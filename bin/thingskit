@@ -218,6 +218,9 @@ Usage
     thingskit rename-task [--id UUID] [--title TITRE] --new-title TITRE
     thingskit reschedule-task [--id UUID] [--title TITRE] [--when VAL]
                               [--deadline AAAA-MM-JJ] [--clear-deadline]
+    thingskit move-task [--id UUID] [--title TITRE]
+                        --to-project TITRE [--to-heading H] | --to-area NOM
+    thingskit move-project --project TITRE|--project-id UUID --area NOM
     thingskit deeplink --type project|area|task --title TITRE
 
 Toutes les sous-commandes de lecture acceptent `--json`. Les sous-commandes
@@ -669,7 +672,8 @@ def osa(script: str) -> tuple[int, str]:
     return r.returncode, (r.stdout or r.stderr).strip()
 
 
-def url_open(payload: list, background: bool = True) -> None:
+def url_open(payload: list, background: bool = True,
+             auth_token: str | None = None) -> None:
     """Envoie un payload au schéma d'URL de Things.
 
     `background=True` (défaut) passe `-g` à `open` : « Do not bring the
@@ -677,11 +681,53 @@ def url_open(payload: list, background: bool = True) -> None:
     fait passer Things au premier plan et vole le focus de l'utilisateur.
     Les commandes qui pilotent l'INTERFACE (menus, frappe clavier) doivent
     passer `background=False` — elles ont besoin du premier plan.
+
+    `auth_token` n'est requis que par les opérations `update` du schéma d'URL
+    (mesuré le 2026-08-27 : une `update` sans jeton est un NO-OP SILENCIEUX et
+    `open` rend malgré tout 0). Il est passé en PARAMÈTRE et jamais imprimé :
+    aucune branche, de succès comme d'échec, ne cite l'URL construite ici.
     """
-    url = "things:///json?data=" + urllib.parse.quote(
-        json.dumps(payload, ensure_ascii=False))
+    params = []
+    if auth_token:
+        params.append("auth-token=" + urllib.parse.quote(auth_token))
+    params.append("data=" + urllib.parse.quote(
+        json.dumps(payload, ensure_ascii=False)))
+    url = "things:///json?" + "&".join(params)
     argv = [OPEN] + (["-g"] if background else []) + [url]
     subprocess.run(argv, check=False)
+
+
+def _uri_scheme_token(action_suffix: str) -> tuple[str | None, str | None]:
+    """Le jeton du schéma d'URL, LU EN BASE (`mode=ro`), (jeton, erreur).
+
+    Mesuré le 2026-08-27 : Things le stocke dans
+    `TMSettings.uriSchemeAuthenticationToken`. Il n'impose donc AUCUNE
+    configuration à l'utilisateur, et n'a pas à vivre dans une variable
+    d'environnement ni dans un fichier de configuration — c'est ce qui
+    distingue ce cas de `reschedule-task`, où la même surface avait été
+    écartée faute de jeton accessible (§ Conventions réelles, « la surface
+    préférée est celle qui marche SANS configuration de l'utilisateur »).
+
+    Un jeton ABSENT ou VIDE est refusé AVANT tout envoi : mesuré, une
+    opération `update` sans jeton est un NO-OP SILENCIEUX et `open` rend
+    malgré tout 0 — le mode d'échec « commande envoyée ≠ effet constaté »
+    sous sa forme la plus trompeuse, et le seul endroit où il est arrêtable
+    est en amont.
+
+    Le jeton est un SECRET : il est rendu à l'appelant, jamais imprimé.
+    """
+    try:
+        rows = q("select uriSchemeAuthenticationToken from TMSettings")
+    except sqlite3.Error:
+        rows = []
+    token = rows[0][0] if rows and rows[0][0] else None
+    if not token:
+        return None, ("jeton du schéma d'URL Things introuvable — l'activer "
+                      "dans Things > Réglages > Général > « Activer les URL "
+                      f"Things », {action_suffix}. Sans lui l'ordre serait "
+                      "ignoré en silence et la commande annoncerait un "
+                      "déplacement qui n'a pas eu lieu.")
+    return token, None
 
 
 # ---------------------------------------------------------------------------
@@ -2706,10 +2752,45 @@ def cmd_reschedule_task(a) -> int:
 #   - Aucune surface (`move`, propriété) n'expose de `heading` : la classe
 #     `heading` n'existe même pas dans le `sdef` de Things3, et aucune
 #     propriété `heading` ne figure dans le dictionnaire de la classe
-#     `to do`. Le déplacement vers un heading n'est donc PAS couvert par
-#     cette commande — mesuré non faisable, pas simplement non tenté
-#     (US-006 § Spécifications techniques : à ne pas exiger sans preuve de
-#     faisabilité).
+#     `to do`. Mesuré, pas déduit (US-006 § Spécifications techniques : à ne
+#     pas exiger sans preuve de faisabilité).
+#
+# `--to-heading` (US-010, mesuré le 2026-08-27 sur projet/en-tête/tâches
+# JETABLES réels, jamais sur des données de l'utilisateur) :
+#
+#   - L'AppleScript est ÉPUISÉ, pas seulement « non exposé ». Six formes
+#     essayées, six échecs, chacun avec son code : `move to do id T to list
+#     id H` (-1728), `move … to to do id H` (301, « Impossible de déplacer la
+#     tâche »), `set project of to do id T to project id H` (-10006),
+#     `set area of to do id T to area id H` (-10006), `move … to list
+#     "<titre de l'en-tête>"` (-1728), et la commande cachée
+#     `_private_experimental_ reorder to dos in`, qu'un en-tête « ne comprend
+#     pas » (-1708). `sdef /Applications/Things3.app | grep -i heading` rend
+#     ZÉRO occurrence.
+#   - Le SCHÉMA D'URL, opération `update`, fonctionne — et c'est la seule
+#     surface qui fonctionne. `heading-id=<uuid>` déplace une tâche EXISTANTE
+#     sous l'en-tête en ~150 ms ; `uuid` et `creationDate` sont relus
+#     INCHANGÉS, la colonne `project` passe à NULL (cohérent avec le constat
+#     du docstring module : une tâche sous en-tête a son `project` vide).
+#     La forme JSON (`operation: "update"`) et la forme requête donnent le
+#     même résultat.
+#   - Le jeton exigé par `update` n'impose AUCUNE configuration à
+#     l'utilisateur : il se LIT en base, colonne
+#     `TMSettings.uriSchemeAuthenticationToken`, en `mode=ro` comme tout le
+#     reste. C'est ce qui distingue ce cas de `reschedule-task`, où la même
+#     surface avait été écartée au motif qu'elle « impose à l'utilisateur
+#     d'aller chercher et de stocker un secret » — elle ne l'impose pas.
+#     Le jeton est un secret : il ne sort jamais sur stdout ni stderr.
+#   - SANS jeton, `update` est un NO-OP SILENCIEUX et `open` rend malgré tout
+#     0 — mesuré par CONTRÔLE sur un attribut notoirement supporté (`title`),
+#     pour établir que la sonde atteignait bien la surface qu'elle croyait
+#     mesurer et non un attribut non reconnu. Même chose pour un `heading`
+#     qui ne nomme aucun en-tête. D'où les deux refus AVANT tout envoi.
+#   - La documentation de Things annonce que `heading-id` est « ignoré si la
+#     tâche n'est pas dans un projet portant cet en-tête ». La MESURE la
+#     contredit : une tâche d'Inbox est bien rangée sous l'en-tête par
+#     `heading-id` seul. `list-id` est envoyé quand même — il ne coûte rien
+#     et ne fait dépendre la commande d'aucune des deux versions du fait.
 # ---------------------------------------------------------------------------
 
 def _resolve_project_by_title(title: str, action_suffix: str) -> tuple[str | None, str | None]:
@@ -2781,6 +2862,18 @@ def cmd_move_task(a) -> int:
               f"{action_suffix}", file=sys.stderr)
         return 1
 
+    # Un titre d'en-tête n'est unique QUE dans son projet — deux projets qui
+    # portent une « Section » chacun est le cas NORMAL, pas une ambiguïté.
+    # Résoudre `--to-heading` sans projet reviendrait donc à « prendre le
+    # premier », que ce projet refuse partout ailleurs. D'où le couplage
+    # exigé, le même que `add-task --list … --heading …` et `find-task`.
+    to_heading = getattr(a, "to_heading", None)
+    if to_heading and not getattr(a, "to_project", None):
+        print(f"erreur : --to-heading exige --to-project (un titre d'en-tête "
+              f"n'est unique que dans son projet), {action_suffix}",
+              file=sys.stderr)
+        return 1
+
     rows = q("select title, trashed from TMTask where uuid=? and type=?",
              (task_id, TYPE_TASK))
     if not rows:
@@ -2795,7 +2888,47 @@ def cmd_move_task(a) -> int:
               file=sys.stderr)
         return 1
 
-    if a.to_project:
+    # `created_before` n'est relevé que sur la voie heading : c'est LÀ que
+    # l'invariant « l'uuid et la date de création ne bougent pas » est en jeu,
+    # puisque le contournement rejeté par US-010 (recréer puis supprimer)
+    # cassait exactement ces deux propriétés.
+    created_before = None
+    token = None
+    heading_project_id = None
+    if to_heading:
+        # Résolveur PARTAGÉ avec `find-task`/`add-task` (`_resolve_find_target`),
+        # jamais un deuxième : il borne déjà la recherche au projet et refuse
+        # sur 0 comme sur 2+ correspondances.
+        _, _, target_id, err = _resolve_find_target(a.to_project, to_heading)
+        if err:
+            print(f"{err} — {action_suffix}. La tâche n'est jamais envoyée "
+                  "vers une cible non résolue : mesuré le 2026-08-27, un "
+                  "`heading` qui ne nomme aucun en-tête est ignoré en silence "
+                  "et l'ordre rend malgré tout 0.", file=sys.stderr)
+            return 1
+        token, err = _uri_scheme_token(action_suffix)
+        if err:
+            print(err, file=sys.stderr)
+            return 1
+        heading_project_id = q("select project from TMTask where uuid=? and "
+                               "type=?", (target_id, TYPE_HEADING))[0][0]
+        target_kind = "heading"
+        target_label = f"{a.to_project} › {to_heading}"
+        obs = q("select heading, creationDate from TMTask where uuid=? and "
+                "type=?", (task_id, TYPE_TASK))
+        current_heading, created_before = obs[0]
+        # Une tâche DÉJÀ sous l'en-tête visé satisfait la vérification
+        # post-action AVANT même l'ordre : la relecture ne distingue alors pas
+        # « fait » de « rien fait », et le code retour 0 serait légitime tout
+        # en étant hors de portée de l'invariant central. Même raisonnement
+        # que `move-project`, et même remède — un message DISTINCT, et aucune
+        # sollicitation de l'application.
+        if current_heading == target_id:
+            print(f"tâche déjà sous l'en-tête : {title!r} "
+                  f"({_rendered(task_id)}) → {target_label!r}")
+            return 0
+        script = None
+    elif a.to_project:
         target_id, err = _resolve_project_by_title(a.to_project, action_suffix)
         if err:
             print(err, file=sys.stderr)
@@ -2813,7 +2946,23 @@ def cmd_move_task(a) -> int:
         target_kind, target_label = "area", a.to_area
 
     ensure_running()
-    rc, out = osa(script)
+    if to_heading:
+        # SEULE surface qui expose l'affectation d'un en-tête à une tâche
+        # EXISTANTE (mesuré le 2026-08-27, cf. en-tête de section). `list-id`
+        # accompagne `heading-id` : la documentation de Things annonce que
+        # `heading-id` est ignoré si la tâche n'est pas déjà dans le projet —
+        # la mesure la CONTREDIT (une tâche d'Inbox est bien rangée), mais
+        # envoyer les deux ne coûte rien et ne dépend pas de cette
+        # contradiction, qui peut se refermer d'une version à l'autre.
+        url_open([{"type": "to-do", "operation": "update", "id": task_id,
+                   "attributes": {"list-id": heading_project_id,
+                                  "heading-id": target_id}}],
+                 auth_token=token)
+        # Ce que la surface a rendu — l'URL n'est JAMAIS citée : elle porte le
+        # jeton, qui est un secret.
+        out = "schéma d'URL, opération update (aucune sortie)"
+    else:
+        rc, out = osa(script)
 
     # La vérification est INCHANGÉE — elle est seulement nommée, pour servir à
     # la fois de sonde d'attente et de source du message d'échec, comme dans
@@ -2821,15 +2970,25 @@ def cmd_move_task(a) -> int:
     # cesserait de décrire celle qui juge. La cascade distingue toujours ses
     # trois causes, qui ne se diagnostiquent pas de la même façon.
     def _move_problem() -> str | None:
-        rows = q("select uuid, project, area, heading from TMTask where uuid=? "
-                 "and type=?", (task_id, TYPE_TASK))
+        rows = q("select uuid, project, area, heading, creationDate from "
+                 "TMTask where uuid=? and type=?", (task_id, TYPE_TASK))
         if not rows:
             return "tâche introuvable après l'opération"
-        obs_uuid, obs_project, obs_area, obs_heading = rows[0]
+        obs_uuid, obs_project, obs_area, obs_heading, obs_created = rows[0]
         if obs_uuid != task_id:
             return (f"l'UUID relu ({obs_uuid!r}) diffère de celui déplacé — "
                     "invariant violé")
-        if target_kind == "project":
+        if created_before is not None and obs_created != created_before:
+            return (f"la date de création relue ({obs_created!r}) diffère de "
+                    f"celle d'avant le déplacement ({created_before!r}) — "
+                    "invariant violé")
+        if target_kind == "heading":
+            # Constat du docstring module, remesuré le 2026-08-27 : une tâche
+            # sous en-tête a sa colonne `project` VIDE. Exiger le projet ici
+            # rendrait un faux négatif sur une écriture réussie — et
+            # l'appelant qui réessaie duplique dans les données (BUG-016).
+            ok = obs_heading == target_id
+        elif target_kind == "project":
             ok = obs_project == target_id and obs_area is None
         else:
             ok = obs_area == target_id and obs_project is None
@@ -3297,14 +3456,21 @@ def main() -> int:
                         "pour la tâche comme pour la cible, et la Corbeille. "
                         "Ne sort en succès que si l'appartenance à la cible "
                         "exacte est constatée en base après coup. Ne couvre "
-                        "PAS le déplacement vers un heading : aucune surface "
-                        "AppleScript ne l'expose (mesuré, cf. docstring "
-                        "module).")
+                        "AUSSI le déplacement sous un EN-TÊTE "
+                        "(--to-project P --to-heading H), qui emprunte la "
+                        "seule surface qui l'expose : le schéma d'URL, "
+                        "opération `update` — aucune surface AppleScript ne "
+                        "le permet (mesuré, cf. docstring module). L'UUID et "
+                        "la date de création de la tâche sont vérifiés "
+                        "inchangés après coup.")
     s.add_argument("--id", help="identifiant Things de la tâche (recommandé)")
     s.add_argument("--title", help="titre exact ; refuse si 0 ou 2+ correspondances")
     g = s.add_mutually_exclusive_group(required=True)
     g.add_argument("--to-project", help="titre exact du projet cible")
     g.add_argument("--to-area", help="titre exact de l'area cible")
+    s.add_argument("--to-heading",
+                   help="titre exact d'un en-tête DANS --to-project ; refuse "
+                        "si 0 ou 2+ correspondances dans ce projet")
 
     s = add("move-project", cmd_move_project,
             description="Déplace un projet DÉJÀ créé vers une autre area, "

@@ -237,11 +237,22 @@ redevient obligatoire.
   (`test_a_project_already_in_the_target_area_is_a_no_op_without_any_solicitation`),
   avec sa contre-épreuve contre le sur-court-circuit
   (`test_the_no_op_message_is_not_reused_for_a_real_move`). `move-task`
-  n'a **aucun** pré-check de ce type — `cmd_move_task` appelle `osa`
-  directement, sans jamais comparer l'appartenance actuelle à la cible, et
-  `tests/test_move_task.py` ne couvre pas ce cas. L'extension du pré-check
-  à `move-task` fait l'objet d'un ticket de suivi séparé, pas de ce
-  changement-ci.
+  n'avait **aucun** pré-check de ce type au 2026-08-26 — `cmd_move_task`
+  appelait `osa` directement, sans jamais comparer l'appartenance actuelle à
+  la cible.
+
+  **Depuis US-010 (2026-08-27), sa voie `--to-heading` en a un**, et
+  l'asymétrie interne est délibérée plutôt que subie : la voie en-tête est
+  du code NEUF, et y laisser un défaut connu au motif qu'il existe ailleurs
+  serait l'adopter. Le pré-check est celui de `move-project`, à l'identique —
+  message DISTINCT (« tâche déjà sous l'en-tête »), aucune sollicitation, et
+  c'est cette absence d'appel qui est testée
+  (`test_a_task_already_under_the_target_heading_is_a_no_op_without_any_solicitation`),
+  avec sa contre-épreuve contre le sur-court-circuit
+  (`test_the_no_op_message_is_not_reused_for_a_real_move`). Les voies
+  `--to-project` et `--to-area` restent SANS pré-check : leur extension est
+  le ticket de suivi séparé déjà ouvert, et l'élargir ici l'aurait fait
+  passer pour traité.
 - **Une garde d'état se décide par opération, jamais par recopie.** `set-notes`
   et `append-notes` sur une tâche refusent la **Corbeille** et **acceptent** une
   tâche `completed` comme `canceled` — ce n'est pas l'ensemble de gardes de
@@ -377,6 +388,26 @@ redevient obligatoire.
   AppleScript qui n'en demande aucun, c'est la seconde — comme pour
   `delete-task` et `complete-task`. Une surface ne « fonctionne » qu'à
   configuration constante.
+
+  **Amendement du 2026-08-27 (US-010) : le critère tient, sa prémisse était
+  fausse.** Le jeton n'impose rien à l'utilisateur — il se LIT en base,
+  colonne `TMSettings.uriSchemeAuthenticationToken`, en `mode=ro` comme tout
+  le reste (`_uri_scheme_token`). La mesure de 2026-08-17 avait établi qu'un
+  `update` sans jeton ne mute rien ; elle n'avait pas établi que le jeton
+  était hors de portée, et c'est cette moitié non mesurée qui avait été
+  écrite comme un fait. `move-task --to-heading` emploie donc la surface URL
+  `update` sans demander la moindre configuration, et le critère la classe
+  désormais AU-DESSUS de l'AppleScript, pas en dessous. La règle n'est pas
+  affaiblie : elle est appliquée à la bonne prémisse. Rejeu :
+
+      sqlite3 "file:<base Things>?mode=ro" \
+        "select length(uriSchemeAuthenticationToken) from TMSettings"
+
+  Ce que l'amendement ne change PAS : un jeton ABSENT ou VIDE reste un refus
+  AVANT tout envoi, parce qu'un `update` sans jeton est un no-op silencieux
+  que `open` rend malgré tout en 0. La surface reste écartée là où elle
+  n'apporte rien (`reschedule-task` a un AppleScript qui marche) ; elle est
+  retenue là où elle est la SEULE (l'en-tête).
 - **Une chaîne de date n'est jamais interprétée par AppleScript.** Mesuré le
   2026-08-17 : `date "2026-09-05"` a produit **2011-03-19**, la session
   appliquant sa propre locale à la chaîne. Toute date passée à `schedule` ou à
@@ -635,6 +666,22 @@ redevient obligatoire.
       .venv/bin/python -m pytest tests/test_applescript_escaping.py --collect-only -q | tail -1 -> 48
       .venv/bin/python -m pytest tests/test_untrusted_rendering.py --collect-only -q | tail -1 -> 81
       .venv/bin/python -m pytest -q -p no:cacheprovider -> 1065 passed, 11 skipped
+
+  Baseline relevée à **1076** le 2026-08-27 avant `move-task --to-heading`
+  (US-010), **1105** après. L'écart de 29 tient entièrement dans
+  `tests/test_move_task.py` (22 -> 51 collectés) : refus avant sollicitation
+  (portée du résolveur, homonyme d'un autre projet, en-tête à la Corbeille,
+  couplage `--to-heading`/`--to-project`), jeton du schéma d'URL absent ou
+  vide, non-fuite du jeton sur les DEUX sorties, invariants d'uuid et de date
+  de création, effet non constaté, course sur le message d'échec, base
+  illisible pendant toute l'attente, no-op et sa contre-épreuve, rendu borné
+  des titres hostiles sur les deux branches, câblage CLI. Aucun autre fichier
+  ne bouge : le fichier de test existait déjà, donc le contrôle paramétré de
+  `test_annotations_resolve.py` ne gagne rien. Les commandes :
+
+      .venv/bin/python -m pytest --collect-only -q | tail -1 -> 1105 tests collected
+      .venv/bin/python -m pytest tests/test_move_task.py --collect-only -q | tail -1 -> 51
+      .venv/bin/python -m pytest -q -p no:cacheprovider -> 1104 passed, 1 skipped
 
   **L'intégration n'a pas été un simple recollement.** Les deux chantiers se
   croisaient sur un point de fond : ADR-003 fait entrer une valeur d'origine
