@@ -39,6 +39,11 @@ import pytest
 # `skipif`, jamais ce qu'il decide.
 INSTALLED_BUNDLE = "/Applications/thingskit.app"
 SHIM_NAME = "thingskit-launch"
+# ADR-003 : le bundle porte desormais l'identite de code qu'il exige de
+# lui-meme, dans un fichier scelle. Un bundle anterieur n'en a pas, et les
+# tests qui l'atteignent n'ont rien a eprouver dessus — meme motif que le
+# shim d'ADR-002 ci-dessus, et meme remede : le saut se decide ICI.
+CODE_IDENTITY_FILE = "code-identity"
 
 
 def conforming_bundle_missing() -> str | None:
@@ -55,7 +60,34 @@ def conforming_bundle_missing() -> str | None:
             f"{INSTALLED_BUNDLE} anterieur a ADR-002 : shim `{SHIM_NAME}` absent. "
             "Reconstruire (`python3 -m build.bundle`) pour eprouver ces tests."
         )
+    if not os.path.isfile(
+            os.path.join(INSTALLED_BUNDLE, "Contents", "Resources", CODE_IDENTITY_FILE)):
+        return (
+            f"{INSTALLED_BUNDLE} anterieur a ADR-003 : fichier d'identite "
+            f"`{CODE_IDENTITY_FILE}` absent. Reconstruire "
+            "(`python3 -m build.bundle`) pour eprouver ces tests."
+        )
     return None
+
+
+def installed_bundle_requirement() -> str:
+    """Exigence de code du bundle INSTALLE, lue dans son propre fichier scelle.
+
+    Seconde et DERNIERE fonction autorisee a atteindre `/Applications/thingskit.app`
+    hors d'un test garde — meme exemption structurelle que le predicat
+    ci-dessus, attachee au mecanisme et non a un nom de fichier. Elle n'est
+    appelee QUE depuis des tests gardes : sur un poste nu, elle n'est jamais
+    evaluee.
+
+    Depuis ADR-003, quelle identite le bundle exige de lui-meme est une donnee
+    QU'IL PORTE. Un test qui la recomposerait depuis une constante du depot
+    n'eprouverait plus l'artefact, mais la constante.
+    """
+    path = os.path.join(
+        INSTALLED_BUNDLE, "Contents", "Resources", CODE_IDENTITY_FILE)
+    with open(path, encoding="utf-8") as handle:
+        identifier, team = thingskit_cli.parse_code_identity(handle.read())
+    return thingskit_cli.compose_code_requirement(identifier, team)
 
 
 requires_conforming_bundle = pytest.mark.skipif(

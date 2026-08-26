@@ -32,42 +32,59 @@ doctrine (`constitution.md`) is French too, for the same reason: it is over
 two languages. If a French-speaking interface is a blocker for you, know
 that before you invest time here.
 
-### You can't run a self-built binary without your own signing identity
+### Building it yourself requires your own Apple signing identity
 
-**This repository cannot be run as-is after a plain clone, and a bundle
-you build yourself will not work either without an Apple signing
-certificate that belongs to you.**
+**A plain clone is not runnable as such: you have to build the bundle, and
+building it requires an Apple signing certificate that belongs to you.**
+You no longer have to edit any code to do so.
 
 `bin/thingskit` is never executed directly: the `PATH` entry
-(`~/.local/bin/thingskit`) delegates to a signed `.app`
-(`/Applications/thingskit.app`), which embeds its own Python interpreter.
-This indirection exists for a precise reason: macOS grants TCC
-(Transparency, Consent and Control — the "Full Disk Access" permission
-needed to read the Things database) consent to a **code identity**, not to
-a file path. A shebang script delegates that identity to the system's
-Python interpreter, whose signature changes on every update
+(`~/.local/bin/thingskit`) delegates to a signed `.app`, which embeds its
+own Python interpreter. This indirection exists for a precise reason: macOS
+grants TCC (Transparency, Consent and Control — the "Full Disk Access"
+permission needed to read the Things database) consent to a **code
+identity**, not to a file path. A shebang script delegates that identity to
+the system's Python interpreter, whose signature changes on every update
 (`brew upgrade python`, for instance) — and consent granted yesterday
 becomes invalid tomorrow, without warning. Packaging `thingskit` into a
-signed bundle under a stable identity was the only way to make that
-consent durable.
+signed bundle under a stable identity was the only way to make that consent
+durable.
 
-The launcher and the bundle therefore verify, on every startup, that the
-binary being run carries `CFBundleIdentifier = app.sowell.thingskit` and
-the Apple Team ID `56AP2NSB54` — the maintainer's own. **A bundle you build
-yourself, signed under your own developer identity (or ad hoc), will fail
-this check and the launcher will refuse to start.** This is not a bug or
-an arbitrary restriction: it's the guard that protects TCC consent from
-silent code substitution (full detail: `constitution.md` § Sensitive
-zones, #3 — French).
+Which identity is expected is **configuration, not source code**
+(`ADR-003`). It lives in `build/identity.conf`, a local file that is never
+versioned — this repository ships **no default identity at all**:
 
-**In practice**: you can read the code, run it under test (the suite
-depends on no installed bundle), and contribute. You cannot, as things
-stand, obtain a runnable `thingskit` outside the maintainer's own machine
-without rebuilding this chain of trust with your own signing identity —
-something the project does not yet generalize. This is an open, tracked
-piece of work (see `BUG-010` in the project history: generalizing the
-hardcoded signing identity). If this blocks you, open an issue before
-investing time in a setup that cannot succeed today.
+```ini
+bundle_identifier = app.example.thingskit
+team_identifier = <your-team-id>      # 10 uppercase alphanumerics: the leaf certificate's OU
+install_path = /Applications/thingskit.app
+```
+
+Create that file, then build and install:
+
+```bash
+python3 -m build.bundle                 # signs with an identity of that team
+```
+
+The build refuses, naming the file and the missing fields, if the
+configuration is absent or malformed. It also refuses if no signing
+identity of that team exists in your keychain — it never falls back to an
+ad-hoc signature, which would produce a bundle that looks signed and has
+lost TCC consent.
+
+**What the guard still does, and what it no longer does.** The launcher and
+the CLI entry point verify, on every startup, that the running interpreter
+carries the bundle's own code identity. That expectation is now
+**self-referential**: it is written into the bundle at build time (compiled
+into the launcher shim, and sealed as a data file under
+`Contents/Resources/`), and refuses fail-closed if it is missing,
+unreadable or malformed. It no longer pins the maintainer's team. The cost
+of producing an artefact this chain accepts therefore moves from "own the
+maintainer's certificate" to "own an Apple Developer certificate and
+re-sign a bundle" — that widening is deliberate and documented in
+`ADR-003`.
+
+Full detail: `constitution.md` § Sensitive zones, #3 (French).
 
 ## Requirements
 

@@ -260,8 +260,19 @@ import unicodedata
 # La garde porte UNIQUEMENT sur `__main__` : `tests/conftest.py` charge ce
 # fichier comme module via `SourceFileLoader`, et un refus au niveau module
 # casserait toute la suite sans rien protéger de plus.
-BUNDLE_IDENTIFIER = "app.sowell.thingskit"
-TEAM_IDENTIFIER = "56AP2NSB54"
+# ADR-003 : le script ne porte plus AUCUNE valeur d'identité. Quelle identité
+# est attendue est une donnée du bundle, écrite dans `Contents/Resources/` par
+# le build et scellée par la signature — lue ici par chemin absolu dérivé de
+# `sys.executable` RÉSOLU, et parsée comme DONNÉE, jamais importée : `-I`
+# n'implique pas `-S` et ne ferme pas l'ombrage par un module homonyme du
+# répertoire courant (motif mesuré, build/bundle.py). Un `import` sur le
+# chemin de démarrage de la garde serait une surface d'exécution.
+#
+# Motif de ce déplacement : une valeur écrite ici liait le dépôt public à
+# l'équipe du mainteneur, et `verify_embedded_copy` (build/bundle.py) interdit
+# par construction qu'une valeur par poste soit générée dans ce fichier — il
+# doit rester identique à l'octet près à la copie embarquée.
+CODE_IDENTITY_FILE = "code-identity"
 # Chemin ABSOLU : un vérificateur que `PATH` peut détourner ne vérifie rien.
 CODESIGN = "/usr/bin/codesign"
 # Marqueur d'extension X.509 du TYPE de certificat (ADR-002 § Decision 5). Le
@@ -270,12 +281,16 @@ CODESIGN = "/usr/bin/codesign"
 # (Developer ID Application) satisferait cette exigence tout en ayant perdu le
 # grant. Rationale complète et limite non établie : build/bundle.py.
 CERTIFICATE_TYPE_OID = "1.2.840.113635.100.6.1.2"
-CODE_REQUIREMENT = (
-    "anchor apple generic"
-    f' and identifier "{BUNDLE_IDENTIFIER}"'
-    f' and certificate leaf[field.{CERTIFICATE_TYPE_OID}] exists'
-    f' and certificate leaf[subject.OU]="{TEAM_IDENTIFIER}"'
-)
+# Formes admises des deux champs. Elles sont STRICTES, pas seulement
+# échappables : tout ce qui sort de ces classes est le signe que le fichier ne
+# dit pas ce qu'on croit, et un échappement correct rendrait le défaut
+# silencieux au lieu de le nommer. Ni guillemet, ni espace, ni caractère de
+# contrôle ne peut donc entrer dans l'exigence composée plus bas.
+BUNDLE_IDENTIFIER_FORM = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,127}\Z")
+# L'unité d'organisation d'un certificat Apple est l'identifiant d'équipe :
+# dix caractères alphanumériques en capitales.
+TEAM_IDENTIFIER_FORM = re.compile(r"[A-Z0-9]{10}\Z")
+CODE_IDENTITY_FIELDS = ("bundle_identifier", "team_identifier")
 LAUNCHER_HINT = "~/.local/bin/thingskit"
 # `codesign` peut se bloquer (volume réseau, `AppleMobileFileIntegrity`
 # occupé). Sans borne, toute invocation du CLI pendrait indéfiniment et sans
@@ -287,17 +302,144 @@ CODESIGN_TIMEOUT = 10
 IDENTITY_REFUSAL_CODE = 125
 
 
-def code_identity_refusal(executable: str | None = None, runner=None) -> str | None:
+def _requirement_value(value: str, form: "re.Pattern[str]") -> str:
+    """Rend `value` si elle satisfait `form`, LÈVE sinon.
+
+    Neutraliseur par REFUS, là où `_esc` neutralise par échappement — et c'est
+    la bonne forme ici : la grammaire de `csreq` n'est pas celle d'AppleScript,
+    et échapper un guillemet y ferait passer une valeur que ce dépôt veut voir
+    refusée. Le contrôle est réaffirmé AU SITE d'interpolation, et pas
+    seulement à la lecture du fichier : c'est là que la valeur rencontre le
+    gabarit, donc là que l'injection se joue.
+    """
+    if not form.match(value):
+        raise ValueError(
+            f"valeur hors forme pour une exigence de code : {value!r}")
+    return value
+
+
+def compose_code_requirement(bundle_identifier: str, team_identifier: str) -> str:
+    """Compose l'exigence de code opposée à l'interpréteur.
+
+    Le PLANCHER de forme n'est pas configurable : l'ancrage Apple générique et
+    le marqueur d'extension de TYPE de certificat sont écrits ici, et aucune
+    donnée lue ne peut les retirer. Sans ce plancher, un fichier d'identité
+    dégradé affaiblirait la garde en silence — la seule dégradation invisible,
+    puisque le CLI démarrerait quand même.
+    """
+    return (
+        "anchor apple generic"
+        f' and identifier '
+        f'"{_requirement_value(bundle_identifier, BUNDLE_IDENTIFIER_FORM)}"'
+        f' and certificate leaf[field.{CERTIFICATE_TYPE_OID}] exists'
+        f' and certificate leaf[subject.OU]='
+        f'"{_requirement_value(team_identifier, TEAM_IDENTIFIER_FORM)}"'
+    )
+
+
+def code_identity_path(executable: str | None = None) -> str:
+    """Chemin du fichier d'identité scellé, à côté de l'interpréteur RÉSOLU.
+
+    Résolu, parce qu'un lien symbolique déplacerait la source de l'attente
+    sans déplacer le code qui l'exécute.
+    """
+    exe = Path(executable or sys.executable).resolve()
+    return str(exe.parent.parent / "Resources" / CODE_IDENTITY_FILE)
+
+
+def parse_code_identity(text: str) -> tuple[str, str]:
+    """Rend le couple (identifiant de bundle, équipe) lu dans le fichier.
+
+    Lève `ValueError` sur TOUTE forme dégénérée — fichier vide, ligne sans
+    séparateur, champ inconnu, dupliqué, manquant, vide ou hors forme. Aucune
+    tolérance : ce fichier décide de ce à quoi l'interpréteur est comparé.
+    Les valeurs fautives sont CONVERTIES (`!r`) dans le message, jamais
+    recopiées — le fichier peut n'être pas scellé, c'est même le cas où cette
+    fonction refuse, donc son contenu est d'origine non contrôlée.
+    """
+    fields: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition("=")
+        if not sep:
+            raise ValueError(f"ligne sans separateur : {line!r}")
+        key, value = key.strip(), value.strip()
+        if key not in CODE_IDENTITY_FIELDS:
+            raise ValueError(f"champ inconnu : {key!r}")
+        if key in fields:
+            raise ValueError(f"champ duplique : {key!r}")
+        fields[key] = value
+    for name in CODE_IDENTITY_FIELDS:
+        if name not in fields:
+            raise ValueError(f"champ manquant : {name!r}")
+    identifier, team = fields["bundle_identifier"], fields["team_identifier"]
+    if not BUNDLE_IDENTIFIER_FORM.match(identifier):
+        raise ValueError(f"identifiant de bundle hors forme : {identifier!r}")
+    if not TEAM_IDENTIFIER_FORM.match(team):
+        raise ValueError(f"identifiant d'equipe hors forme : {team!r}")
+    return identifier, team
+
+
+def expected_code_identity(executable: str | None = None, reader=None):
+    """Rend `((identifiant, equipe), None)`, ou `(None, message de refus)`.
+
+    Fermé par défaut : fichier absent, illisible, indécodable ou malformé →
+    l'attente n'est pas établie, donc l'exécution est refusée. `ValueError`
+    couvre l'indécodable (`UnicodeDecodeError`) comme le malformé.
+    """
+    path = code_identity_path(executable)
+    try:
+        if reader is not None:
+            text = reader(path)
+        else:
+            # Lecture INLINE, sans passer par un helper nommé : le balayage de
+            # la partition du régime rapide refuse une fonction de module
+            # employée comme VALEUR (`tests/test_fast_path_partition.py`) —
+            # une référence indirecte l'empêcherait de suivre les appels.
+            with open(path, "r", encoding="utf-8") as handle:
+                text = handle.read()
+        fields = parse_code_identity(text)
+    except (OSError, ValueError) as exc:
+        # `_rendered` sur l'exception, pas sur ses seules parties : le message
+        # de `parse_code_identity` est déjà composé avec `!r` sur les valeurs
+        # fautives, mais s'en remettre à ça ferait reposer la borne sur une
+        # relecture croisée de deux fonctions — exactement ce dont ce dépôt se
+        # méfie. Le fichier scellé est une valeur d'origine non contrôlée de
+        # plus (§ Zones sensibles 1, R7), et sa borne est mécanique. C'est le
+        # motif que `_parsed_when` et `_parsed_deadline` emploient déjà.
+        return None, (
+            f"thingskit: identite de code attendue non etablie "
+            f"({_rendered(exc)}) : {path!r}\n"
+            f"thingskit: execution refusee — lancer {LAUNCHER_HINT}, sinon "
+            f"l'acces a la base de Things se ferait sous une identite de "
+            f"passage et macOS redemanderait l'autorisation."
+        )
+    return fields, None
+
+
+def code_identity_refusal(executable: str | None = None, runner=None,
+                          requirement: str | None = None, reader=None) -> str | None:
     """Rend le message de refus, ou `None` si l'interpréteur porte l'identité.
 
-    Le contrôle est fermé par défaut : si `codesign` ne peut pas être exécuté,
-    l'identité n'est pas établie, donc elle est refusée.
+    Le contrôle est fermé par défaut, à DEUX titres : si l'attente n'est pas
+    établie (fichier scellé absent ou malformé), et si `codesign` ne peut pas
+    être exécuté. `requirement` n'est qu'une couture de test, au même titre
+    que `runner` : sur le chemin réel, l'attente vient du bundle.
     """
     executable = executable or sys.executable
     runner = runner or subprocess.run
+    subject = requirement
+    if requirement is None:
+        fields, refusal = expected_code_identity(executable, reader=reader)
+        if refusal is not None:
+            return refusal
+        subject = fields[0]
+        requirement = compose_code_requirement(*fields)
     try:
         rc = runner(
-            [CODESIGN, "--verify", "--strict", f"-R={CODE_REQUIREMENT}", executable],
+            [CODESIGN, "--verify", "--strict", f"-R={requirement}", executable],
             capture_output=True,
             text=True,
             timeout=CODESIGN_TIMEOUT,
@@ -312,8 +454,8 @@ def code_identity_refusal(executable: str | None = None, runner=None) -> str | N
     if rc == 0:
         return None
     return (
-        f"thingskit: interpreteur sans l'identite de code du bundle "
-        f"({BUNDLE_IDENTIFIER}) : {executable}\n"
+        f"thingskit: interpreteur sans l'identite de code attendue par le "
+        f"bundle ({subject!r}) : {executable!r}\n"
         f"thingskit: execution refusee — lancer {LAUNCHER_HINT}, sinon l'acces "
         f"a la base de Things se ferait sous une identite de passage et "
         f"macOS redemanderait l'autorisation."

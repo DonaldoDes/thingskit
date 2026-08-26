@@ -16,3 +16,8 @@ __pycache__/
 dist/
 build/*.egg-info/
 *.egg-info/
+
+# ADR-003 — identite de code attendue, locale au poste du mainteneur.
+# Jamais versionnee : ce depot est public et ne porte aucune valeur
+# d identite par defaut (cf. CONTRIBUTING.md).
+build/identity.conf

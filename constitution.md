@@ -583,8 +583,16 @@ redevient obligatoire.
       .venv/bin/python -m pytest tests/test_create_area.py -q -> 19 passed
       .venv/bin/python -m pytest -q -p no:cacheprovider -> 809 passed, 1 skipped
 
-  Baseline relevée à **810** le 2026-08-26 avant BUG-026, **843** après.
-  L'écart de 33 se décompose, et chaque terme est mesuré : 32 dans
+  Baseline relevée à **810** le 2026-08-26 avant BUG-026, **843** après son
+  premier lot, **889** après le second — celui qui borne ce qu'`argparse`
+  émet. Ce bloc a porté **843** devant un arbre à 889 jusqu'à l'intégration
+  d'ADR-003 : le second lot a ajouté 46 tests sans le mettre à jour, exactement
+  la classe que `BUG-025` nomme. Rejeu, sur un arbre détaché à l'état voulu :
+
+      git worktree add /tmp/tk-etat <ref> && cd /tmp/tk-etat \
+        && python3 -m pytest --collect-only -q | tail -1
+
+  L'écart de 33 du premier lot se décompose, et chaque terme est mesuré : 32 dans
   `tests/test_untrusted_rendering.py` (le balayage de la classe, ses six
   formes en contre-épreuve, la manipulation réelle du script, les deux
   contre-épreuves de sur-refus, la borne de `_rendered` sur le plan
@@ -592,11 +600,78 @@ redevient obligatoire.
   sortie) ; +1 au contrôle paramétré de `test_annotations_resolve.py`, qui
   balaie les fichiers de test (34 -> 35, un fichier de plus). Les commandes :
 
-      .venv/bin/python -m pytest --collect-only -q | tail -1 -> 843 tests collected
+      .venv/bin/python -m pytest --collect-only -q | tail -1 -> 889 tests collected
+      # (843 au premier lot de BUG-026, 889 au second)
       .venv/bin/python -m pytest tests/test_untrusted_rendering.py -q -> 32 passed
       .venv/bin/python -m pytest tests/test_annotations_resolve.py -q -> 35 passed
       .venv/bin/python -m pytest tests/test_create_area.py -q -> 19 passed
       .venv/bin/python -m pytest -q -p no:cacheprovider -> 842 passed, 1 skipped
+
+  Baseline relevée à **889** le 2026-08-26 avant l'intégration d'ADR-003 —
+  l'identité de code attendue devenue configurable au build —, **1076** après
+  la troisième passe de review.
+  Les chiffres portés ici pendant le chantier (923, puis 983) valaient contre
+  une base d'AVANT BUG-026 : ils ont été REMESURÉS après fusion plutôt
+  qu'additionnés, parce qu'aucune des deux branches n'avait vu l'autre.
+  L'écart de 187 se décompose, et chaque terme est mesuré : +118 dans le
+  fichier neuf `tests/test_build_identity.py` (lecture de la configuration,
+  configurations hostiles, plancher de forme, accord des deux côtés,
+  ordonnancement, ambiguïté d'unité d'organisation, compositions hostiles côté
+  build, destination hors forme, et l'aide du point d'entrée) ; +47 dans
+  `test_code_identity.py` (22 -> 69 :
+  les formes dégénérées du fichier scellé, la dérivation du chemin, et les 20
+  compositions hostiles qui tuent la mutation du neutraliseur) ; +9 dans
+  `test_applescript_escaping.py` (31 -> 48 : la dispense liée au motif épinglé,
+  les six formes qui ne dispensent pas, et les sept routes d'ombrage et
+  d'approbation du troisième tour) ; +1 dans `test_bundle.py`
+  (107 -> 108) ; +3 dans `test_untrusted_rendering.py` (78 -> 81 : la septième
+  racine, ses trois orthographes et sa contre-épreuve) ; +1 au contrôle paramétré de
+  `test_annotations_resolve.py`, qui balaie les fichiers de test (35 -> 36).
+  Les commandes :
+
+      .venv/bin/python -m pytest --collect-only -q | tail -1 -> 1076 tests collected
+      .venv/bin/python -m pytest tests/test_build_identity.py --collect-only -q | tail -1 -> 118
+      .venv/bin/python -m pytest tests/test_code_identity.py --collect-only -q | tail -1 -> 69
+      .venv/bin/python -m pytest tests/test_applescript_escaping.py --collect-only -q | tail -1 -> 48
+      .venv/bin/python -m pytest tests/test_untrusted_rendering.py --collect-only -q | tail -1 -> 81
+      .venv/bin/python -m pytest -q -p no:cacheprovider -> 1065 passed, 11 skipped
+
+  **L'intégration n'a pas été un simple recollement.** Les deux chantiers se
+  croisaient sur un point de fond : ADR-003 fait entrer une valeur d'origine
+  externe — le fichier d'identité scellé — dans un message de refus, et la
+  garde d'axe portée/puits de BUG-026 l'a signalée dès la fusion, sous sa forme
+  « exception interpolée sans conversion ». Le message est donc borné par
+  `_rendered`, comme `_parsed_when` et `_parsed_deadline` le font déjà, et le
+  prédicat gagne sa **septième racine**. Une fusion qui aurait gardé les deux
+  côtés sans les confronter aurait laissé cette valeur sortir brute, avec les
+  deux suites vertes.
+
+  **Les sauts passent de 1 à 11, et c'est voulu.** `conforming_bundle_missing`
+  exige désormais que le bundle installé porte son fichier d'identité : un
+  bundle antérieur à ADR-003 n'en a pas, et les tests qui l'atteignent n'ont
+  rien à éprouver dessus. Même mécanisme, et même motif, que pour le shim
+  d'ADR-002.
+
+  **« Ils redeviennent actifs à la reconstruction » a été ÉCRIT avant d'être
+  établi, et un des dix ne redevenait pas actif — il devenait rouge.**
+  `tests/test_bundle.py` atteignait le bundle par `bundle.INSTALL_PATH`, une
+  constante qu'ADR-003 retire ; le durcissement du prédicat de saut, venu de
+  la même branche, cachait la casse. La phrase est maintenant MESURÉE, sur un
+  bundle construit vers une destination temporaire et une copie du dépôt dont
+  la fixture y est repointée : **les 10 sauts d'ADR-003 s'exécutent et
+  passent**, et le seul saut restant est celui, indépendant, du doublon de
+  `LC_RPATH` que ce poste refuse — il saute aussi sur `master`. Rejeu :
+
+      cp -R <dépôt> /tmp/tk-skips && find /tmp/tk-skips -name __pycache__ -prune -exec rm -rf {} +
+      python3 -m build.bundle /tmp/tk-skips-app/thingskit.app
+      cd /tmp/tk-skips && grep -rl <chemin installé> tests/ \
+        | xargs sed -i '' "s#<chemin installé>#/tmp/tk-skips-app/thingskit.app#g"
+      python3 -m pytest -q          # -> 1 skipped (le doublon de rpath), le reste passe
+
+  **La purge des `__pycache__` fait partie de la mesure, pas de l'hygiène.**
+  Copier le dépôt en les préservant fait charger le script depuis le chemin
+  d'ORIGINE encodé dans le bytecode : une mutation posée dans la copie est
+  alors mesurée contre le dépôt réel, en silence.
 - **Une fixture ne porte jamais une identité de signature réelle, ni une
   valeur personnelle citée en clair.** Le dépôt est public. Les fixtures dites
   « mesurées » documentent la FORME d'une sortie `security find-identity` ou
@@ -707,8 +782,8 @@ redevient obligatoire.
   deviné à la forme. `Jean DUPONT` échoue parce que `JEAN` n'est dans aucune
   des deux listes.
 
-  Les deux seuls identifiants réels admis sont nommés un par un avec le motif
-  qui les rend publics ; et **sept jeux** sont désormais épinglés par
+  Le seul identifiant réel admis est nommé avec le motif qui le rend public ;
+  et **sept jeux** sont désormais épinglés par
   empreinte, ce qui rend tout ajout VISIBLE en revue. Les trois ajoutés à
   l'empreinte ferment un trou du lot précédent : les **motifs** des
   identifiants réels admis n'y entraient pas — seules les clés — donc réécrire
@@ -723,12 +798,23 @@ redevient obligatoire.
   `COUVERTURE`, `PYTHONPATH`…), mesuré ; et l'empreinte rend un ajout
   *visible*, jamais *impossible* — c'est une garde de revue, pas un verrou.
 
-  **Deux identifiants réels sont admis**, et le motif est écrit à côté de
-  chacun : le Team ID du projet, public par construction puisqu'il est dans
-  `CODE_REQUIREMENT`, donc dans le sceau de tout artefact distribué ; et celui
-  de Cultured Code, qui préfixe le Group Container de Things et ne désigne
-  personne ici. Une garde qui les refuserait serait ininstallable, donc
-  désactivée.
+  **Un seul identifiant réel est admis** depuis ADR-003, et le motif est écrit
+  à côté : celui de Cultured Code, qui préfixe le Group Container de Things et
+  ne désigne personne ici. Une garde qui le refuserait serait ininstallable,
+  donc désactivée.
+
+  **Le Team ID du projet en est SORTI le 2026-08-26.** Il y figurait pour une
+  raison qui a cessé d'être vraie : il était dans `CODE_REQUIREMENT`, donc
+  inévitable dans l'arbre publié. L'exigence de code se compose désormais
+  depuis une configuration locale non versionnée (ADR-003), et plus aucune
+  valeur d'identité du projet ne subsiste dans l'arbre suivi — ni identifiant
+  d'équipe, ni identifiant de bundle, `README.md`, `constitution.md` et
+  `specs/` compris. Commande de rejeu :
+
+      git grep -c '56AP2N''SB54\|app\.sow''ell' -> aucun résultat
+
+  (les deux motifs sont coupés ici pour ne pas réintroduire dans ce document
+  ce que la garde en retire — les recoller avant de lancer la commande).
 
   Le défaut d'origine n'était pas l'absence de convention — les fixtures
   voisines du MÊME fichier employaient déjà `Zoe`, `Adele`, `Mallory` — mais
@@ -913,11 +999,25 @@ irréversible pour un gestionnaire de tâches personnel utilisé au quotidien.
   prédicat.** Cinq mesures l'avaient précédée et avaient rendu cinq résultats
   — 24 sites plus 13 faibles, 237 champs sur 326, 82, 117, 37. Aucune n'était
   un comptage fautif : chacune présumait une définition de « valeur d'origine
-  non contrôlée » au lieu de l'écrire. Le prédicat à six racines (namespace
+  non contrôlée » au lieu de l'écrire. Le prédicat à **sept** racines (namespace
   argparse, `q(...)`, `osa(...)`, paramètre alimenté, retour par slot de
-  tuple, `sys.argv`), son trajet et ses conversions sont écrits en tête de
-  `tests/test_untrusted_rendering.py` ; c'est lui qu'il faut contester pour
-  contester le chiffre.
+  tuple, `sys.argv`, et le contenu d'un FICHIER lu — `read`, `read_text` ou
+  `readlines`, les trois orthographes, parce que n'en reconnaître qu'une était
+  exactement le défaut du balayage de `sleep`), son trajet et ses conversions
+  sont écrits en tête de `tests/test_untrusted_rendering.py` ; c'est lui qu'il
+  faut contester pour contester le chiffre.
+
+  **La septième est arrivée avec ADR-003**, le même jour, par un chantier mené
+  en parallèle : le fichier d'identité scellé fait entrer dans le script une
+  source externe qu'aucune des six autres n'atteignait. Il est scellé, donc il
+  devrait être digne de confiance — mais le cas où la garde d'identité REFUSE
+  est exactement celui où il ne l'est pas, et c'est là que son contenu atteint
+  un message. Une racine qui ne vaudrait que « quand tout va bien » ne vaudrait
+  rien. Ce qu'elle ne voit pas est énoncé dans le prédicat : une lecture
+  atteinte par un alias, par `os.read`, par `json.load`, ou par un module
+  tiers — aucune n'existe ici, mesuré. Le compte résiduel reste nul, et la
+  mesure des 90 valeurs ci-dessous est inchangée : l'état d'avant BUG-026 ne
+  lisait aucun fichier.
 
   **La mesure sous ce prédicat : 90 valeurs dans 34 fonctions**, sur l'état
   d'AVANT le correctif. Le chiffre porté ici jusqu'au 2026-08-26 — « 87 valeurs
@@ -944,13 +1044,15 @@ irréversible pour un gestionnaire de tâches personnel utilisé au quotidien.
 
   Cette unité n'est PAS un nombre de `print` : une valeur est comptée à son
   ORIGINE dans sa fonction, et un même `task_id` alimente jusqu'à six lignes.
-  Le volume du correctif se mesure, lui, en sites de conversion — 81
-  occurrences de `_rendered(` dont une définition, soit 80 appels, et `!r}`
-  passé de 104 à 161. Le chiffre « 85 emplacements de texte » porté ici
+  Le volume du correctif se mesure, lui, en sites de conversion — 82
+  occurrences de `_rendered(` dont une définition, soit 81 appels, et `!r}`
+  passé de 104 à 171. Ces deux chiffres ont bougé d'un cran et de dix à
+  l'intégration d'ADR-003, qui borne le refus d'identité de code et compose
+  ses propres messages avec `!r`. Le chiffre « 85 emplacements de texte » porté ici
   jusqu'au 2026-08-26 ne correspondait à aucune commande :
 
-      grep -o '_rendered(' bin/thingskit | wc -l              # -> 81
-      grep -o '!r}' bin/thingskit | wc -l                     # -> 161
+      grep -o '_rendered(' bin/thingskit | wc -l              # -> 82
+      grep -o '!r}' bin/thingskit | wc -l                     # -> 171
       git show cc4ff9d:bin/thingskit | grep -o '!r}' | wc -l  # -> 104
 
   Deux inclusions décident du chiffre, et les deux manquaient aux balayages
@@ -1369,10 +1471,13 @@ qui s'exécute. Un script à shebang n'en porte aucune — c'est l'interpréteur
 la porte.
 
 **Fichiers concernés** : `build/bundle.py` (construction, relocalisation,
-signature, compilation du shim, lecture de `FAST_PATH_COMMANDS`),
-`build/thingskit-launch.c.in` (gabarit du shim), `bin/thingskit`
-(`CODE_REQUIREMENT`, `FAST_PATH_COMMANDS`, `code_identity_refusal`),
-`Info.plist` généré, le lanceur installé en `~/.local/bin/thingskit`.
+signature, compilation du shim, lecture de `FAST_PATH_COMMANDS`, lecture de la
+configuration d'identité), `build/thingskit-launch.c.in` (gabarit du shim),
+`build/identity.conf` (origine unique de configuration, **locale et jamais
+versionnée**), `bin/thingskit` (`compose_code_requirement`,
+`parse_code_identity`, `FAST_PATH_COMMANDS`, `code_identity_refusal`),
+`Contents/Resources/code-identity` (fichier d'identité scellé), l'`Info.plist`
+généré, le lanceur installé en `~/.local/bin/thingskit`.
 
 **Risques propres à cette surface** :
 - **Identité mouvante.** Le Python Homebrew est signé ad-hoc et son identifiant
@@ -1469,6 +1574,116 @@ signature, compilation du shim, lecture de `FAST_PATH_COMMANDS`),
   Gardé par mesure du PID, pas par lecture du mot-clé
   (`test_launcher_replaces_its_process_image_instead_of_forking`) et par
   comparaison des codes de sortie.
+- **Quelle identité est attendue est une DONNÉE du bundle, plus une constante
+  du dépôt** (ADR-003, 2026-08-26). Elle vient d'une origine unique de
+  configuration sous `build/`, lue par le seul build — jamais par un chemin
+  d'exécution du CLI. Ce dernier point est balayé, pas relu, et la portée du
+  balayage est **plus étroite que son nom** : il voit le chemin écrit dans un
+  littéral du script (résidu nul), et la remontée depuis l'emplacement du
+  script est fermée à part (`__file__` absent du fichier). Un chemin
+  reconstruit par concaténation ou lu dans l'environnement resterait invisible
+  — invariant non gardé, écrit plutôt que tu. Elle voyage ensuite par **deux porteurs, tous deux
+  scellés** : la chaîne compilée dans le shim, et un fichier de données écrit
+  dans `Contents/Resources/` **avant** la signature — donc couvert par le sceau
+  des ressources, ce qui est mesuré et non déduit (une ligne ajoutée au fichier
+  d'un bundle construit rend `codesign --verify --strict` en `rc=1`, « a sealed
+  resource is missing or invalid »). Les deux sortent de la MÊME lecture, dans
+  le même appel de `build()`, et leur égalité est littérale.
+
+  Quatre propriétés, chacune tenue par un test :
+
+  - **La lecture est fail-closed sur la CLASSE, pas sur le cas rencontré.**
+    Fichier absent, illisible, indécodable, vide, champ manquant, vide,
+    dupliqué, inconnu ou hors forme → refus, code 125, et **aucune invocation
+    de `codesign`** : refuser après avoir vérifié quelque chose n'aurait pas de
+    sens, puisqu'il n'y a rien à vérifier tant que l'attente n'est pas établie.
+  - **Le plancher de forme n'est pas configurable.** L'ancrage Apple générique
+    et le marqueur d'extension de TYPE de certificat sont écrits dans le code,
+    des deux côtés ; le vocabulaire de la configuration est CLOS — trois champs
+    au build, deux dans le fichier scellé — et tout autre champ vaut refus.
+    Sans ce plancher, une configuration dégradée affaiblirait la garde en
+    silence : la seule dégradation invisible, puisque le build réussirait et
+    que le CLI démarrerait.
+  - **La valeur est neutralisée AU SITE d'interpolation, par refus.** Une
+    valeur hors forme n'est pas échappée, elle fait lever — `_requirement_value`
+    est un neutraliseur par refus, là où `_esc` neutralise par échappement, et
+    c'est le bon outil ici : la grammaire de `csreq` n'est pas celle
+    d'AppleScript, et échapper un guillemet y ferait passer une valeur que ce
+    dépôt veut voir refusée. Le mécanisme existe **des deux côtés** — script et
+    build composent la même chaîne, donc encourent la même injection de clause.
+
+    **Une défense en profondeur non testée n'est pas une défense, c'est une
+    phrase** : ce site n'était exercé par aucun test, et un `return value` posé
+    en tête de la fonction — qui la rend passe-plat — laissait la suite ENTIÈRE
+    verte (912 passed, mesuré le 2026-08-26 en review). Le contrôle de recette
+    est écrit ici parce que c'est lui, et non la relecture, qui établit la
+    propriété : poser cette mutation doit faire tomber la suite (22 échecs côté
+    script, 23 côté build). Les tests qui la tuent visent
+    `compose_code_requirement` / `code_requirement`, jamais le parseur — un
+    test écrit contre `parse_code_identity` n'atteint pas le site
+    d'interpolation, donc ne tue rien.
+
+  - **La dispense que ce neutraliseur ouvre dans le balayage d'échappement
+    porte sur le MOTIF, jamais sur le nom de la fonction appelée — et le nom
+    de forme ne doit pas être OMBRÉ au site.** La propriété, en une phrase :
+    *un nom lié dans une portée englobante du site ne dispense pas*, qu'il
+    soit une fonction neutralisante ou un motif, qu'il vienne d'une
+    affectation locale, d'un paramètre ou de sa valeur par défaut. Les deux
+    moitiés de la dispense passent par la même remontée de portées.
+
+    **Cette ligne a énoncé deux fois une propriété que le code ne tenait
+    pas**, et c'est le motif de la réécrire ici en entier. La première
+    version accordait la dispense au seul nom de la fonction appelée et
+    n'inspectait pas le second argument : `_requirement_value(a.name, ANY)`
+    passait, quel que soit `ANY`. La deuxième a lié la dispense à un motif
+    épinglé — et n'a fermé que la moitié de la propriété : ce document a
+    alors porté « lié une fois au niveau module à `re.compile(<motif épinglé
+    au littéral>)` » devant un balayage qui ne regardait ni l'ombrage local
+    ni les paramètres. Un site AppleScript neuf dont la forme permissive
+    arrivait par la valeur par défaut d'un paramètre passait intégralement,
+    la suite restant à sa ligne de base — reproduit en revue.
+
+    Ce que le prédicat d'approbation exige aujourd'hui, condition par
+    condition : le nom est d'une **liste close** ; il est lié **une fois**, au
+    niveau module ; sa valeur est `re.compile(...)` où `re` est bien le module
+    importé — le nom d'attribut seul approuvait `fake.compile(...)` — ; l'appel
+    n'a **qu'un** argument, car un drapeau surnuméraire comme `re.I` élargit
+    la forme sans toucher au motif ; cet argument est le littéral épinglé ; et
+    le nom n'est **ombré dans aucune portée englobante** du site. Chacune est
+    gardée dans les deux sens.
+  - **Le contenu du fichier est d'origine non contrôlée** — c'est précisément
+    dans le cas où il n'est pas scellé que la garde refuse — donc il ne
+    traverse jamais un message sans conversion `!r`.
+
+  **Ce que ce changement ne ferme pas, et qui est dit plutôt que tu** : le
+  contrôle devient **auto-référentiel** — celui qui fournit le binaire fournit
+  aussi l'attente qui lui est opposée. La population capable de produire un
+  artefact acceptable passe d'une équipe nommée à l'ensemble des détenteurs
+  d'un certificat Apple Developer. C'est un élargissement d'un cran, acté dans
+  ADR-003 § « Ce que la garde garantit », et le résidu d'ADR-002 § Decision 5bis
+  n'en change pas de nature.
+
+- **La destination de la ligne de commande du build subit la forme de la
+  configuration**, comme la valeur configurée. Elle y échappait alors que la
+  même donnée, passée par le fichier, était validée : un écart de traitement
+  sur une valeur qui atterrit dans une chaîne C et dans un `sh` est une
+  invitation, même quand il n'est pas exploitable.
+
+- **Le chemin d'installation vient de la même origine** (ADR-003, INV-003-8) :
+  aucune source publiée ne le grave. Le balayage porte sur le CODE — littéraux
+  hors docstring des `.py`, lignes non commentées du gabarit C — parce qu'une
+  garde qui balaie aussi la narration d'une mesure impose une allowlist qui
+  grossit à chaque paragraphe, donc une garde désactivée dans le mois.
+
+- **L'unité d'organisation d'un sujet X.509 ne se lit qu'à l'UNIQUE.** La
+  sélection du certificat est le point où la configuration entre dans le
+  build : un sujet portant deux `OU=` est **ambigu**, et « le premier gagne »
+  y serait un choix implicite sur la valeur qui décide de l'identité du
+  build. Il est donc refusé — fail-closed, le certificat devient inéligible,
+  jamais éligible par erreur. Même règle que les résolutions par titre du CLI.
+  Le découpage RFC2253 (une virgule échappée n'est pas un séparateur) était
+  déjà en place et le reste.
+
 - **L'entrée CLI du script source refuse tout interpréteur qui ne porte pas
   l'identité du bundle** (BUG-009, 2026-08-19). Avant ce correctif, rien ne
   forçait le passage par le lanceur : `bin/thingskit` restait exécutable par
@@ -1614,7 +1829,7 @@ signature, compilation du shim, lecture de `FAST_PATH_COMMANDS`),
 - **La stabilité de `codesign` ne vaut jamais preuve de persistance du grant,
   et `Identifier`/`TeamIdentifier` inchangés ne valent pas stabilité de
   signature au sens de TCC.** Mesuré le 2026-08-21 : le `csreq` enregistré par
-  TCC pour `app.sowell.thingskit` pinne l'`identifier`, l'ancre Apple, le **CN
+  TCC pour l'identifiant du bundle pinne l'`identifier`, l'ancre Apple, le **CN
   du certificat feuille** et le marqueur de l'intermédiaire — **jamais le Team
   ID**. Un bundle re-signé sous une identité de type différent conserve donc
   `Identifier` et `TeamIdentifier`, satisfait `--verify --strict`, et a
@@ -1828,8 +2043,8 @@ trois chemins versionnés du même outil).
 
   ```
   sans disclaim : AllFiles, Sub:{com.mitchellh.ghostty}  -> Allowed (System Set)
-  sous disclaim : AllFiles, Sub:{app.sowell.thingskit}   -> Denied (Service Policy)
-                  puis AppData, Sub:{app.sowell.thingskit} -> Unknown -> PROMPT
+  sous disclaim : AllFiles, Sub:{<identifiant du bundle>}  -> Denied (Service Policy)
+                  puis AppData, Sub:{<identifiant du bundle>} -> Unknown -> PROMPT
   ```
 
   Ce que le manque produit n'est pas une lenteur, c'est **deux défauts selon le
@@ -1934,7 +2149,7 @@ trois chemins versionnés du même outil).
 
   **Ce que ce garde faisait avant le 2026-08-22, et pourquoi il ne le fait
   plus.** Il lisait en seule lecture la ligne `kTCCServiceSystemPolicyAllFiles`
-  / `app.sowell.thingskit` de la base TCC système. Or **lire cette base exige
+  / l'identifiant du bundle de la base TCC système. Or **lire cette base exige
   elle-même l'Accès complet au disque pour le processus lecteur** — c'est
   exactement la propriété testée. Depuis le terminal qui lance ce garde au
   démarrage de session, ce contrôle n'a donc **jamais** pu aboutir : pas un
@@ -1975,7 +2190,7 @@ passer par le shim.
 
 Mesuré le 2026-08-21 : `codesign --verify --strict -R=<exigence du dépôt>`
 opposé à `Contents/MacOS/thingskit` rend `rc=0` — ce binaire satisfait SEUL
-l'exigence ; et la ligne `kTCCServiceAppleEvents | app.sowell.thingskit |
+l'exigence ; et la ligne `kTCCServiceAppleEvents | <identifiant du bundle> |
 auth_value=2` existe désormais en base, alors qu'elle n'existait pas avant ce
 chantier.
 
@@ -1983,13 +2198,13 @@ Le disclaim ne CRÉE donc pas la faiblesse, mais il en **augmente le rendement**
 Avant, le résidu donnait la lecture de la base Things (`AppData`). Après, il
 donne en plus un consentement AppleEvents stable et durable, sous une identité
 qui n'est plus liée au terminal appelant — donc la capacité d'automatiser Things,
-et de solliciter toute application à laquelle `app.sowell.thingskit` se verra
+et de solliciter toute application à laquelle l'identifiant du bundle se verra
 accorder AppleEvents plus tard. C'est la contrepartie exacte du bénéfice
 principal : un sujet TCC unique et stable l'est pour tout le monde.
 
 `[mesuré 2026-08-21]`, de bout en bout : un spawner tiers posant le disclaim sur
 `Contents/MacOS/thingskit` obtient l'Apple Event vers Things SANS invite, sous
-l'identité du bundle — `AUTHREQ_SUBJECT: subject=app.sowell.thingskit`,
+l'identité du bundle — `AUTHREQ_SUBJECT: subject=<identifiant du bundle>`,
 `authValue: 2`, `osascript rc=0`, aucun prompt dans 8 240 lignes de trace ;
 contrôle sans disclaim : `subject=com.mitchellh.ghostty`. Ce binaire satisfait
 en outre le `csreq` de TCC lui-même (`codesign --verify --strict -R

@@ -11,7 +11,7 @@
  * -------------------------------------------------
  * `kTCCServiceAppleEvents` ne s'evalue pas sur le processus mais sur son
  * processus RESPONSABLE. Un `exec` depuis `sh` preserve le PID, donc la chaine
- * de responsabilite : le processus porte bien `app.sowell.thingskit`, mais son
+ * de responsabilite : le processus porte bien l'identifiant du bundle, mais son
  * responsable reste le terminal ou l'agent qui l'a lance — un sujet TCC par
  * terminal, par hote, et par VERSION d'hote. `sh` ne sait pas appeler
  * `responsibility_spawnattrs_setdisclaim`, et la responsabilite se decide
