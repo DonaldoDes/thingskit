@@ -21,6 +21,7 @@ eprouve. Aucun test d'ici ne depend du bundle installe ni de Things (C-4).
 import ast
 import inspect
 import subprocess
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -367,16 +368,88 @@ def test_the_build_derives_both_carriers_from_a_single_read():
 
 def test_the_identity_file_is_written_before_the_signature():
     """INV-003-3 : ecrire apres la signature invaliderait le sceau des
-    ressources — et un fichier hors sceau ne prouve rien."""
+    ressources — et un fichier hors sceau ne prouve rien.
+
+    L'ordre se lit sur les NUMEROS DE LIGNE, pas sur l'ordre de parcours de
+    `ast.walk`, qui est un parcours en LARGEUR : indexer sa sortie ne prouvait
+    l'ordre de la source que tant que les trois appels restaient au premier
+    niveau du corps, et serait devenu faux — silencieusement — le jour ou l'un
+    d'eux passerait dans une condition ou une boucle (releve en review).
+    """
     tree = ast.parse(inspect.getsource(bundle.build))
-    calls = [n.func.id for n in ast.walk(tree)
-             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+    lines = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            lines.setdefault(node.func.id, node.lineno)
     for name in ("write_code_identity", "_sign_everything",
                  "assert_bundle_satisfies_requirement"):
-        assert name in calls, f"{name} n'est pas appele par build()"
-    assert (calls.index("write_code_identity")
-            < calls.index("_sign_everything")
-            < calls.index("assert_bundle_satisfies_requirement")), calls
+        assert name in lines, f"{name} n'est pas appele par build()"
+    assert (lines["write_code_identity"]
+            < lines["_sign_everything"]
+            < lines["assert_bundle_satisfies_requirement"]), lines
+
+
+def test_the_ordering_check_reads_the_source_not_the_traversal():
+    """Contre-epreuve du correctif : sur une source ou l'ordre d'ecriture et
+    l'ordre de parcours en largeur DIVERGENT, la lecture par numero de ligne
+    tranche juste. C'est le cas qu'un `ast.walk` indexe rendait faux.
+    """
+    source = textwrap.dedent("""
+        def build(flag):
+            if flag:
+                premier()
+            second()
+    """)
+    tree = ast.parse(source)
+    walked = [n.func.id for n in ast.walk(tree)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+    lines = {n.func.id: n.lineno for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    assert walked == ["second", "premier"], walked
+    assert lines["premier"] < lines["second"]
+
+
+HOSTILE_COMPOSITIONS = (
+    [(value, FAKE_TEAM) for value in HOSTILE_IDENTIFIERS]
+    + [(FAKE_ID, value) for value in HOSTILE_TEAMS]
+)
+
+
+@pytest.mark.parametrize("identifier,team", HOSTILE_COMPOSITIONS)
+def test_the_build_composition_refuses_a_hostile_value_at_the_site(
+        identifier, team):
+    """Symetrie avec `bin/thingskit` (releve en review) : le script reaffirme
+    la forme au SITE d'interpolation, le build ne le faisait pas.
+
+    Non atteignable — `build()` est le seul appelant, apres validation — mais
+    le motif vaut des deux cotes : c'est la meme chaine, et la meme injection
+    de clause si la valeur passe.
+    """
+    with pytest.raises(bundle.BundleError):
+        bundle.code_requirement(identifier, team)
+
+
+def test_the_build_composition_accepts_a_wellformed_pair():
+    """Contre-epreuve : refuser TOUT ne prouverait rien."""
+    assert bundle.code_requirement(FAKE_ID, FAKE_TEAM).startswith(
+        "anchor apple generic")
+
+
+@pytest.mark.parametrize("destination", [
+    "thingskit.app",                    # relatif
+    "/tmp/x.app\"; rm -rf /",           # injection dans le lanceur sh
+    "/tmp/$(id).app",
+    "/tmp/x",                           # pas un bundle
+])
+def test_a_destination_out_of_form_is_refused_by_the_build_entry_point(
+        tmp_path, destination, capsys):
+    """La destination de la ligne de commande subit la MEME forme que celle de
+    la configuration (releve en review : `argv[1]` y echappait, alors que la
+    meme donnee passee par `--config` etait validee — un ecart de traitement
+    est une invitation)."""
+    assert bundle.main(["bundle.py", destination,
+                        "--config", str(_config(tmp_path))]) == 1
+    assert "install_path" in capsys.readouterr().err
 
 
 def test_the_identity_file_lands_where_the_cli_looks_for_it(tmp_path):
@@ -402,7 +475,22 @@ def _cli_string_constants(source: str) -> list[str]:
 
 
 def test_no_execution_path_of_the_cli_reads_the_build_configuration():
-    """Balayage a compte residuel nul, jamais une relecture."""
+    """Balayage a compte residuel nul, jamais une relecture.
+
+    **Ce qu'il couvre, exactement** : le nom de l'origine de configuration et
+    le segment `build/` ecrits dans un LITTERAL de chaine du script. C'est la
+    forme directe, celle ou le chemin et le code se rencontrent dans la meme
+    expression.
+
+    **Ce qu'il ne couvre PAS**, dit plutot que tu (releve en review) : un
+    chemin RECONSTRUIT — par concatenation de fragments, par `os.environ`, ou
+    par remontee depuis l'emplacement du script. La derniere de ces trois
+    routes est la seule qui menerait au depot sans le nommer, et elle est
+    fermee separement, par une propriete du script entier plutot que par ce
+    balayage : `test_the_cli_does_not_derive_a_path_from_its_own_location`
+    (`tests/test_code_identity.py`) exige que `__file__` n'y figure pas du
+    tout. Les deux autres restent des invariants NON gardes.
+    """
     source = SCRIPT.read_text(encoding="utf-8")
     origin = Path(bundle.BUILD_IDENTITY_CONFIG).name
     offenders = [literal for literal in _cli_string_constants(source)

@@ -146,6 +146,23 @@ CERTIFICATE_TYPE_OID = "1.2.840.113635.100.6.1.2"
 # reste copiable telle quelle dans un `sh` de diagnostic.
 
 
+def _requirement_value(value: str, form: "re.Pattern[str]") -> str:
+    """Rend `value` si elle satisfait `form`, REFUSE sinon.
+
+    Symétrique du neutraliseur de `bin/thingskit` : la forme est réaffirmée là
+    où la valeur rencontre le gabarit, et pas seulement à la lecture de la
+    configuration. `build()` est aujourd'hui le seul appelant de la fonction
+    ci-dessous, et il valide en amont — mais c'est la même chaîne et la même
+    injection de clause si une valeur passe, et un site non gardé se met à
+    compter le jour où un second appelant apparaît.
+    """
+    if not form.match(value):
+        raise BundleError(
+            f"valeur hors forme pour une exigence de code : {value!r} "
+            f"(attendu {form.pattern!r})")
+    return value
+
+
 def code_requirement(bundle_identifier: str, team_identifier: str) -> str:
     """Compose l'exigence de code opposee au bundle et au shim.
 
@@ -159,11 +176,13 @@ def code_requirement(bundle_identifier: str, team_identifier: str) -> str:
     `bin/thingskit` compose la meme chaine a partir du fichier scelle ; leur
     egalite est LITTERALE et mesuree (INV-003-5).
     """
+    identifier = _requirement_value(bundle_identifier, _BUNDLE_IDENTIFIER_FORM)
+    team = _requirement_value(team_identifier, _TEAM_IDENTIFIER_FORM)
     return (
         'anchor apple generic'
-        f' and identifier "{bundle_identifier}"'
+        f' and identifier "{identifier}"'
         f' and certificate leaf[field.{CERTIFICATE_TYPE_OID}] exists'
-        f' and certificate leaf[subject.OU]="{team_identifier}"'
+        f' and certificate leaf[subject.OU]="{team}"'
     )
 
 
@@ -1322,7 +1341,22 @@ def main(argv: list[str]) -> int:
         config = Path(args[index + 1])
         del args[index:index + 2]
     try:
-        dest = build(Path(args[0]) if args else None, config=config)
+        # La destination de la ligne de commande subit la MÊME forme que celle
+        # de la configuration. Elle y échappait, alors que la même donnée
+        # passée par `--config` était validée : un écart de traitement sur la
+        # valeur qui atterrit dans une chaîne C et dans un `sh` est une
+        # invitation, même quand il n'est pas exploitable.
+        destination = None
+        if args:
+            try:
+                _requirement_value(args[0], _INSTALL_PATH_FORM)
+            except BundleError as exc:
+                raise BundleError(
+                    f"destination hors forme : {args[0]!r} — elle subit la "
+                    "forme du champ install_path de la configuration "
+                    f"({_INSTALL_PATH_FORM.pattern!r})") from exc
+            destination = Path(args[0])
+        dest = build(destination, config=config)
     except (BundleError, subprocess.CalledProcessError) as exc:
         detail = getattr(exc, "stderr", "") or ""
         print(f"build: {exc}\n{detail}", file=sys.stderr)

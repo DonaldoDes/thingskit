@@ -600,6 +600,22 @@ redevient obligatoire.
       .venv/bin/python -m pytest tests/test_code_identity.py --collect-only -q | tail -1 -> 43
       .venv/bin/python -m pytest -q -p no:cacheprovider -> 912 passed, 11 skipped
 
+  Baseline reprise à **923** le 2026-08-26 après les deux bloquants de review,
+  **983** après. L'écart de 60 se décompose, et chaque terme est mesuré : +25
+  dans `test_build_identity.py` (90 -> 115 : les 19 compositions hostiles côté
+  build, les 4 destinations hors forme, la contre-épreuve de l'ordre lu sur les
+  numéros de ligne) ; +26 dans `test_code_identity.py` (43 -> 69 : les 20
+  compositions hostiles côté script, qui sont ce qui TUE la mutation, plus la
+  conversion du message, trois paires bien formées et l'absence de `__file__`) ;
+  +9 dans `test_applescript_escaping.py` (31 -> 40 : la dispense liée au motif,
+  et les six formes qui ne dispensent pas). Les commandes :
+
+      .venv/bin/python -m pytest --collect-only -q | tail -1 -> 983 tests collected
+      .venv/bin/python -m pytest tests/test_build_identity.py --collect-only -q | tail -1 -> 115
+      .venv/bin/python -m pytest tests/test_code_identity.py --collect-only -q | tail -1 -> 69
+      .venv/bin/python -m pytest tests/test_applescript_escaping.py --collect-only -q | tail -1 -> 40
+      .venv/bin/python -m pytest -q -p no:cacheprovider -> 972 passed, 11 skipped
+
   **Les sauts passent de 1 à 11, et c'est voulu.** `conforming_bundle_missing`
   exige désormais que le bundle installé porte son fichier d'identité : un
   bundle antérieur à ADR-003 n'en a pas, et les tests qui l'atteignent n'ont
@@ -1323,8 +1339,12 @@ généré, le lanceur installé en `~/.local/bin/thingskit`.
 - **Quelle identité est attendue est une DONNÉE du bundle, plus une constante
   du dépôt** (ADR-003, 2026-08-26). Elle vient d'une origine unique de
   configuration sous `build/`, lue par le seul build — jamais par un chemin
-  d'exécution du CLI, ce qui est vérifié par balayage d'AST à compte résiduel
-  nul, pas par relecture. Elle voyage ensuite par **deux porteurs, tous deux
+  d'exécution du CLI. Ce dernier point est balayé, pas relu, et la portée du
+  balayage est **plus étroite que son nom** : il voit le chemin écrit dans un
+  littéral du script (résidu nul), et la remontée depuis l'emplacement du
+  script est fermée à part (`__file__` absent du fichier). Un chemin
+  reconstruit par concaténation ou lu dans l'environnement resterait invisible
+  — invariant non gardé, écrit plutôt que tu. Elle voyage ensuite par **deux porteurs, tous deux
   scellés** : la chaîne compilée dans le shim, et un fichier de données écrit
   dans `Contents/Resources/` **avant** la signature — donc couvert par le sceau
   des ressources, ce qui est mesuré et non déduit (une ligne ajoutée au fichier
@@ -1351,9 +1371,30 @@ généré, le lanceur installé en `~/.local/bin/thingskit`.
     est un neutraliseur par refus, là où `_esc` neutralise par échappement, et
     c'est le bon outil ici : la grammaire de `csreq` n'est pas celle
     d'AppleScript, et échapper un guillemet y ferait passer une valeur que ce
-    dépôt veut voir refusée. Le balayage d'interpolations non échappées
-    (`tests/test_applescript_escaping.py`) connaît les deux, et leur applique
-    les mêmes contrôles de portée.
+    dépôt veut voir refusée. Le mécanisme existe **des deux côtés** — script et
+    build composent la même chaîne, donc encourent la même injection de clause.
+
+    **Une défense en profondeur non testée n'est pas une défense, c'est une
+    phrase** : ce site n'était exercé par aucun test, et un `return value` posé
+    en tête de la fonction — qui la rend passe-plat — laissait la suite ENTIÈRE
+    verte (912 passed, mesuré le 2026-08-26 en review). Le contrôle de recette
+    est écrit ici parce que c'est lui, et non la relecture, qui établit la
+    propriété : poser cette mutation doit faire tomber la suite (22 échecs côté
+    script, 23 côté build). Les tests qui la tuent visent
+    `compose_code_requirement` / `code_requirement`, jamais le parseur — un
+    test écrit contre `parse_code_identity` n'atteint pas le site
+    d'interpolation, donc ne tue rien.
+
+  - **La dispense que ce neutraliseur ouvre dans le balayage d'échappement
+    porte sur le MOTIF, jamais sur le nom de la fonction appelée.** La
+    première écriture accordait la dispense au nom seul et n'inspectait pas le
+    second argument — celui qui fait tout le travail de refus :
+    `_requirement_value(a.name, ANY)` passait, quel que soit `ANY`. Le second
+    argument doit être un nom d'une **liste close**, lié une fois au niveau
+    module à `re.compile(<motif épinglé au littéral>)`. Rendre le motif
+    permissif, ou seulement le réécrire, fait tomber la dispense et rougir la
+    garde — même mécanisme que l'empreinte des allowlists ci-dessus : rendre
+    le changement VISIBLE en revue plutôt que possible en silence.
   - **Le contenu du fichier est d'origine non contrôlée** — c'est précisément
     dans le cas où il n'est pas scellé que la garde refuse — donc il ne
     traverse jamais un message sans conversion `!r`.
@@ -1365,6 +1406,12 @@ généré, le lanceur installé en `~/.local/bin/thingskit`.
   d'un certificat Apple Developer. C'est un élargissement d'un cran, acté dans
   ADR-003 § « Ce que la garde garantit », et le résidu d'ADR-002 § Decision 5bis
   n'en change pas de nature.
+
+- **La destination de la ligne de commande du build subit la forme de la
+  configuration**, comme la valeur configurée. Elle y échappait alors que la
+  même donnée, passée par le fichier, était validée : un écart de traitement
+  sur une valeur qui atterrit dans une chaîne C et dans un `sh` est une
+  invitation, même quand il n'est pas exploitable.
 
 - **Le chemin d'installation vient de la même origine** (ADR-003, INV-003-8) :
   aucune source publiée ne le grave. Le balayage porte sur le CODE — littéraux

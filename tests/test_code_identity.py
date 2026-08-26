@@ -513,3 +513,103 @@ def test_the_identity_refusal_of_a_bare_interpreter_carries_its_own_exit_code():
     assert proc.returncode == 125
     assert proc.stdout == ""
     assert "Traceback" not in proc.stderr
+
+
+# ------------------------------------------------------------------ ADR-003
+# Le neutraliseur du SITE d'interpolation, éprouvé pour lui-même.
+#
+# Défaut relevé en review (2026-08-26) : `_requirement_value` n'était exercé
+# par aucun test. Un `return value` posé en tête de la fonction — qui la rend
+# passe-plat et supprime tout refus — laissait la suite ENTIÈRE verte (912
+# passed, mesuré). Le docstring affirmait pourtant que « le contrôle est
+# réaffirmé au site d'interpolation » : une affirmation d'établissement
+# qu'aucune relecture de code ne réfute, puisque le code, lui, était correct.
+#
+# Ces tests visent `compose_code_requirement`, qui ne PARSE pas — un test
+# écrit contre `parse_code_identity` ne tue pas la mutation, puisqu'il
+# n'atteint jamais le site d'interpolation.
+
+INJECTED_IDENTIFIERS = [
+    'app.evil" or true',                        # clause injectée dans l'exigence
+    'app.evil" and anchor apple',
+    'app.evil"',
+    "app evil",
+    "app.evil\x1b[2K",
+    "app.evil\x00",
+    "app.evil‮",
+    "-app.evil",
+    "",
+    "   ",
+    "app." + "e" * 200,
+]
+
+INJECTED_TEAMS = [
+    'X" or true',
+    'X" and anchor trusted',
+    "team000001",
+    "TEAM00001",
+    "TEAM0000012",
+    "TEAM 00001",
+    "TEAM00000\x1b",
+    "",
+    "   ",
+]
+
+
+@pytest.mark.parametrize("identifier", INJECTED_IDENTIFIERS)
+def test_the_composition_refuses_a_hostile_identifier_at_the_site(
+        thingskit, identifier):
+    """La forme est réaffirmée LÀ OÙ la valeur rencontre le gabarit.
+
+    `parse_code_identity` l'a déjà refusée en amont sur tout chemin de
+    production : c'est de la défense en profondeur, et une défense en
+    profondeur non testée n'est pas une défense — c'est une phrase.
+    """
+    with pytest.raises(ValueError):
+        thingskit.compose_code_requirement(identifier, FAKE_TEAM)
+
+
+@pytest.mark.parametrize("team", INJECTED_TEAMS)
+def test_the_composition_refuses_a_hostile_team_at_the_site(thingskit, team):
+    with pytest.raises(ValueError):
+        thingskit.compose_code_requirement(FAKE_ID, team)
+
+
+def test_the_refusal_names_the_offending_value_without_relaying_it(thingskit):
+    """Le message CONVERTIT la valeur (`!r`) : elle est d'origine non
+    contrôlée, et une séquence de contrôle recopiée ferait lire au mainteneur
+    autre chose que ce que la garde a refusé."""
+    with pytest.raises(ValueError) as exc:
+        thingskit.compose_code_requirement("app.evil\x1b[2K\rautre", FAKE_TEAM)
+    assert "\x1b" not in str(exc.value) and "\r" not in str(exc.value)
+
+
+@pytest.mark.parametrize("identifier,team", [
+    ("app.example.thingskit", "TEAM000001"),
+    ("thingskit", "OLDTEAM001"),
+    ("app.example.tools.thingskit-2", "NEWTEAM002"),
+])
+def test_the_composition_accepts_a_wellformed_pair(thingskit, identifier, team):
+    """Contre-épreuve : un neutraliseur qui refuserait TOUT ne prouve rien."""
+    requirement = thingskit.compose_code_requirement(identifier, team)
+    assert f'identifier "{identifier}"' in requirement
+    assert f'certificate leaf[subject.OU]="{team}"' in requirement
+
+
+def test_no_composed_requirement_can_carry_an_injected_clause(thingskit):
+    """La propriété, énoncée en une fois : aucune valeur refusée par la forme
+    ne produit d'exigence, donc aucune ne peut y greffer une clause."""
+    composed = []
+    for identifier in INJECTED_IDENTIFIERS:
+        try:
+            composed.append(thingskit.compose_code_requirement(identifier, FAKE_TEAM))
+        except ValueError:
+            pass
+    assert composed == []
+
+
+def test_the_cli_does_not_derive_a_path_from_its_own_location():
+    """INV-003-7, seconde route : le balayage de littéraux ne verrait pas un
+    chemin RECONSTRUIT. `__file__` est la voie par laquelle un script atteint
+    son propre dépôt — donc `build/` — sans jamais le nommer."""
+    assert "__file__" not in SCRIPT.read_text(encoding="utf-8")

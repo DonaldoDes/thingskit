@@ -81,12 +81,31 @@ ESCAPE_FUNCTION = "_esc"
 # le mauvais outil : la grammaire de `csreq` n'est pas celle d'`osascript`, et
 # échapper y ferait passer une valeur que le dépôt veut voir refusée.
 #
-# La dispense qu'il ouvre est plus étroite que celle d'`_esc` : elle exige une
-# forme, elle ne rend pas une valeur portable. Les deux passent par les MÊMES
-# contrôles de portée — un `_requirement_value = lambda v, f: v` posé en tête
-# de fonction dispenserait autrement tout ce qu'il couvre.
+# La dispense qu'il ouvre est plus étroite que celle d'`_esc`, et elle porte
+# sur le MOTIF, jamais sur le nom de la fonction appelée. La première écriture
+# de cette garde (2026-08-26) accordait la dispense sur le seul nom et
+# n'inspectait jamais le second argument — celui qui fait tout le travail de
+# refus : `_requirement_value(a.name, ANY)` passait, quel que soit `ANY`, et
+# l'en-tête qui affirmait « elle exige une forme » décrivait une garde qui
+# n'existait pas. Elle exigeait qu'un deuxième argument EXISTE.
+#
+# Le second argument doit désormais être un NOM de la liste close ci-dessous,
+# lié UNE fois au niveau du module à `re.compile(<le motif épinglé>)`. Rendre
+# le motif permissif — ou seulement le réécrire — fait tomber la dispense,
+# donc rougir la garde : c'est ce qui rend le changement de forme VISIBLE en
+# revue, comme l'empreinte des allowlists de `test_bundle.py`.
+#
+# Les deux neutraliseurs passent par les MÊMES contrôles de portée — un
+# `_requirement_value = lambda v, f: v` posé en tête de fonction dispenserait
+# autrement tout ce qu'il couvre.
 REQUIREMENT_VALUE_FUNCTION = "_requirement_value"
 NEUTRALISING_FUNCTIONS = (ESCAPE_FUNCTION, REQUIREMENT_VALUE_FUNCTION)
+# Liste CLOSE, motif épinglé au littéral. Un nom absent d'ici ne dispense
+# rien, et un nom présent ne dispense que s'il porte EXACTEMENT ce motif.
+REQUIREMENT_FORMS = {
+    "BUNDLE_IDENTIFIER_FORM": r"[A-Za-z0-9][A-Za-z0-9.-]{0,127}\Z",
+    "TEAM_IDENTIFIER_FORM": r"[A-Z0-9]{10}\Z",
+}
 
 
 def _globally_rebound_names(tree: ast.Module) -> set[str]:
@@ -170,16 +189,63 @@ def _module_literal_names(tree: ast.Module,
     return names
 
 
-def _neutralising_call(node: ast.AST) -> str | None:
-    """Nom du neutraliseur appelé par `node`, ou `None`."""
-    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+def _approved_form_names(tree: ast.Module,
+                         owner: dict[int, ast.AST | None]) -> set[str]:
+    """Noms de la liste close liés UNE fois, au niveau module, au motif épinglé.
+
+    Trois conditions, et chacune ferme une route : le nom est de la liste (un
+    motif improvisé ne dispense pas), il n'est lié qu'une fois au niveau
+    module (une réaffectation ultérieure le retire), et sa valeur est
+    `re.compile(<littéral épinglé>)` — c'est cette dernière qui fait tomber la
+    dispense sur un motif PERMISSIF portant le bon nom, le cas que la garde
+    manquait entièrement.
+    """
+    counts = _module_level_bound_names(tree, owner)
+    rebound = _globally_rebound_names(tree)
+    approved = set()
+    for node in ast.walk(tree):
+        if owner.get(id(node)) is not None or not isinstance(node, ast.Assign):
+            continue
+        value = node.value
+        if not (isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Attribute)
+                and value.func.attr == "compile"
+                and value.args and isinstance(value.args[0], ast.Constant)):
+            continue
+        for target in node.targets:
+            if (isinstance(target, ast.Name)
+                    and target.id in REQUIREMENT_FORMS
+                    and counts.get(target.id, 0) == 1
+                    and target.id not in rebound
+                    and value.args[0].value == REQUIREMENT_FORMS[target.id]):
+                approved.add(target.id)
+    return approved
+
+
+def _neutralising_call(node: ast.AST, approved_forms: set[str]) -> str | None:
+    """Nom du neutraliseur appelé par `node`, ou `None`.
+
+    Pour `_requirement_value`, la dispense EXIGE le motif : deux arguments
+    exactement, et le second est un nom approuvé. Un appel, un attribut, une
+    constante ou un nom hors liste ne dispensent rien — la garde ne peut pas
+    établir ce que la valeur subira.
+    """
+    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
             and node.func.id in NEUTRALISING_FUNCTIONS):
+        return None
+    if node.func.id != REQUIREMENT_VALUE_FUNCTION:
+        return node.func.id
+    if len(node.args) != 2 or node.keywords:
+        return None
+    form = node.args[1]
+    if isinstance(form, ast.Name) and form.id in approved_forms:
         return node.func.id
     return None
 
 
 def _is_escape_call(node: ast.AST) -> bool:
-    return _neutralising_call(node) == ESCAPE_FUNCTION
+    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == ESCAPE_FUNCTION)
 
 
 def _escape_definition_is_sound(tree: ast.Module,
@@ -328,6 +394,7 @@ def _unescaped_quoted_interpolations(path: Path | None = None) -> list[str]:
     owner = _enclosing_functions(tree)
     literal_names = _module_literal_names(tree, owner)
     escape_is_sound = _escape_definition_is_sound(tree, owner)
+    approved_forms = _approved_form_names(tree, owner)
 
     offenders: list[str] = []
     for node in ast.walk(tree):
@@ -354,7 +421,7 @@ def _unescaped_quoted_interpolations(path: Path | None = None) -> list[str]:
             if not inside:
                 continue
             expression = part.value
-            if _neutralising_call(expression) is not None:
+            if _neutralising_call(expression, approved_forms) is not None:
                 if _escape_is_shadowed_at(node, owner) or not escape_is_sound:
                     offenders.append(
                         f"ligne {node.lineno} : {ast.unparse(expression)} — "
@@ -915,3 +982,125 @@ def test_the_format_spec_counts_toward_the_cumulative_static_text(tmp_path):
         # `n` aussi : il est dedans, avant même que le `format_spec` ne compte.
         "ligne 2 : n interpolé dans un littéral de chaîne sans _esc",
     ]
+
+
+# ---------------------------------------------------------------------------
+# La dispense du SECOND neutraliseur porte sur le MOTIF, jamais sur le nom.
+#
+# Défaut relevé en review (2026-08-26) : `_neutralising_call` accordait la
+# dispense sur le seul nom de la fonction appelée et n'inspectait jamais le
+# second argument — celui qui fait tout le travail de refus.
+# `_requirement_value(a.name, ANY)` passait donc, quel que soit `ANY`. La
+# formulation qui l'accompagnait — « elle exige une forme » — décrivait une
+# garde qui n'existait pas : elle exigeait qu'un deuxième argument EXISTE.
+#
+# La dispense est désormais liée à un motif ÉPINGLÉ, nommé et littéral : le
+# second argument doit être un NOM de la liste close, lié une seule fois au
+# niveau du module à `re.compile(<le motif épinglé>)`. Changer le motif — le
+# rendre permissif, ou seulement le réécrire — fait tomber la dispense, donc
+# rougir la garde. C'est la contre-épreuve qui manquait.
+# ---------------------------------------------------------------------------
+
+_PINNED = "\n".join(
+    f"{name} = re.compile({pattern!r})" for name, pattern in REQUIREMENT_FORMS.items()
+)
+
+
+def _requirement_module(tmp_path, forms: str, body: str):
+    return _fake_module(tmp_path, "import re\n" + forms + "\n" + textwrap.dedent(body))
+
+
+def test_the_pinned_form_dispenses_the_requirement_interpolation(tmp_path):
+    """Cas nominal : la forme épinglée, liée au niveau module, dispense."""
+    fake = _requirement_module(tmp_path, _PINNED, '''
+        def _requirement_value(value, form):
+            if not form.match(value):
+                raise ValueError(value)
+            return value
+        def compose(identifier):
+            return f'identifier "{_requirement_value(identifier, BUNDLE_IDENTIFIER_FORM)}"'
+        ''')
+    assert _unescaped_quoted_interpolations(fake) == []
+
+
+def test_a_form_that_is_not_on_the_closed_list_does_not_dispense(tmp_path):
+    """`_requirement_value(a.name, ANY)` — le cas reproduit en review."""
+    fake = _requirement_module(tmp_path, _PINNED + "\nANY = re.compile('.*')", '''
+        def _requirement_value(value, form):
+            if not form.match(value):
+                raise ValueError(value)
+            return value
+        def cmd(a):
+            return f'error "{_requirement_value(a.name, ANY)}"'
+        ''')
+    assert _unescaped_quoted_interpolations(fake) != []
+
+
+def test_a_permissive_form_under_a_pinned_name_does_not_dispense(tmp_path):
+    """LE cas que la garde manquait : le nom est le bon, le motif ne l'est
+    plus. Une dispense adossée au nom seul resterait verte ici."""
+    fake = _requirement_module(
+        tmp_path, "BUNDLE_IDENTIFIER_FORM = re.compile('.*')", '''
+        def _requirement_value(value, form):
+            if not form.match(value):
+                raise ValueError(value)
+            return value
+        def cmd(a):
+            return f'error "{_requirement_value(a.name, BUNDLE_IDENTIFIER_FORM)}"'
+        ''')
+    assert _unescaped_quoted_interpolations(fake) != []
+
+
+def test_a_form_rebound_at_module_level_does_not_dispense(tmp_path):
+    """Même défaut par l'autre route : le motif épinglé, puis réaffecté."""
+    fake = _requirement_module(
+        tmp_path, _PINNED + "\nBUNDLE_IDENTIFIER_FORM = re.compile('.*')", '''
+        def _requirement_value(value, form):
+            if not form.match(value):
+                raise ValueError(value)
+            return value
+        def cmd(a):
+            return f'error "{_requirement_value(a.name, BUNDLE_IDENTIFIER_FORM)}"'
+        ''')
+    assert _unescaped_quoted_interpolations(fake) != []
+
+
+@pytest.mark.parametrize("argument", [
+    "re.compile('.*')",                 # un appel, pas un nom : rien à épingler
+    "forms.BUNDLE_IDENTIFIER_FORM",     # un attribut : la cible n'est pas lisible ici
+    "None",
+])
+def test_a_form_that_is_not_a_pinned_name_does_not_dispense(tmp_path, argument):
+    fake = _requirement_module(tmp_path, _PINNED, f'''
+        def _requirement_value(value, form):
+            if not form.match(value):
+                raise ValueError(value)
+            return value
+        def cmd(a):
+            return f'error "{{_requirement_value(a.name, {argument})}}"'
+        ''')
+    assert _unescaped_quoted_interpolations(fake) != []
+
+
+def test_a_requirement_value_call_without_its_form_does_not_dispense(tmp_path):
+    fake = _requirement_module(tmp_path, _PINNED, '''
+        def _requirement_value(value, form=None):
+            return value
+        def cmd(a):
+            return f'error "{_requirement_value(a.name)}"'
+        ''')
+    assert _unescaped_quoted_interpolations(fake) != []
+
+
+def test_the_real_script_pins_the_two_forms_the_dispensation_rests_on():
+    """Le motif épinglé ici est celui que le script emploie RÉELLEMENT.
+
+    Sans cette assertion, la liste close pourrait décrire un script qui
+    n'existe pas — la dispense tomberait alors sur le vrai fichier, ce que
+    `test_no_value_reaches_a_script_string_literal_unescaped` verrait ; mais
+    l'inverse, un motif épinglé plus permissif que le script, ne se verrait
+    nulle part.
+    """
+    tree = ast.parse(SCRIPT_PATH.read_text(encoding="utf-8"))
+    owner = _enclosing_functions(tree)
+    assert _approved_form_names(tree, owner) == set(REQUIREMENT_FORMS)
