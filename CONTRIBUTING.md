@@ -74,6 +74,35 @@ that requires macOS or code-signing tools (`codesign`, `security`,
 absent; make sure they still pass on a machine that has them before
 opening the pull request.
 
+## Building the bundle locally
+
+The tests need neither Things 3 nor a built bundle. Building one does need
+an Apple signing certificate of your own, and a local configuration file
+that this repository deliberately does not ship:
+
+```ini
+# build/identity.conf — local, git-ignored, no default is versioned
+bundle_identifier = app.example.thingskit
+team_identifier = <your-team-id>      # 10 uppercase alphanumerics (the leaf certificate's OU)
+install_path = /Applications/thingskit.app
+```
+
+Then `python3 -m build.bundle` (or `python3 -m build.bundle <destination>`,
+or `--config <file>` to point at another configuration).
+
+Three things worth knowing before you spend time on it:
+
+- **The three fields are mandatory and strictly shaped.** An absent, empty,
+  duplicated, unknown or ill-formed field is a refusal that names the file
+  and the field — never a silent default. The same shape rules are enforced
+  a second time, at runtime, on the copy sealed inside the bundle.
+- **You have to recreate this file after a `git clean`.** That is the
+  accepted cost of shipping no identity in a public repository (`ADR-003`).
+- **The floor of the code requirement is not configurable.** The
+  configuration can only narrow what the bundle demands of itself: the
+  Apple anchor and the certificate-type marker are written in code, and no
+  configuration can remove them.
+
 ## Contributing in a sensitive zone
 
 `constitution.md` (in French) § Sensitive zones lists the areas of the
