@@ -1,0 +1,3093 @@
+#!/usr/bin/env python3
+"""thingskit — CLI d'accès à Things 3 (Cultured Code) pour le harness agentique.
+
+Pourquoi cet outil existe
+-------------------------
+La skill `things` ne porte que l'usage : aucun code, et surtout aucun code
+généré à la volée — un script réécrit à chaque appel n'est jamais deux fois le
+même, donc jamais testé. Tout ce que le harness sait faire avec Things passe
+par ici, où c'est versionné, lisible et vérifiable.
+
+Ce que Things permet, et ce qu'il ne permet pas
+-----------------------------------------------
+Constaté par test le 2026-08-11, pas déduit de la documentation :
+
+  Area            créer          -> AppleScript (`make new area`)
+                  créer via JSON -> NON : le schéma d'URL ignore SILENCIEUSEMENT
+                                    une area inexistante et laisse le projet sans
+                                    rattachement, sans lever d'erreur
+                  notes          -> NON : une area n'a pas de champ notes
+  Projet          créer          -> JSON (`things:///json`), area par son nom
+                  notes          -> AppleScript (`set notes of project`), ou
+                                    par identifiant : `to do id "<uuid de
+                                    projet>"` résout aussi (la classe `project`
+                                    hérite de `to do`), ce qui donne
+                                    `--project-id`, seule voie utilisable
+                                    depuis le vault qui ne connaît que
+                                    `things_id`, jamais les titres Things
+  Heading         créer (projet   -> JSON, dans `items` à la création du projet
+                  neuf)              (`create-project --heading`)
+                  créer (projet   -> AUCUNE surface API (URL scheme, JSON,
+                  existant)          AppleScript) ne l'expose. Seule
+                                    l'automatisation d'interface fonctionne
+                                    (menu Fichier > "Nouvel en-tête" ou
+                                    équivalent localisé) : `create-heading`
+                  notes          -> NON. `to do id "<uuid de heading>"` RÉSOUT
+                                    et `set notes` y retourne 0, mais la valeur
+                                    n'est ni relue par AppleScript ni présente
+                                    en base ensuite : l'ordre est un no-op
+                                    SILENCIEUX (mesuré le 2026-08-12 sur la
+                                    vraie base). Un heading est donc refusé
+                                    avant tout envoi — c'est le mode d'échec
+                                    « commande envoyée ≠ effet constaté »
+  Tâche           créer          -> JSON ; `list` = projet ou area,
+                                    `heading` = heading existant. Un `list`
+                                    qui ne nomme NI projet NI area est ignoré
+                                    silencieusement : la tâche atterrit en
+                                    Inbox et `open` rend malgré tout 0 —
+                                    même mode d'échec que l'area inexistante
+                                    ci-dessus (constaté le 2026-08-12 par
+                                    l'utilisateur, BUG-005 ; non re-mesuré
+                                    ici, le mesurer imposerait d'écrire dans
+                                    la base réelle). D'où la résolution de la
+                                    cible AVANT l'envoi, et la vérification du
+                                    RATTACHEMENT après coup — l'existence de
+                                    la tâche, elle, est vraie dans les deux
+                                    cas et ne prouve donc rien
+                  sous heading   -> son champ `project` reste VIDE en base.
+                                    Compter les tâches d'un projet en joignant
+                                    sur `project` les rate toutes
+                  terminer       -> AppleScript (`set status of to do id … to
+                                    completed`). Constaté le 2026-08-12 par
+                                    `sdef /Applications/Things3.app` : `status`
+                                    est une propriété rw de la classe `to do`,
+                                    d'énumération open|completed|canceled — donc
+                                    PAS besoin d'automatisation d'interface,
+                                    contrairement au heading : `complete-task`
+                  notes          -> AppleScript (`set notes of to do id … to …`).
+                                    `notes` est déclarée sans attribut `access`
+                                    dans le dictionnaire de la classe `to do`,
+                                    donc rw par défaut comme `name` : aucune
+                                    frappe clavier en jeu, un saut de ligne y
+                                    est un contenu légitime.
+                                    Fidélité MESURÉE de bout en bout le
+                                    2026-08-12 sur une tâche jetable réelle
+                                    (accents, tiret cadratin, LF, CR, CRLF,
+                                    tabulation, URI percent-encodée, guillemet
+                                    et antislash, emoji hors BMP, U+2028) :
+                                    la valeur relue en base est
+                                    exactement la chaîne envoyée, AUCUNE classe
+                                    n'est altérée — donc aucune n'est refusée
+                  où elle apparaît -> le couple (`start`, `startDate`), jamais
+                                    `start` seul. Table MESURÉE le 2026-08-12
+                                    en croisant `to dos of list "<libellé>"`
+                                    avec la base, re-mesurée le 2026-08-12
+                                    (BUG-001) sur 610 tâches ouvertes :
+                                      start=0 sans date -> À classer     (126)
+                                      start=1 sans date -> À tout moment (458)
+                                      start=1 avec date -> Aujourd'hui   (11)
+                                      start=2 sans date -> Un jour       (1)
+                                      start=2 avec date -> À venir       (14)
+                                    Contresens à éviter : lire `start=2` comme
+                                    « Un jour ». Une tâche planifiée à une date
+                                    future porte bien `start=2` ; forcer 1 la
+                                    ferait basculer dans Aujourd'hui
+                  replanifier    -> AppleScript ciblé : `schedule … for <date>`
+                                    pour une date, `move … to list "<libellé>"`
+                                    pour Aujourd'hui / À tout moment / Un jour,
+                                    `set due date` et `delete due date` pour
+                                    l'échéance : `reschedule-task`. Mesuré le
+                                    2026-08-17 sur une tâche jetable réelle,
+                                    cinq constats qui commandent le design :
+                                    (1) le schéma d'URL `operation: "update"`
+                                    EXIGE un jeton d'authentification (Things >
+                                    Réglages > Général) ; sans jeton l'app
+                                    affiche une boîte de dialogue et NE MUTE
+                                    RIEN — no-op silencieux côté script, donc
+                                    surface écartée, pas « tentée » ;
+                                    (2) `activation date` est access="r"
+                                    (la poser lève -10006) : le `when` passe
+                                    par la commande `schedule`, pas par la
+                                    propriété ;
+                                    (3) un littéral `date "2026-09-05"` est
+                                    interprété selon la LOCALE de la session et
+                                    a produit 2011-03-19 — toute date est
+                                    construite champ par champ
+                                    (`set year/month/day`), jamais en chaîne ;
+                                    (4) `set due date … to missing value` lève
+                                    -1700 ; c'est `delete due date` qui retire
+                                    l'échéance ;
+                                    (5) `schedule … for (current date)` pose
+                                    start=2 + date du jour = « À venir », PAS
+                                    « Aujourd'hui » (start=1 + date) : celui-ci
+                                    s'obtient par `move to list`, dont les
+                                    libellés sont LOCALISÉS (`exists list
+                                    "Anytime"` -> false, `"À tout moment"` ->
+                                    true sur ce poste) — d'où une liste de
+                                    candidats, comme pour le menu de heading.
+                                    Non couvert, donc REFUSÉ explicitement :
+                                    `evening` (aucune liste « Ce soir » /
+                                    « Evening » n'existe) et le suffixe
+                                    `@HH:MM` (`reminderTime` n'est exposé par
+                                    aucune propriété AppleScript).
+                                    `schedule` sur une tâche `completed`
+                                    RÉUSSIT et laisse le statut inchangé : la
+                                    date atterrit sur un objet absent de toute
+                                    liste, d'où le refus en amont
+                  rouvrir        -> AppleScript ciblé, même propriété `status`
+                                    que `terminer`/`annuler` mais dans l'autre
+                                    sens : `set status … to open`. Ajoutée le
+                                    2026-08-24, en rupture assumée avec le
+                                    principe initial de `complete-task` /
+                                    `cancel-task` (« aucune opération inverse
+                                    n'est exposée ») : ce principe protégeait
+                                    une DÉCISION affirmée, pas une ERREUR de
+                                    fermeture (ex. un lot de complétions qui
+                                    emporte des tâches encore vraies).
+                                    `reopen-task` accepte indifféremment
+                                    `completed` ET `canceled` comme état de
+                                    départ — contrairement aux deux commandes
+                                    voisines, qui refusent chacune l'état de
+                                    l'autre : `reopen-task` est précisément
+                                    l'opération qui manquait aux deux, et leurs
+                                    messages de refus doivent le dire plutôt
+                                    que d'affirmer qu'aucune n'existe
+
+La lecture ne passe jamais par AppleScript : elle interroge la base SQLite en
+lecture seule (`mode=ro`), ce qui est plus rapide, scriptable, et ne dépend pas
+de l'application au premier plan.
+
+Le schéma d'URL ne sait pas SUPPRIMER sans jeton d'authentification (réglages
+Things). Les suppressions passent donc par AppleScript, qui n'en demande pas.
+
+Délai d'enregistrement d'une écriture — MESURÉ le 2026-08-25 (Mac Studio,
+Things 3.23), par sondage de `main.sqlite` toutes les 25 ms jusqu'à constat,
+plafond 10 s, sur 10 tâches jetables :
+
+    création par schéma d'URL   n=5    médiane  11 ms   max   66 ms
+    création par AppleScript    n=5    médiane  13 ms   max   14 ms
+    renommage                   n=10   médiane  11 ms   max   14 ms
+    complétion                  n=10   médiane  11 ms   max   14 ms
+    mise à la Corbeille         n=10   médiane  23 ms   max 5026 ms
+
+Deux constats commandent le design de l'attente post-écriture (BUG-016) :
+(1) l'enregistrement est de l'ordre de 11-23 ms, soit ~130x moins que les
+attentes fixes de 1500-2500 ms qui le précédaient ; (2) la queue existe et
+dépasse ces plafonds — une suppression sur dix a mis 5026 ms, cas où la
+relecture tombait avant l'effet et où la commande sortait en échec sur une
+écriture pourtant réussie. L'attente est donc une BOUCLE DE RELECTURE BORNÉE
+(`wait_for_effect`), jamais une durée devinée. Mesuré le même jour, la
+composante attente d'un cycle réel tombe de 1500-2500 ms fixes à 0-25 ms :
+`osascript` rend la main après que Things a appliqué le changement, donc la
+toute première relecture constate déjà l'effet (0 sondage sur rename /
+complete / delete, 1 sur add-task, qui écrit par schéma d'URL — asynchrone).
+
+`create-heading` a une SECONDE attente, de nature différente : le clic de
+menu s'applique à la fenêtre au premier plan, et il faut que Things ait
+affiché le projet visé. Cette condition-là n'a aucune trace en base, mais
+elle s'observe par la surface applicative (`name of window 1`), donc elle est
+sondée elle aussi. Mesuré le 2026-08-25 sur 3 démarrages à froid :
+`pgrep -x Things3` matche à 57-62 ms, la fenêtre affiche le projet à
+795-970 ms. Un AppleEvent adressé à l'application EN COURS DE LANCEMENT ne
+rend pas `-600` : il BLOQUE jusqu'à pouvoir être servi (699, 753, 854 ms,
+rc=0) — d'où la borne `with timeout of` posée dans la sonde, sans quoi
+l'attente serait bornée par le délai d'AppleEvent d'`osascript` (120 s) et
+non par le plafond de la boucle. Écartés parce que MESURÉS inopérants sur
+cette version : `current list url` et `current list name`, propriétés cachées
+du dictionnaire, rendent `missing value`.
+
+Usage
+-----
+    thingskit areas [--json]
+    thingskit projects [--area NOM] [--json]
+    thingskit headings [--project TITRE] [--json]
+    thingskit tasks [--project TITRE] [--area NOM] [--inbox] [--json]
+    thingskit uuid --type area|project|heading --title TITRE
+    thingskit find-task TITRE --list CIBLE [--heading H] [--json]
+    thingskit create-area NOM
+    thingskit create-project TITRE --area NOM [--notes TEXTE] [--heading H]...
+    thingskit create-heading TITRE --project TITRE
+    thingskit add-task TITRE --list CIBLE [--heading H] [--notes TEXTE]
+    thingskit set-notes --project TITRE|--project-id UUID --notes TEXTE
+    thingskit set-notes --task TITRE|--task-id UUID --notes TEXTE
+    thingskit append-notes --project TITRE|--project-id UUID --line LIGNE
+    thingskit append-notes --task TITRE|--task-id UUID --line LIGNE
+    thingskit complete-task [--id UUID] [--title TITRE]
+    thingskit cancel-task [--id UUID] [--title TITRE]
+    thingskit reopen-task [--id UUID] [--title TITRE]
+    thingskit rename-task [--id UUID] [--title TITRE] --new-title TITRE
+    thingskit reschedule-task [--id UUID] [--title TITRE] [--when VAL]
+                              [--deadline AAAA-MM-JJ] [--clear-deadline]
+    thingskit deeplink --type project|area|task --title TITRE
+
+Toutes les sous-commandes de lecture acceptent `--json`. Les sous-commandes
+d'écriture affichent ce qu'elles ont fait et sortent en code non nul si la
+vérification post-écriture échoue.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+import unicodedata
+
+
+# --------------------------------------------------------------- BUG-009
+# Identité de code de l'entrée CLI (ADR-001, INV-001-1).
+#
+# Le grant TCC `kTCCServiceSystemPolicyAppData` est accordé à une IDENTITÉ DE
+# CODE, pas à un fichier. Lancer ce script sous un interpréteur de passage
+# (Homebrew, Xcode, venv) accède donc à la base de Things sous l'identité de
+# CET interpréteur — d'où une invite d'autorisation par interpréteur, et une
+# nouvelle à chaque `brew upgrade python` (mesuré : deux entrées TCC pour
+# python@3.14.6 et 3.14.7). C'est exactement le défaut qu'ADR-001 élimine, par
+# un chemin d'appel qui n'était pas couvert.
+#
+# Le discriminant est la SIGNATURE de l'interpréteur en cours, opposée à
+# l'exigence de code du bundle — le même contrôle que fait le lanceur sur le
+# bundle. Un critère satisfaisable par accident (variable d'environnement,
+# nom de fichier, répertoire parent) ne vaudrait rien : il suffirait de le
+# poser pour retrouver l'invite. `-R` n'est pas optionnel — sans lui, codesign
+# constate « une signature valide », jamais « LA signature » (une copie
+# re-signée ad-hoc repassait à rc=0, mesuré le 2026-08-18).
+#
+# La garde porte UNIQUEMENT sur `__main__` : `tests/conftest.py` charge ce
+# fichier comme module via `SourceFileLoader`, et un refus au niveau module
+# casserait toute la suite sans rien protéger de plus.
+BUNDLE_IDENTIFIER = "app.sowell.thingskit"
+TEAM_IDENTIFIER = "56AP2NSB54"
+# Chemin ABSOLU : un vérificateur que `PATH` peut détourner ne vérifie rien.
+CODESIGN = "/usr/bin/codesign"
+# Marqueur d'extension X.509 du TYPE de certificat (ADR-002 § Decision 5). Le
+# `csreq` que TCC a enregistré pinne le CN de la feuille, jamais le Team ID :
+# sans ce discriminant, un bundle re-signé sous un certificat d'un autre type
+# (Developer ID Application) satisferait cette exigence tout en ayant perdu le
+# grant. Rationale complète et limite non établie : build/bundle.py.
+CERTIFICATE_TYPE_OID = "1.2.840.113635.100.6.1.2"
+CODE_REQUIREMENT = (
+    "anchor apple generic"
+    f' and identifier "{BUNDLE_IDENTIFIER}"'
+    f' and certificate leaf[field.{CERTIFICATE_TYPE_OID}] exists'
+    f' and certificate leaf[subject.OU]="{TEAM_IDENTIFIER}"'
+)
+LAUNCHER_HINT = "~/.local/bin/thingskit"
+# `codesign` peut se bloquer (volume réseau, `AppleMobileFileIntegrity`
+# occupé). Sans borne, toute invocation du CLI pendrait indéfiniment et sans
+# message : le refus par défaut serait préservé, mais jamais rendu. Lue à
+# l'appel (pas figée en défaut de `def`) pour rester substituable en test.
+CODESIGN_TIMEOUT = 10
+# Distinct de tout code du chemin nominal (`main` rend 0/1, argparse 2) ET du
+# refus de sceau du lanceur (126) : les deux causes ne se confondent pas.
+IDENTITY_REFUSAL_CODE = 125
+
+
+def code_identity_refusal(executable: str | None = None, runner=None) -> str | None:
+    """Rend le message de refus, ou `None` si l'interpréteur porte l'identité.
+
+    Le contrôle est fermé par défaut : si `codesign` ne peut pas être exécuté,
+    l'identité n'est pas établie, donc elle est refusée.
+    """
+    executable = executable or sys.executable
+    runner = runner or subprocess.run
+    try:
+        rc = runner(
+            [CODESIGN, "--verify", "--strict", f"-R={CODE_REQUIREMENT}", executable],
+            capture_output=True,
+            text=True,
+            timeout=CODESIGN_TIMEOUT,
+        ).returncode
+    # Fermé par défaut, et fermé PROPREMENT : tout échec d'invocation devient
+    # un refus nommé avec son propre code de sortie. `SubprocessError` couvre
+    # le dépassement de délai (`TimeoutExpired`) ; `ValueError` couvre les
+    # arguments que `subprocess` rejette avant même de forker (chemin à octet
+    # nul). Un traceback rendrait 1, indiscernable d'un échec de `main()`.
+    except (OSError, subprocess.SubprocessError, ValueError):
+        rc = -1
+    if rc == 0:
+        return None
+    return (
+        f"thingskit: interpreteur sans l'identite de code du bundle "
+        f"({BUNDLE_IDENTIFIER}) : {executable}\n"
+        f"thingskit: execution refusee — lancer {LAUNCHER_HINT}, sinon l'acces "
+        f"a la base de Things se ferait sous une identite de passage et "
+        f"macOS redemanderait l'autorisation."
+    )
+
+import urllib.parse
+from pathlib import Path
+
+# La base vit dans un dossier dont le suffixe varie d'une installation à
+# l'autre : on la résout par glob plutôt que de coder un chemin qui casserait
+# au prochain poste.
+_GC = Path.home() / "Library/Group Containers/JLMPQHK86H.com.culturedcode.ThingsMac"
+
+# Chemins ABSOLUS, jamais résolus par PATH. Le bundle signé isole
+# l'interpréteur de son environnement Python (`-I`, cf. build/bundle.py), mais
+# `-I` ne ferme pas `PATH` : une commande invoquée par NOM NU y serait résolue,
+# donc détournable par un homonyme déposé dans un répertoire du PATH — et le
+# code du stub tournerait sous l'identité de code porteuse du grant TCC
+# `kTCCServiceSystemPolicyAppData`. Même classe de défaut que `PYTHONPATH` et
+# que le `codesign` du lanceur (build/bundle.py, CODESIGN), avec une
+# conséquence plus lourde : ce n'est pas une garde qu'on neutralise, c'est du
+# code arbitraire qu'on exécute. Reproduit le 2026-08-18 (stub `osascript`).
+OSASCRIPT = "/usr/bin/osascript"
+OPEN = "/usr/bin/open"
+PGREP = "/usr/bin/pgrep"
+
+# Régime rapide du lanceur (ADR-002). Source de vérité UNIQUE de la partition :
+# `build/bundle.py` lit cette constante au build et l'embarque dans le shim
+# Mach-O, qui ne porte aucune liste écrite à la main (INV-002-3). Elle n'est
+# lue par aucun chemin d'exécution du CLI — c'est une déclaration, pas un
+# dispatch.
+#
+# Le sens de lecture est le cœur de la décision, pas un détail : le shim ne
+# connaît QUE cette liste, et disclaime la responsabilité de processus pour
+# tout le reste — sous-commande inconnue, absente, invalide, ou simplement
+# NOUVELLE. Un oubli ne peut donc coûter qu'une lenteur mesurable — de l'ordre
+# de la seconde à CHAQUE appel, surcoût permanent mesuré le 2026-08-21 sur
+# toute sous-commande, y compris celles qui n'envoient aucun Apple Event —,
+# jamais une régression de consentement `kTCCServiceAppleEvents`, qui serait
+# un défaut silencieux découvert par l'utilisateur devant un dialogue. C'est
+# ce coût que la partition épargne au chemin chaud.
+#
+# Le critère d'appartenance n'est PAS « lecture vs écriture » mais « sollicite
+# `osascript` ou non » : `create-project` et `add-task` écrivent par schéma
+# d'URL (`things:///json` via `/usr/bin/open`) et n'ont aucun besoin
+# d'AppleEvents — les taxer serait une erreur de partition. Gardé par balayage
+# du graphe d'appel (`tests/test_fast_path_partition.py`), qui exige une
+# intersection vide avec l'ensemble des sous-commandes atteignant `osa()`.
+FAST_PATH_COMMANDS = frozenset({
+    "add-task",
+    "agenda",
+    "areas",
+    "create-project",
+    "deeplink",
+    "find-task",
+    "headings",
+    "projects",
+    "tasks",
+    "uuid",
+})
+
+TYPE_TASK, TYPE_PROJECT, TYPE_HEADING = 0, 1, 2
+
+# status: constaté par AppleScript (`status of to do id …`) contre les 3
+# valeurs réellement présentes en base le 2026-08-11 — pas déduit de la doc.
+STATUS_OPEN, STATUS_CANCELED, STATUS_COMPLETED = 0, 2, 3
+STATUS_LABELS = {STATUS_OPEN: "open", STATUS_CANCELED: "canceled",
+                 STATUS_COMPLETED: "completed"}
+
+
+def decode_things_date(v: int | None) -> str | None:
+    """startDate / deadline : entier bit-packé, constaté sur le schéma réel.
+
+    year = v >> 16 ; month = (v >> 12) & 0xF ; day = (v >> 7) & 0x1F.
+    Vérifié sur les 3 témoins d'un projet réel de la base
+    (132811008 -> 2026-08-18, etc.) — pas une conversion présumée.
+    """
+    if v is None:
+        return None
+    year = v >> 16
+    month = (v >> 12) & 0xF
+    day = (v >> 7) & 0x1F
+    return f"{year:04d}-{month:02d}-{day:02d}"
+
+
+def decode_alarm_time(v: int | None) -> str | None:
+    """reminderTime : entier = (heure*64+minute) << 20. Les minutes occupent 6
+    bits (0-63) : aucune quantification, Things accepte les minutes non
+    rondes.
+
+    Mesuré le 2026-08-17 sur 10 valeurs `reminderTime` distinctes réellement
+    présentes en base, dont 5 à minutes non rondes (16:15, 16:29, 16:31,
+    16:45, 16:59) — l'ancien modèle `(heure*60+minute)//30 << 25` ne
+    reconstituait que les 5 valeurs à minutes rondes.
+    """
+    if v is None:
+        return None
+    hour, minute = divmod(v >> 20, 64)
+    return f"{hour:02d}:{minute:02d}"
+
+
+# `start` seul ne dit PAS où la tâche apparaît : c'est le couple
+# (start, startDate) qui décide. Table MESURÉE le 2026-08-12 en croisant
+# l'AppleScript `to dos of list "<libellé>"` avec la base, sur les 606 tâches
+# ouvertes — pas déduite de la documentation.
+#
+#   start=0, sans date -> À classer     start=2, sans date -> Un jour
+#   start=1, sans date -> À tout moment start=2, avec date -> À venir
+#   start=1, avec date -> Aujourd'hui
+#
+# Le contresens à éviter : lire `start=2` comme « Un jour » sans regarder la
+# date. Une tâche planifiée à une date future porte bien `start=2`, et forcer
+# `start=1` ne la « réparerait » pas — ça la ferait basculer dans Aujourd'hui.
+START_INBOX, START_ANYTIME, START_SOMEDAY = 0, 1, 2
+
+
+def scheduling_list(start: int | None, start_date: int | None) -> str | None:
+    """Rend la liste Things où la tâche apparaît, ou None si `start` n'est pas
+    une des trois valeurs mesurées — on n'invente pas un libellé pour une
+    valeur qu'on n'a pas observée. Pure.
+    """
+    if start == START_INBOX:
+        return "inbox"
+    if start == START_ANYTIME:
+        return "today" if start_date is not None else "anytime"
+    if start == START_SOMEDAY:
+        return "upcoming" if start_date is not None else "someday"
+    return None
+
+
+def db_path() -> Path:
+    hits = sorted(_GC.glob("ThingsData-*/Things Database.thingsdatabase/main.sqlite"))
+    if not hits:
+        sys.exit("base Things introuvable — l'application est-elle installée ?")
+    return hits[0]
+
+
+def q(sql: str, args: tuple = ()) -> list[tuple]:
+    con = sqlite3.connect(f"file:{db_path()}?mode=ro", uri=True)
+    try:
+        return con.execute(sql, args).fetchall()
+    finally:
+        con.close()
+
+
+def osa(script: str) -> tuple[int, str]:
+    r = subprocess.run([OSASCRIPT, "-e", script], capture_output=True, text=True)
+    return r.returncode, (r.stdout or r.stderr).strip()
+
+
+def url_open(payload: list, background: bool = True) -> None:
+    """Envoie un payload au schéma d'URL de Things.
+
+    `background=True` (défaut) passe `-g` à `open` : « Do not bring the
+    application to the foreground » (man open). Sans lui, chaque écriture
+    fait passer Things au premier plan et vole le focus de l'utilisateur.
+    Les commandes qui pilotent l'INTERFACE (menus, frappe clavier) doivent
+    passer `background=False` — elles ont besoin du premier plan.
+    """
+    url = "things:///json?data=" + urllib.parse.quote(
+        json.dumps(payload, ensure_ascii=False))
+    argv = [OPEN] + (["-g"] if background else []) + [url]
+    subprocess.run(argv, check=False)
+
+
+# ---------------------------------------------------------------------------
+# Attente post-écriture : boucle de relecture bornée (BUG-016, 2026-08-25)
+# ---------------------------------------------------------------------------
+# Chaque commande d'écriture attendait une durée FIXE avant de relire la base
+# pour constater son effet. Mesuré le 2026-08-25 (Mac Studio, Things 3.23,
+# sondage de `main.sqlite` toutes les 25 ms, plafond 10 s, 10 tâches jetables) :
+#
+#   création par schéma d'URL    n=5    médiane  11 ms   max   66 ms
+#   création par AppleScript     n=5    médiane  13 ms   max   14 ms
+#   renommage                    n=10   médiane  11 ms   max   14 ms
+#   complétion                   n=10   médiane  11 ms   max   14 ms
+#   mise à la Corbeille          n=10   médiane  23 ms   max 5026 ms
+#
+# Une durée devinée est fautive DANS LES DEUX SENS. Trop longue dans le cas
+# courant — 1500 à 2500 ms pour un effet enregistré en 11 ms, soit ~130x. Trop
+# COURTE sur la queue : la suppression mesurée à 5026 ms dépassait le plafond
+# de 1500 ms, la relecture tombait avant l'enregistrement, et la commande
+# sortait en échec sur une écriture qui avait pourtant réussi. C'est le mode
+# d'échec le plus coûteux du lot : l'appelant qui réessaie sur échec produit un
+# doublon dans la base réelle de l'utilisateur (§ Zones sensibles 1).
+#
+# POLL_INTERVAL — 25 ms. C'est l'intervalle avec lequel les chiffres ci-dessus
+#   ont été mesurés, donc le seul pour lequel ils valent directement. Il vaut
+#   ~2x la médiane de 11 ms : le cas courant est constaté au premier ou au
+#   deuxième sondage. Le sondage lui-même coûte 0,7 ms (médiane sur 50 lectures
+#   de la vraie base, 1122 lignes, mesuré le 2026-08-25) — 3 % de l'intervalle,
+#   donc le temps réellement écoulé ne dépasse le plafond nominal que de
+#   quelques pour cent.
+#
+# WRITE_TIMEOUT — 15 s, soit près de 3x la seule queue observée (5026 ms). La
+#   marge est délibérément asymétrique, parce que les deux erreurs ne coûtent
+#   pas la même chose. Un plafond trop BAS reconvertit une écriture réussie en
+#   échec, et se paie dans les données de l'utilisateur (doublon) ; trop HAUT,
+#   il ne coûte que de la latence, et seulement sur un chemin déjà défaillant. Les
+#   5026 ms étant un échantillon UNIQUE, la distribution de la queue est
+#   inconnue : la marge se prend du côté qui ne casse rien. 15 s reste très en
+#   deçà du seuil où un appelant conclurait que le CLI est pendu — c'est la
+#   raison d'être d'un plafond, même motif que `CODESIGN_TIMEOUT`.
+#
+# LAUNCH_TIMEOUT — 6 s, inchangé : c'est l'ancienne attente fixe de
+#   `ensure_running`, conservée comme PLAFOND pour ne pas aggraver le pire cas.
+#   Seule la médiane change (le lancement est constaté, plus attendu).
+POLL_INTERVAL = 0.025
+WRITE_TIMEOUT = 15.0
+LAUNCH_POLL_INTERVAL = 0.1
+LAUNCH_TIMEOUT = 6.0
+
+# AFFICHAGE de `create-heading` — condition OBSERVÉE, plus durée devinée.
+#
+# Le clic « Fichier > Nouvel en-tête » s'applique à la FENÊTRE AU PREMIER
+# PLAN. Rien ne garantissait qu'elle affiche le projet visé : on envoyait
+# `things:///show?id=<uuid>`, puis on attendait 1 s. Sur `master` cette
+# seconde venait après les 6 s fixes de `ensure_running` — ~7 s de marge sur
+# un démarrage à froid. Depuis que le lancement est CONSTATÉ par `pgrep`, il
+# ne restait qu'elle, et `pgrep` observe l'existence du processus, jamais
+# l'avancement du lancement.
+#
+# Mesuré le 2026-08-25 (Mac Studio, Things 3.23, 3 démarrages à froid,
+# application quittée entre chaque) :
+#
+#   `pgrep -x Things3` matche à              57, 61, 62 ms
+#   la fenêtre affiche enfin le projet à    795, 846, 970 ms
+#   marge restante avant le clic            ~130 à ~305 ms   (~6,9 s sur master)
+#
+# Le défaut ne s'est pas reproduit sur ces trois essais — la marge a suffi.
+# C'est la marge elle-même qui avait fondu d'un facteur ~25 sur une opération
+# dont le pire cas dépend de la charge du poste et de la synchronisation
+# iCloud au lancement ; et son mode d'échec est celui que la constitution
+# nomme en § Zones sensibles 2 : le titre tapé dans le mauvais projet, effet
+# de bord irréversible que la vérification post-action constate sans pouvoir
+# le défaire.
+#
+# Cette condition n'a AUCUNE trace en base — il n'y a rien à relire. Elle est
+# en revanche observable par la surface applicative : `name of window 1` rend
+# le nom de la liste affichée (mesuré : « Aujourd'hui » avant l'URL, le titre
+# du projet après). Les deux propriétés cachées du dictionnaire, `current
+# list url` et `current list name`, rendent `missing value` sur cette
+# version : mesurées, écartées, pas déduites.
+#
+# HEADING_VIEW_TIMEOUT — 15 s, PLAFOND, pas attente : même valeur et même
+#   motif que `WRITE_TIMEOUT`, soit ~15x le pire affichage mesuré. Une marge
+#   asymétrique, du côté qui ne casse rien : trop bas, il refuserait un
+#   affichage lent et l'appelant réessaierait.
+# HEADING_VIEW_POLL_INTERVAL — 100 ms. La sonde est un AppleEvent (~80 ms
+#   mesuré à chaud), pas une lecture SQLite de 0,7 ms : sonder aux 25 ms de
+#   `POLL_INTERVAL` reviendrait à sonder en continu.
+# HEADING_VIEW_PROBE_TIMEOUT — 5 s, borne de l'AppleEvent LUI-MÊME. Établi
+#   sur pièce le 2026-08-25 : un AppleEvent adressé à une application en
+#   cours de lancement ne rend PAS `-600`, il BLOQUE jusqu'à pouvoir être
+#   servi (699, 753 et 854 ms mesurés, rc=0). Sans cette borne, l'attente
+#   serait bornée par le délai d'AppleEvent par défaut d'`osascript` (120 s)
+#   et le plafond de la boucle ne voudrait plus rien dire.
+HEADING_VIEW_TIMEOUT = 15.0
+HEADING_VIEW_POLL_INTERVAL = 0.1
+HEADING_VIEW_PROBE_TIMEOUT = 5
+
+# Premier plan — SECONDE condition, indépendante de l'affichage.
+# HEADING_FRONTMOST_ATTEMPTS x HEADING_FRONTMOST_POLL_INTERVAL = 5 s de
+#   DÉLAIS CUMULÉS. Ce produit était annoncé « 5 s de plafond » : c'était
+#   faux, rectifié le 2026-08-25. Il ne borne QUE les `delay` — chaque
+#   itération émet en plus un AppleEvent (`frontmost of application
+#   "Things3"`), borné individuellement à HEADING_VIEW_PROBE_TIMEOUT (5 s)
+#   par le `with timeout` englobant, et `osa()` ne passe aucun `timeout=` à
+#   `subprocess.run`. Le PIRE CAS réel est donc
+#   ATTEMPTS x (HEADING_VIEW_PROBE_TIMEOUT + POLL_INTERVAL) = 505 s, atteint
+#   seulement si chacun des 100 sondages épuise ses 5 s. La boucle TERMINE et
+#   échoue fermé dans tous les cas : c'est le chiffre qui mentait, pas le
+#   mécanisme. Les trois termes sont épinglés ensemble par test
+#   (`test_the_frontmost_budget_is_the_delays_alone_not_the_worst_case`) —
+#   c'est leur dissociation qui avait produit le chiffre faux.
+#   Ce pire cas n'est PAS borné côté Python, et c'est délibéré : `osa()`
+#   exécute ici un script qui clique un menu PUIS tape le titre. Le tuer en
+#   cours laisserait un en-tête créé sans titre, soit la mutation partielle
+#   silencieuse que `_LOST_FOCUS_MARKER` existe pour signaler — on échangerait
+#   une attente longue, que l'utilisateur voit, contre un objet vide dans sa
+#   base, qu'il ne voit pas.
+#   Dans le cas nominal la boucle sort au premier constat vrai et coûte zéro
+#   (l'`activate` qui la précède a déjà rendu Things frontmost). Elle remplace
+#   le délai fixe de 300 ms qui pariait sur une activation aboutie — poste
+#   chargé, dialogue modal d'une autre app, utilisateur qui change de fenêtre :
+#   le titre partait alors dans une AUTRE application.
+# La borne est un COMPTE D'ITÉRATIONS, pas un `with timeout` : ce dernier
+#   borne chaque AppleEvent, jamais la durée d'un `repeat`. Une boucle
+#   `repeat until` serait restée non bornée.
+HEADING_FRONTMOST_ATTEMPTS = 100
+HEADING_FRONTMOST_POLL_INTERVAL = 0.05
+
+
+def wait_for_effect(probe, timeout: float = WRITE_TIMEOUT,
+                    interval: float = POLL_INTERVAL):
+    """Sonde `probe` à intervalle court jusqu'à une valeur vraie, ou plafond.
+
+    Rend la dernière valeur rendue par la sonde : vraie = effet constaté,
+    fausse = plafond atteint sans constat.
+
+    Cette fonction ne décide RIEN. La vérification post-action et le code
+    retour restent au site d'appel — un plafond atteint reste un échec, jamais
+    un « commande envoyée » déguisé en succès (§ Zones sensibles 1). Tout ce
+    qu'elle change, c'est la DURÉE de l'attente : écourtée quand l'effet est
+    déjà là, allongée quand il tarde.
+
+    Le site d'appel compose son message depuis la valeur que la SONDE a
+    observée, capturée par fermeture — il ne relit PAS la base. Une seconde
+    lecture court après l'effet : s'il atterrit entre le dernier sondage et le
+    `print`, elle rend la valeur *attendue*, et le message affirme un échec en
+    montrant deux valeurs identiques. La forme est interdite par balayage
+    d'AST (`tests/test_write_wait.py`), sur la branche d'échec de chacun des
+    14 appels.
+
+    Une erreur de lecture SQLite pendant l'attente vaut « pas encore constaté »,
+    jamais « constaté » : la base est écrite par l'application pendant qu'on la
+    sonde, et un refus transitoire ne doit pas abréger l'attente — sonder 600
+    fois multiplie les occasions d'en rencontrer un, là où l'attente fixe ne
+    lisait qu'une fois. Un refus qui PERSISTE jusqu'au plafond ne ressort donc
+    nulle part : la sonde n'a simplement jamais rien observé, et les sites qui
+    capturent le disent (`_NO_OBSERVATION`) au lieu d'inventer un écart. Les
+    autres classes d'erreur, elles, ne sont pas avalées : elles ressortent dès
+    le premier sondage (cf. `_probe_once`).
+    """
+    observed = _probe_once(probe)
+    remaining = timeout
+    while not observed and remaining > 1e-9:
+        nap = min(interval, remaining)
+        time.sleep(nap)
+        remaining -= nap
+        observed = _probe_once(probe)
+    return observed
+
+
+def _probe_once(probe):
+    """Un sondage, filet posé sur ce qui est RÉELLEMENT transitoire.
+
+    `sqlite3.OperationalError` seul : c'est la classe des refus de lecture que
+    l'écriture concurrente de l'application produit (`database is locked`).
+    `sqlite3.Error` couvrait aussi `ProgrammingError` et `InterfaceError` —
+    un binding manquant ou une colonne mal nommée devenait alors 15 s de
+    boucle muette, suivies d'un message d'échec qui accusait l'application au
+    lieu de nommer le défaut. Aucun faux succès possible, mais un diagnostic
+    rendu impossible : un défaut de programmation ressort tout de suite.
+    """
+    try:
+        return probe()
+    except sqlite3.OperationalError:
+        return None
+
+
+def _observed_status(task_id: str) -> int | None:
+    """Statut relu en base, `None` si la ligne a disparu."""
+    rows = q("select status from TMTask where uuid=? and type=?",
+             (task_id, TYPE_TASK))
+    return rows[0][0] if rows else None
+
+
+# Repli COMMUN aux six sites qui composent leur message depuis la valeur
+# capturée par la sonde. Un seul objet, pas six littéraux : six copies d'une
+# même phrase divergent à la première reformulation, et le test qui les garde
+# ne verrait plus qu'une partie de la classe. Il sert quand la sonde n'a rien
+# pu observer de TOUTE l'attente — lecture de la base refusée du premier au
+# dernier sondage : il n'y a alors aucun écart à citer, et le dire vaut mieux
+# qu'imprimer `None` ou une chaîne vide.
+_NO_OBSERVATION = ("aucun écart observé au dernier sondage — lecture de la "
+                   "base refusée pendant toute l'attente")
+
+
+def _status_gap(observed: int | None, expected: int) -> str | None:
+    """Écart de statut TEL QUE LA SONDE L'A CONSTATÉ, `None` s'il n'y en a pas.
+
+    Pure : elle ne lit pas la base, elle met en forme ce qui a déjà été lu.
+    C'est ce qui permet de l'appeler dans la sonde et d'en garder le résultat
+    pour le message, au lieu de redemander à la base ce qu'elle vient de dire.
+    """
+    if observed == expected:
+        return None
+    label = ("(ligne absente)" if observed is None
+             else STATUS_LABELS.get(observed, observed))
+    return (f"statut constaté en base = {label}, attendu "
+            f"{STATUS_LABELS.get(expected, expected)!r}")
+
+
+def ensure_running() -> None:
+    """Lance Things s'il ne tourne pas — en arrière-plan (`-g`).
+
+    Une commande d'écriture ne doit jamais faire basculer l'utilisateur hors
+    de son application courante. `create-heading`, qui a besoin du premier
+    plan, l'obtient par son propre `open` activant, après cet appel.
+    """
+    if _things3_is_running():
+        return
+    subprocess.run([OPEN, "-g", "-a", "Things3"], check=False)
+    # La lambda n'est pas un ornement : passer `_things3_is_running` par son NOM
+    # en ferait une fonction de module employée comme valeur, forme que le
+    # balayage de `tests/test_fast_path_partition.py` ne sait pas résoudre. Le
+    # test qui en dépend est `test_the_sweep_vouches_for_every_form_in_the_real_script`,
+    # dont le résidu exigé est nul — « je ne sais pas lire » ne doit jamais s'y
+    # lire « rien à signaler ». Vérifié sur pièce le 2026-08-25 en substituant
+    # le nom à la lambda : ce test-là échoue, et lui seul ;
+    # `test_no_fast_path_subcommand_reaches_osa` reste vert dans les deux
+    # formes, donc la partition du régime rapide n'est PAS en jeu ici.
+    if not wait_for_effect(lambda: _things3_is_running(), timeout=LAUNCH_TIMEOUT,
+                           interval=LAUNCH_POLL_INTERVAL):
+        # Pas un échec de commande : `ensure_running` est une précondition, pas
+        # une écriture. On le DIT plutôt que de le taire, et on laisse la
+        # vérification post-action de la commande trancher — c'est elle qui
+        # porte le contrat « 0 = effet constaté ».
+        print(f"Things3 n'est toujours pas lancé après {LAUNCH_TIMEOUT:g} s — "
+              "la commande continue, sa vérification post-action tranchera.",
+              file=sys.stderr)
+
+
+def _things3_is_running() -> bool:
+    return subprocess.run([PGREP, "-x", "Things3"],
+                          capture_output=True).returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# Lecture
+# ---------------------------------------------------------------------------
+def cmd_areas(a) -> int:
+    rows = q("select uuid, title from TMArea order by title")
+    out = [{"uuid": u, "title": t} for u, t in rows]
+    print(json.dumps(out, ensure_ascii=False, indent=1) if a.json
+          else "\n".join(f"{u}  {t}" for u, t in rows))
+    return 0
+
+
+def cmd_projects(a) -> int:
+    sql = ("select p.uuid, p.title, coalesce(ar.title,'') from TMTask p "
+           "left join TMArea ar on p.area=ar.uuid "
+           "where p.type=? and p.trashed=0")
+    args: tuple = (TYPE_PROJECT,)
+    if a.area:
+        sql += " and ar.title=?"
+        args += (a.area,)
+    rows = q(sql + " order by ar.title, p.title", args)
+    out = [{"uuid": u, "title": t, "area": ar} for u, t, ar in rows]
+    print(json.dumps(out, ensure_ascii=False, indent=1) if a.json
+          else "\n".join(f"{u}  {ar or '(sans area)':<38}  {t}" for u, t, ar in rows))
+    return 0
+
+
+def cmd_headings(a) -> int:
+    sql = ("select h.uuid, h.title, coalesce(p.title,'') from TMTask h "
+           "left join TMTask p on h.project=p.uuid "
+           "where h.type=? and h.trashed=0")
+    args: tuple = (TYPE_HEADING,)
+    if a.project:
+        sql += " and p.title=?"
+        args += (a.project,)
+    rows = q(sql + " order by p.title, h.title", args)
+    out = [{"uuid": u, "title": t, "project": p} for u, t, p in rows]
+    print(json.dumps(out, ensure_ascii=False, indent=1) if a.json
+          else "\n".join(f"{u}  {p:<38}  {t}" for u, t, p in rows))
+    return 0
+
+
+def cmd_tasks(a) -> int:
+    # Une tâche sous heading a `project` VIDE : la requête doit remonter par le
+    # heading, sinon elle en rate silencieusement une partie.
+    sql = ("select t.uuid, t.title, coalesce(p.title, hp.title, ''), "
+           "coalesce(h.title,''), coalesce(ar.title, par.title, hpar.title,''), "
+           "t.start, t.startDate, t.reminderTime, t.deadline, t.status, "
+           "t.notes "
+           "from TMTask t "
+           "left join TMTask p on t.project=p.uuid "
+           "left join TMTask h on t.heading=h.uuid "
+           "left join TMTask hp on h.project=hp.uuid "
+           "left join TMArea ar on t.area=ar.uuid "
+           "left join TMArea par on p.area=par.uuid "
+           "left join TMArea hpar on hp.area=hpar.uuid "
+           "where t.type=? and t.trashed=0")
+    args: tuple = (TYPE_TASK,)
+    if a.project:
+        sql += " and coalesce(p.title, hp.title,'')=?"
+        args += (a.project,)
+    if a.area:
+        sql += " and coalesce(ar.title, par.title, hpar.title,'')=?"
+        args += (a.area,)
+    if a.inbox:
+        sql += " and t.project is null and t.heading is null and t.area is null"
+    rows = q(sql + " order by 3, 4, 2", args)
+    out = [
+        {
+            "uuid": u, "title": t, "project": p, "heading": h, "area": ar,
+            "when": decode_things_date(sd),
+            "alarm": decode_alarm_time(rt),
+            "deadline": decode_things_date(dl),
+            "list": scheduling_list(sb, sd),
+            "status": STATUS_LABELS.get(st, str(st)),
+            # NULL et "" disent la même chose côté usage : on normalise, pour
+            # qu'un consommateur n'ait pas deux formes de la même absence.
+            "notes": nt or "",
+        }
+        for u, t, p, h, ar, sb, sd, rt, dl, st, nt in rows
+    ]
+    if a.json:
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+    else:
+        for o in out:
+            marks = []
+            if o["when"]:
+                marks.append(o["when"] + (f"@{o['alarm']}" if o["alarm"] else ""))
+            elif o["list"] in ("someday", "inbox"):
+                marks.append(o["list"])
+            if o["deadline"]:
+                marks.append(f"⏰{o['deadline']}")
+            if o["status"] != "open":
+                marks.append(o["status"])
+            suffix = f"  [{' '.join(marks)}]" if marks else ""
+            print(f"{o['uuid']}  {(o['project'] or o['area'] or 'Inbox'):<34}  "
+                  f"{(o['heading'] or ''):<26}  {o['title'][:60]}{suffix}")
+    print(f"\n{len(rows)} tâche(s)", file=sys.stderr)
+    return 0
+
+
+_TYPE_SQL = {
+    "area": ("select uuid from TMArea where title=?", ()),
+    "project": ("select uuid from TMTask where title=? and type=1 and trashed=0", ()),
+    "heading": ("select uuid from TMTask where title=? and type=2 and trashed=0", ()),
+    "task": ("select uuid from TMTask where title=? and type=0 and trashed=0", ()),
+}
+
+
+def resolve_uuid(kind: str, title: str) -> str | None:
+    sql, _ = _TYPE_SQL[kind]
+    rows = q(sql, (title,))
+    if not rows:
+        return None
+    if len(rows) > 1:
+        print(f"AMBIGU : {len(rows)} objets '{kind}' nommés {title!r}", file=sys.stderr)
+    return rows[0][0]
+
+
+def cmd_uuid(a) -> int:
+    u = resolve_uuid(a.type, a.title)
+    if not u:
+        print(f"introuvable : {a.type} {a.title!r}", file=sys.stderr)
+        return 1
+    print(u)
+    return 0
+
+
+def cmd_agenda(a) -> int:
+    """Ce qui est à faire aujourd'hui / cette semaine — la question de l'agent agenda.
+
+    BUG-001 (2026-08-12) : `startBucket` ne discrimine rien de pertinent
+    (mesuré à 0 pour les 610 tâches ouvertes de la base réelle) et aucune
+    tâche ouverte ne porte de `deadline` de façon stable — ce prédicat SQL
+    rendait donc l'intégralité des tâches ouvertes, indépendamment de
+    `--horizon`. Le signal correct est celui déjà exposé par `cmd_tasks` :
+    `scheduling_list(start, startDate)` (table de vérité mesurée à sa
+    définition) et `decode_things_date`.
+
+    `--horizon today` : tâches dont `scheduling_list(...) == "today"` — ce qui
+    inclut, comportement natif Things assumé et non masqué, ce qui était
+    planifié un jour antérieur et n'a pas été fait — plus les tâches à
+    échéance dure du jour même, quel que soit leur bucket.
+    `--horizon week` : élargit à une fenêtre de 7 jours sur le même signal
+    (`when` pour les tâches `upcoming`, `deadline`), sans jamais inclure
+    `anytime`/`someday`/`inbox`.
+    """
+    rows = q(
+        "select t.uuid, t.title, coalesce(p.title, hp.title, ar.title,'Inbox'), "
+        "t.start, t.startDate, t.deadline "
+        "from TMTask t "
+        "left join TMTask p on t.project=p.uuid "
+        "left join TMTask h on t.heading=h.uuid "
+        "left join TMTask hp on h.project=hp.uuid "
+        "left join TMArea ar on t.area=ar.uuid "
+        "where t.type=? and t.trashed=0 and t.status=0 "
+        "order by t.deadline is null, t.deadline, 3",
+        (TYPE_TASK,))
+    today = dt.date.today().isoformat()
+    horizon_end = ((dt.date.today() + dt.timedelta(days=7)).isoformat()
+                   if a.horizon == "week" else today)
+    out = []
+    for u, ti, w, sb, sd, dl in rows:
+        lst = scheduling_list(sb, sd)
+        when = decode_things_date(sd)
+        deadline = decode_things_date(dl)
+        included = lst == "today"
+        if not included and deadline is not None and today <= deadline <= horizon_end:
+            included = True
+        if (not included and a.horizon == "week" and lst == "upcoming"
+                and when is not None and today <= when <= horizon_end):
+            included = True
+        if included:
+            out.append({"uuid": u, "title": ti, "where": w,
+                        "today": lst == "today", "has_deadline": deadline is not None})
+    if a.json:
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+    else:
+        for o in out:
+            mark = "⏰" if o["has_deadline"] else ("•" if o["today"] else " ")
+            print(f"{mark} {o['where'][:30]:<32} {o['title'][:64]}")
+        print(f"\n{len(out)} actionnable(s)", file=sys.stderr)
+    return 0
+
+
+def _resolve_find_target(list_name: str, heading_name: str | None
+                         ) -> tuple[str | None, str | None, str | None, str | None]:
+    """Résout la cible de rattachement d'un `find-task` : (project_uuid,
+    area_uuid, heading_uuid, erreur) — exactement un des trois premiers est
+    posé si erreur est None. Refuse sur 0 ou 2+ correspondances, jamais 'le
+    premier' (même règle que `_resolve_project_for_heading`) : une cible
+    ambiguë est une erreur, pas un signal dégradé.
+    """
+    project_rows = q("select uuid from TMTask where title=? and type=? and trashed=0",
+                     (list_name, TYPE_PROJECT))
+    if heading_name:
+        if not project_rows:
+            return None, None, None, (
+                f"cible introuvable : projet {list_name!r} — impossible de "
+                f"résoudre le heading {heading_name!r}")
+        if len(project_rows) > 1:
+            return None, None, None, (
+                f"AMBIGU : {len(project_rows)} projets nommés {list_name!r} — "
+                "impossible de choisir sans risque")
+        project_uuid = project_rows[0][0]
+        heading_rows = q(
+            "select uuid from TMTask where project=? and type=? and title=? "
+            "and trashed=0", (project_uuid, TYPE_HEADING, heading_name))
+        if not heading_rows:
+            return None, None, None, (
+                f"cible introuvable : heading {heading_name!r} dans le projet "
+                f"{list_name!r}")
+        if len(heading_rows) > 1:
+            return None, None, None, (
+                f"AMBIGU : {len(heading_rows)} headings nommés {heading_name!r} "
+                f"dans le projet {list_name!r}")
+        return None, None, heading_rows[0][0], None
+
+    area_rows = q("select uuid from TMArea where title=?", (list_name,))
+    total = len(project_rows) + len(area_rows)
+    if total == 0:
+        return None, None, None, (
+            f"cible introuvable : {list_name!r} n'est ni un projet ni une area")
+    if total > 1:
+        return None, None, None, (
+            f"AMBIGU : {list_name!r} correspond à {total} cibles (projet et/ou "
+            "area) — impossible de choisir sans risque")
+    if project_rows:
+        return project_rows[0][0], None, None, None
+    return None, area_rows[0][0], None, None
+
+
+def cmd_find_task(a) -> int:
+    """Recherche d'une tâche OUVERTE bornée à une liste de rattachement —
+    garde d'idempotence pour un cron qui doit décider s'il faut créer.
+
+    Lecture pure : aucune surface d'écriture n'est sollicitée. Distingue trois
+    cas par code de sortie distinct, jamais par parsing de sortie (précédent
+    BUG-003 côté omnikit : partager un code entre 'non trouvé' et 'échec réel'
+    a déjà causé un défaut) :
+      0 = trouvée   1 = non trouvée   2 = cible de rattachement introuvable/ambiguë
+    """
+    project_uuid, area_uuid, heading_uuid, err = _resolve_find_target(a.list, a.heading)
+    if err:
+        print(err, file=sys.stderr)
+        return 2
+
+    if heading_uuid:
+        col, target = "heading", heading_uuid
+    elif project_uuid:
+        col, target = "project", project_uuid
+    else:
+        col, target = "area", area_uuid
+
+    rows = q(f"select uuid from TMTask where {col}=? and type=? and trashed=0 "
+             "and status=? and title=? limit 1",
+             (target, TYPE_TASK, STATUS_OPEN, a.title))
+
+    where = a.list + (f" › {a.heading}" if a.heading else "")
+    if rows:
+        if a.json:
+            print(json.dumps({"found": True, "uuid": rows[0][0]}, ensure_ascii=False))
+        else:
+            print(f"trouvé : {a.title!r} dans {where!r}")
+        return 0
+
+    if a.json:
+        print(json.dumps({"found": False}, ensure_ascii=False))
+    else:
+        print(f"non trouvé : {a.title!r} dans {where!r}", file=sys.stderr)
+    return 1
+
+
+def cmd_deeplink(a) -> int:
+    u = resolve_uuid(a.type, a.title)
+    if not u:
+        print(f"introuvable : {a.type} {a.title!r}", file=sys.stderr)
+        return 1
+    print(f"things:///show?id={u}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Écriture
+# ---------------------------------------------------------------------------
+def cmd_create_area(a) -> int:
+    if resolve_uuid("area", a.name):
+        print(f"existe déjà : {a.name}")
+        return 0
+    ensure_running()
+    rc, out = osa(f'tell application "Things3" to make new area '
+                  f'with properties {{name:"{_esc(a.name)}"}}')
+    if not wait_for_effect(lambda: resolve_uuid("area", a.name)):
+        print(f"ÉCHEC création area {a.name!r} : {out}", file=sys.stderr)
+        return 1
+    print(f"area créée : {a.name}")
+    return 0
+
+
+def cmd_create_project(a) -> int:
+    if not resolve_uuid("area", a.area):
+        print(f"area inexistante : {a.area!r} — la créer d'abord, sinon Things "
+              "ignore le rattachement en silence", file=sys.stderr)
+        return 1
+    attrs = {"title": a.title, "area": a.area}
+    if a.notes:
+        attrs["notes"] = a.notes
+    if a.heading:
+        attrs["items"] = [{"type": "heading", "attributes": {"title": h}}
+                          for h in a.heading]
+    ensure_running()
+    url_open([{"type": "project", "attributes": attrs}])
+    if not wait_for_effect(lambda: resolve_uuid("project", a.title)):
+        print(f"ÉCHEC création projet {a.title!r}", file=sys.stderr)
+        return 1
+    print(f"projet créé : {a.title} (area {a.area}, "
+          f"{len(a.heading or [])} heading(s))")
+    return 0
+
+
+def _tasks_titled(title: str) -> list[tuple]:
+    """Tâches non jetées portant ce titre EXACT, avec leur rattachement —
+    `(uuid, project, area, heading)`. Lecture pure, égalité paramétrée : un
+    `%` dans le titre est un caractère, jamais un joker.
+    """
+    return q("select uuid, project, area, heading from TMTask where title=? "
+             "and type=? and trashed=0", (title, TYPE_TASK))
+
+
+def cmd_add_task(a) -> int:
+    """Crée une tâche par le schéma d'URL, dans une cible RÉSOLUE avant d'écrire.
+
+    BUG-005 — `--list` était recopié tel quel dans le payload. Une valeur qui
+    ne nomme aucun projet ni aucune area fait atterrir la tâche en **Inbox**,
+    et Things ne le dit pas : la commande sortait en `0` avec un message de
+    rangement. La cible est donc résolue d'abord, par le même résolveur que
+    `find-task` (`_resolve_find_target`), qui refuse sur 0 comme sur 2+
+    correspondances — jamais « la première ». Le refus **précède** toute
+    sollicitation de l'application : rien n'est lancé, rien n'est envoyé.
+
+    L'autre moitié est la vérification. Elle portait sur l'**existence** de la
+    tâche (`resolve_uuid("task", titre)`) : verte exactement dans le cas où le
+    rangement n'avait pas eu lieu, puisque la tâche existait bel et bien — en
+    Inbox. Elle porte désormais sur le **rattachement constaté**, et sur une
+    tâche **nouvelle** : les tâches de ce titre déjà présentes sont relevées
+    avant d'écrire, sans quoi une homonyme déjà rangée sous la cible signerait
+    une écriture qui n'a jamais eu lieu — le même défaut, déplacé d'un cran.
+
+    Ce qui reste hors de cette commande : la cible est toujours envoyée par
+    TITRE (`list`), pas par identifiant. Une cible qui résout ici et dont
+    l'écriture se perd ailleurs (BUG-008) échoue donc bruyamment au lieu de
+    passer pour un rangement — le symptôme est rendu visible, son mécanisme
+    n'est pas expliqué.
+    """
+    action_suffix = "aucune tâche créée"
+
+    project_uuid, area_uuid, heading_uuid, err = _resolve_find_target(
+        a.list, a.heading)
+    if err:
+        print(f"{err} — {action_suffix}. La tâche n'est jamais envoyée vers "
+              "une cible non résolue (elle atterrirait sinon en Inbox sans le "
+              "dire).", file=sys.stderr)
+        return 1
+
+    if heading_uuid:
+        target_kind, target_id = "heading", heading_uuid
+    elif project_uuid:
+        target_kind, target_id = "project", project_uuid
+    else:
+        target_kind, target_id = "area", area_uuid
+    where = a.list + (f" › {a.heading}" if a.heading else "")
+
+    # Statut du projet visé, relevé AVANT l'écriture. Il ne décide RIEN — ni
+    # refus, ni succès : il est capturé pour que le message d'échec puisse
+    # citer un fait utile au diagnostic sans redemander à la base. Un projet
+    # terminé se résout et se laisse viser, comme partout ailleurs dans ce
+    # script (les quatre résolveurs de projet par titre filtrent `trashed=0`,
+    # jamais le statut) ; que Things range ou non une tâche dans un projet
+    # terminé n'est PAS établi ici — l'établir impose d'écrire dans la base
+    # réelle de l'utilisateur.
+    target_note = ""
+    if target_kind == "project":
+        status_rows = q("select status from TMTask where uuid=? and type=?",
+                        (target_id, TYPE_PROJECT))
+        if status_rows and status_rows[0][0] != STATUS_OPEN:
+            label = STATUS_LABELS.get(status_rows[0][0], status_rows[0][0])
+            target_note = f" — le projet visé est {label}"
+
+    # Relevé AVANT l'écriture : ce qui portait déjà ce titre ne pourra pas
+    # servir de preuve que la nouvelle tâche a atterri au bon endroit.
+    known = {row[0] for row in _tasks_titled(a.title)}
+
+    attrs = {"title": a.title, "list": a.list}
+    if a.heading:
+        attrs["heading"] = a.heading
+    if a.notes:
+        attrs["notes"] = a.notes
+    # Things n'a que DEUX notions de date, pas trois comme OmniFocus.
+    # `when`     = quand la tâche apparaît dans les listes (today / tomorrow /
+    #              evening / anytime / someday / AAAA-MM-JJ), suffixable de
+    #              `@HH:MM` pour poser une alerte.
+    # `deadline` = l'échéance dure, celle qui rougit. Elle est RARE : presque
+    #              rien n'en est une, et en fabriquer une non demandée rend
+    #              l'outil criard puis ignoré.
+    if a.when:
+        attrs["when"] = a.when
+    if a.deadline:
+        attrs["deadline"] = a.deadline
+    ensure_running()
+    url_open([{"type": "to-do", "attributes": attrs}])
+
+    def _placement_problem() -> str | None:
+        """L'écart entre le rattachement demandé et celui constaté, `None`
+        s'il n'y en a pas. Sert de sonde ET de source du message : deux copies
+        divergeraient, celle qui attend cessant de décrire celle qui juge."""
+        fresh = [r for r in _tasks_titled(a.title) if r[0] not in known]
+        if not fresh:
+            return f"aucune tâche {a.title!r} n'est apparue en base"
+        for obs_uuid, obs_project, obs_area, obs_heading in fresh:
+            if target_kind == "heading":
+                # Constat du docstring module : une tâche sous heading a sa
+                # colonne `project` VIDE. Exiger le projet ici rendrait un
+                # faux négatif sur une écriture réussie — et l'appelant qui
+                # réessaie duplique dans les données de l'utilisateur.
+                ok = obs_heading == target_id
+            elif target_kind == "project":
+                ok = obs_project == target_id and obs_area is None
+            else:
+                ok = obs_area == target_id and obs_project is None
+            if ok:
+                return None
+        # Les QUATRE valeurs de cette expression sont converties, pas trois
+        # sur quatre : l'uuid partait brut au milieu de ses voisins. Son
+        # atteignabilité n'est pas établie — ces uuid viennent de Things —
+        # mais un écart connu au milieu de la garde qu'on ajoute reste un
+        # écart, et l'uniformité se vérifie par EXPRESSION, pas par ligne.
+        observed = " ; ".join(
+            f"{u!r} (project={p!r}, area={ar!r}, heading={h!r})"
+            for u, p, ar, h in fresh)
+        return (f"créée mais rattachée ailleurs : {observed}, attendu "
+                f"{target_kind}={target_id!r}")
+
+    # La valeur qui compose le message est celle que la sonde a OBSERVÉE : une
+    # seconde lecture court après l'effet et rendrait « aucun problème » —
+    # le message affirmerait un échec en imprimant `None` (§ Zones sensibles 1).
+    seen: dict[str, str | None] = {"problem": None}
+
+    def _placement_settled() -> bool:
+        seen["problem"] = _placement_problem()
+        return seen["problem"] is None
+
+    if not wait_for_effect(_placement_settled):
+        observed = seen["problem"] or _NO_OBSERVATION
+        print(f"ÉCHEC ajout tâche {a.title!r} → {where!r} : {observed}"
+              f"{target_note} — code retour = échec, pas 'commande envoyée'.",
+              file=sys.stderr)
+        return 1
+
+    # Le titre et la cible sont RENDUS, jamais recopiés bruts. Les octets
+    # d'un titre brut sont corrects — et c'est exactement le problème : le
+    # terminal, lui, EXÉCUTE ce qu'il reçoit. Un titre portant `\x1b[2K\r`
+    # efface la ligne et fait lire à l'utilisateur une confirmation
+    # qu'aucune partie de ce programme n'a écrite — le dommage même que ce
+    # correctif ferme (« le message annonce un rangement qui n'a pas eu
+    # lieu »), restauré par un autre vecteur, avec cette fois un code retour
+    # 0 légitime. L'entrée n'est pas hypothétique : ces titres viennent
+    # notamment de comptes rendus importés, que personne ne relit.
+    #
+    # `!r` plutôt qu'un filtre maison : il borne la classe de
+    # `str.isprintable()` — Cc (dont ESC/CR/LF), Cf (dont l'inversion de
+    # sens de lecture U+202E), Zl/Zp, Zs hors espace, Cs/Co/Cn — et laisse
+    # lisibles accents, tiret cadratin, `→`, `›` et emoji (mesuré le
+    # 2026-08-25 sur ces dix formes). C'est aussi la forme qu'emploie déjà
+    # la branche d'échec ci-dessus : l'asymétrie entre les deux est ce qui
+    # a laissé passer le défaut.
+    print(f"tâche ajoutée : {a.title!r} → {where!r}")
+    return 0
+
+
+def _esc(s: str) -> str:
+    return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+# ---------------------------------------------------------------------------
+# create-heading — aucune surface API (URL scheme, commande `json`,
+# AppleScript) ne permet d'ajouter un heading à un projet DÉJÀ créé (cf.
+# docstring module). Seule l'automatisation d'interface (menu Fichier)
+# le permet — vérifié sur pièce, pas déduit de la documentation.
+# ---------------------------------------------------------------------------
+
+# Libellés connus du menu Fichier > "Nouvel en-tête". Le premier trouvé dans
+# le menu réel est utilisé — ne jamais présumer le français comme seule
+# langue d'installation possible.
+HEADING_MENU_LABELS = ("Nouvel en-tête", "New Heading")
+
+_NO_LABEL_MARKER = "THINGSKIT_NO_LABEL"
+# Marqueur de refus AVANT le clic : la fenêtre au premier plan n'affiche pas
+# le projet visé. Distinct de `_NO_LABEL_MARKER` — là c'est le menu qui
+# manque, ici c'est la CIBLE du clic qui est la mauvaise.
+_WRONG_VIEW_MARKER = "THINGSKIT_WRONG_VIEW"
+# Zéro fenêtre lisible. Distinct de `_WRONG_VIEW_MARKER` : là on a LU un nom
+# qui n'est pas le bon, ici on n'a rien pu lire du tout. Sans ce marqueur, le
+# cas se confondait avec « la bonne vue » dès que le projet visé portait un
+# titre vide (`"" is not ""` rend faux) — le seul trou que la comparaison
+# laissait ouverte dans un « fail-closed par construction ».
+_NO_WINDOW_MARKER = "THINGSKIT_NO_WINDOW"
+# Things n'est pas l'application au premier plan du SYSTÈME. Condition
+# DISTINCTE de l'affichage : `name of window 1` établit ce que la fenêtre 1 de
+# Things montre, jamais que Things a le focus clavier. `keystroke` de System
+# Events frappe l'app frontmost du système — le clic de menu, lui, passe par
+# `tell process` et ne l'exige pas.
+_NOT_FRONTMOST_MARKER = "THINGSKIT_NOT_FRONTMOST"
+# Premier plan perdu APRÈS le clic de menu, avant la frappe. Séparé du
+# précédent parce que la conséquence diffère : là rien n'a été fait, ici le
+# menu a déjà été cliqué et un en-tête SANS TITRE a pu être créé. Le message
+# doit le dire — un refus qui tait un effet déjà produit est un faux refus.
+_LOST_FOCUS_MARKER = "THINGSKIT_LOST_FOCUS"
+
+_ACCESSIBILITY_ERROR_MARKERS = (
+    "not allowed assistive access",
+    "isn't allowed assistive access",
+    "not authorized to send apple events",
+    "-1743",
+    "-25211",
+)
+
+
+# Caractères que `keystroke` ne peut pas taper comme un caractère littéral :
+# `_esc` les transmet FIDÈLEMENT (mesuré : un saut de ligne source arrive avec
+# l'identifiant AppleScript 10), et c'est exactement le problème — dans le champ
+# de saisie d'un heading, un retour à la ligne vaut validation. Le heading est
+# alors créé tronqué, et le reste de la frappe part hors du champ visé : un
+# effet de bord irréversible que la vérification post-action constate sans
+# pouvoir le défaire. D'où un refus AVANT toute activation de l'application.
+# Classe = catégories Unicode Cc (contrôles, dont \n \r \t \x1b \x7f),
+# Zl / Zp (séparateurs de ligne/paragraphe U+2028/U+2029).
+_UNTYPABLE_CATEGORIES = ("Cc", "Zl", "Zp")
+
+
+def _untypable_chars(s: str) -> list[str]:
+    """Liste, en ordre d'apparition et sans doublon, les caractères de `s` qui
+    ne peuvent pas être saisis littéralement par une frappe clavier. Pure.
+    """
+    found: list[str] = []
+    for c in s:
+        if unicodedata.category(c) in _UNTYPABLE_CATEGORIES:
+            code = f"U+{ord(c):04X}"
+            if code not in found:
+                found.append(code)
+    return found
+
+
+def _shown_list_comparison(project_title: str) -> str:
+    """Lignes AppleScript comparant la liste AFFICHÉE au projet visé.
+
+    UNE seule copie, employée deux fois : comme SONDE avant d'ouvrir
+    l'interface, et comme GARDE dans le script d'automatisation, juste avant
+    le clic. Deux copies divergeraient — celle qui attend cesserait de
+    décrire celle qui autorise la frappe.
+
+    Fail-closed par construction : zéro fenêtre, application pas encore
+    servante, délai d'AppleEvent dépassé — tout ce qui empêche de LIRE le nom
+    laisse `shownList` vide, donc différent du titre, donc refus.
+
+    Le refus sur `shownList` VIDE est explicite, et il n'est pas redondant avec
+    la comparaison : `"" is not ""` rend FAUX, donc zéro fenêtre + un projet à
+    titre vide franchissaient la garde. Non atteignable au 2026-08-25 (aucun
+    projet à titre vide sur les 59 mesurés), mais « fail-closed par
+    construction » ne peut pas dépendre du contenu de la base.
+
+    `considering case and diacriticals` n'est pas décoratif — mais ce qui le
+    porte est la CASSE, pas les diacritiques. Mesuré le 2026-08-25 :
+    `"AUJOURDHUI" is "aujourdhui"` rend `true` (la comparaison par défaut
+    ignore la casse), tandis que `"ete" is "été"` rend `false` (elle respecte
+    déjà les diacritiques). Sans `case`, deux projets ne différant que par une
+    majuscule seraient confondus et le titre irait dans le mauvais ;
+    `diacriticals` est sans effet ici et n'est conservé que pour énoncer
+    l'exigence en entier plutôt que la moitié qui se trouve être nécessaire.
+    """
+    return (
+        'set shownList to ""\n'
+        'try\n'
+        '  tell application "Things3" to set shownList to name of window 1\n'
+        'end try\n'
+        f'if shownList is "" then error "{_NO_WINDOW_MARKER}: aucune fenêtre '
+        f'lisible"\n'
+        'considering case and diacriticals\n'
+        f'  if shownList is not "{_esc(project_title)}" then error '
+        f'"{_WRONG_VIEW_MARKER}: " & shownList\n'
+        'end considering\n'
+    )
+
+
+def _frontmost_check(marker: str, attempts: int) -> str:
+    """Lignes AppleScript exigeant que Things3 soit l'application au premier
+    plan du SYSTÈME, sondé au plus `attempts` fois. Pure.
+
+    `attempts=1` = constat immédiat, sans attente : après le clic de menu il
+    n'y a plus rien à attendre, et patienter ne ferait que taper plus tard
+    dans la mauvaise application.
+
+    Bornée par le COMPTE d'itérations, pas par `with timeout` — ce dernier
+    borne l'AppleEvent (d'où son maintien : la propriété est lue chez Things,
+    qui peut être en cours de lancement), jamais la durée du `repeat`.
+    """
+    return (
+        f'with timeout of {HEADING_VIEW_PROBE_TIMEOUT:d} seconds\n'
+        '  set isFront to false\n'
+        f'  repeat with _i from 1 to {attempts:d}\n'
+        '    try\n'
+        '      if (frontmost of application "Things3") then\n'
+        '        set isFront to true\n'
+        '        exit repeat\n'
+        '      end if\n'
+        '    end try\n'
+        f'    delay {HEADING_FRONTMOST_POLL_INTERVAL}\n'
+        '  end repeat\n'
+        f'  if not isFront then error "{_esc(marker)}"\n'
+        'end timeout\n'
+    )
+
+
+def _build_view_probe_script(project_title: str) -> str:
+    """Sonde d'affichage, bornée côté AppleScript. Pure.
+
+    La borne est ce qui rend le plafond de `wait_for_effect` opposable : un
+    AppleEvent adressé à une application en cours de lancement BLOQUE jusqu'à
+    pouvoir être servi (mesuré le 2026-08-25 : 699, 753 et 854 ms, rc=0 — pas
+    de `-600`), et `osascript` n'abandonnerait qu'au bout de 120 s.
+    """
+    return (f'with timeout of {HEADING_VIEW_PROBE_TIMEOUT:d} seconds\n'
+            + _shown_list_comparison(project_title)
+            + 'end timeout\n'
+              'return "OK"\n')
+
+
+def _build_heading_script(title: str, project_title: str,
+                          labels: tuple[str, ...] = HEADING_MENU_LABELS) -> str:
+    """Compose l'AppleScript : vérifie que la fenêtre au premier plan affiche
+    bien le projet visé, cherche le premier libellé de menu connu qui existe
+    réellement, clique dessus, saisit le titre, valide. Pure — testable sans
+    System Events (on vérifie le texte produit).
+
+    Le contrôle d'affichage est REFAIT ici alors que la sonde vient de le
+    passer : la fenêtre peut changer entre les deux, et surtout le trou
+    existe aussi quand Things tourne DÉJÀ — cas où aucune attente n'a jamais
+    été payée, ni avant ni après BUG-016.
+
+    DEUX conditions distinctes, pas une : l'affichage (`name of window 1`, ce
+    que la fenêtre 1 de Things montre) et le PREMIER PLAN (`frontmost`, quelle
+    application reçoit le clavier). La première ne dit rien de la seconde, et
+    c'est la seconde que `keystroke` engage. Le premier plan est réaffirmé
+    entre le clic et la frappe : le contrôle en tête du script ne couvre pas
+    l'instant dangereux, il en est séparé par le clic de menu et son délai.
+    """
+    candidates = ", ".join(f'"{_esc(l)}"' for l in labels)
+    return (
+        'tell application "Things3" to activate\n'
+        + _frontmost_check(_NOT_FRONTMOST_MARKER, HEADING_FRONTMOST_ATTEMPTS)
+        + _shown_list_comparison(project_title) +
+        'tell application "System Events"\n'
+        '  tell process "Things3"\n'
+        '    set targetLabel to missing value\n'
+        f'    repeat with candidate in {{{candidates}}}\n'
+        '      try\n'
+        '        if exists menu item candidate of menu "Fichier" of menu bar '
+        'item "Fichier" of menu bar 1 then\n'
+        '          set targetLabel to candidate\n'
+        '          exit repeat\n'
+        '        end if\n'
+        '      end try\n'
+        '    end repeat\n'
+        f'    if targetLabel is missing value then error "{_NO_LABEL_MARKER}"\n'
+        '    click menu item targetLabel of menu "Fichier" of menu bar item '
+        '"Fichier" of menu bar 1\n'
+        '  end tell\n'
+        'end tell\n'
+        'delay 0.4\n'
+        + _frontmost_check(_LOST_FOCUS_MARKER, 1) +
+        'tell application "System Events"\n'
+        f'  keystroke "{_esc(title)}"\n'
+        '  key code 36\n'
+        'end tell\n'
+        'return "OK"\n'
+    )
+
+
+def _interpret_ui_outcome(rc: int, out: str) -> tuple[bool, str]:
+    """Classifie le résultat de l'automatisation d'interface. Pure et
+    testable sans System Events : rc/out sont ceux renvoyés par `osa`.
+    """
+    if rc == 0 and out.strip() == "OK":
+        return True, "ok"
+    lo = out.lower()
+    if _NOT_FRONTMOST_MARKER in out:
+        return False, (
+            "Things3 n'est pas passé au premier plan dans le délai imparti — "
+            "rien n'a été cliqué ni tapé, aucun titre n'a pu partir dans une "
+            f"autre application ({out})"
+        )
+    if _LOST_FOCUS_MARKER in out:
+        return False, (
+            "Things3 a perdu le premier plan entre le clic de menu et la "
+            "frappe — rien n'a été tapé, mais le clic, lui, a eu lieu : un "
+            "en-tête SANS TITRE a pu être créé dans le projet visé, à "
+            f"supprimer à la main le cas échéant ({out})"
+        )
+    if _NO_WINDOW_MARKER in out:
+        return False, (
+            "aucune fenêtre lisible dans Things3 au moment du contrôle — le "
+            "nom de la liste affichée n'a pas pu être lu, donc rien ne "
+            f"garantissait la cible : rien n'a été cliqué ni tapé ({out})"
+        )
+    if _WRONG_VIEW_MARKER in out:
+        return False, (
+            "la fenêtre au premier plan n'affichait pas le projet visé au "
+            "moment du clic — rien n'a été cliqué ni tapé, aucun en-tête n'a "
+            f"pu atterrir dans un autre projet ({out})"
+        )
+    if _NO_LABEL_MARKER in out:
+        return False, (
+            "aucun libellé de menu connu ('" + "' / '".join(HEADING_MENU_LABELS) +
+            "') n'existe dans le menu Fichier de Things3 — l'interface a peut-être "
+            "changé ou est dans une autre langue"
+        )
+    if any(m in lo for m in _ACCESSIBILITY_ERROR_MARKERS):
+        return False, (
+            "automatisation d'interface refusée — accorder l'accès "
+            "Accessibilité à osascript/Terminal dans Réglages Système > "
+            "Confidentialité et sécurité > Accessibilité, puis réessayer"
+        )
+    return False, f"échec automatisation d'interface non identifié : {out or '(vide)'}"
+
+
+def _resolve_project_for_heading(title: str) -> tuple[str | None, str | None]:
+    """Résout un projet par titre exact. Refuse sur 0 ou 2+ correspondances —
+    ne prend jamais 'le premier', même règle que `delete-task`.
+
+    Refuse AUSSI quand une AREA porte le même titre, et c'est propre à cette
+    commande : la seule condition observable avant le clic est le NOM de la
+    fenêtre au premier plan, qui vaut le titre de la liste affichée — donc la
+    MÊME chaîne pour le projet et pour l'area homonyme. La garde d'affichage
+    est alors satisfaite par la mauvaise vue, et le titre est tapé dedans.
+    Mesuré le 2026-08-25 sur la base réelle : « Conventions du vault » est à
+    la fois un projet et une area, sur 59 projets et 20 areas — la collision
+    est instanciée, pas hypothétique.
+
+    Même règle que `_resolve_find_target`, qui traite déjà cette collision
+    comme une ambiguïté. Léger sur-refus assumé : il est du côté qui ne casse
+    rien, l'autre produisant un effet de bord irréversible.
+    """
+    rows = q("select uuid from TMTask where title=? and type=? and trashed=0",
+             (title, TYPE_PROJECT))
+    if not rows:
+        return None, f"projet introuvable : {title!r}, aucun heading créé"
+    if len(rows) > 1:
+        return None, (f"AMBIGU : {len(rows)} projets nommés {title!r} — "
+                       "impossible de choisir sans risque, aucun heading créé")
+    if q("select uuid from TMArea where title=?", (title,)):
+        return None, (
+            f"AMBIGU : {title!r} est à la fois un projet et une area — la "
+            "seule condition observable avant le clic est le NOM de la "
+            "fenêtre au premier plan, identique dans les deux cas : rien ne "
+            "distinguerait le projet de l'area homonyme, et le titre pourrait "
+            "être tapé dans la mauvaise vue. Renommer l'une des deux. Aucun "
+            "heading créé, l'application n'a pas été sollicitée.")
+    return rows[0][0], None
+
+
+def _find_heading(project_uuid: str, title: str) -> str | None:
+    rows = q("select uuid from TMTask where project=? and type=? and title=? "
+             "and trashed=0", (project_uuid, TYPE_HEADING, title))
+    return rows[0][0] if rows else None
+
+
+def cmd_create_heading(a) -> int:
+    offenders = _untypable_chars(a.title)
+    if offenders:
+        print(f"titre refusé : {a.title!r} contient des caractères non "
+              f"saisissables au clavier ({', '.join(offenders)}) — ils "
+              "seraient tapés dans le champ de saisie et y vaudraient "
+              "validation (heading tronqué, frappe orpheline). Aucun heading "
+              "créé, l'application n'a pas été sollicitée.", file=sys.stderr)
+        return 1
+
+    project_uuid, err = _resolve_project_for_heading(a.project)
+    if err:
+        print(err, file=sys.stderr)
+        return 1
+
+    if _find_heading(project_uuid, a.title):
+        print(f"déjà présent, rien à faire : {a.title!r} (projet {a.project!r})")
+        return 0
+
+    ensure_running()
+    subprocess.run([OPEN, f"things:///show?id={project_uuid}"], check=False)
+
+    seen = {"probe": None}
+
+    def _target_view_shown() -> bool:
+        """Sonde d'AFFICHAGE — exactement la comparaison que le script d'UI
+        refera avant de cliquer, pas une paraphrase."""
+        rc, out = osa(_build_view_probe_script(a.project))
+        seen["probe"] = out
+        return rc == 0 and out == "OK"
+
+    if not wait_for_effect(_target_view_shown, timeout=HEADING_VIEW_TIMEOUT,
+                           interval=HEADING_VIEW_POLL_INTERVAL):
+        print(f"ÉCHEC création heading {a.title!r} : la fenêtre au premier "
+              f"plan n'affiche toujours pas le projet {a.project!r} après "
+              f"{HEADING_VIEW_TIMEOUT:g} s — rien n'a été cliqué ni tapé, "
+              "aucun en-tête n'a pu atterrir dans un autre projet. Dernière "
+              f"observation : {seen['probe'] or '(aucune)'}", file=sys.stderr)
+        return 1
+
+    rc, out = osa(_build_heading_script(a.title, a.project))
+    ok, msg = _interpret_ui_outcome(rc, out)
+    if not ok:
+        print(f"ÉCHEC création heading {a.title!r} : {msg}", file=sys.stderr)
+        return 1
+
+    if not wait_for_effect(lambda: _find_heading(project_uuid, a.title)):
+        print(f"ÉCHEC création heading {a.title!r} : automatisation exécutée "
+              "mais heading non constaté en base — code retour = échec, pas "
+              "'commande envoyée'", file=sys.stderr)
+        return 1
+
+    print(f"heading créé : {a.title!r} (projet {a.project!r})")
+    return 0
+
+
+def _resolve_task_for_notes(a, action_suffix: str) -> tuple[str | None, str | None, str | None]:
+    """Résout la tâche visée par `--task` / `--task-id` et refuse tout ce qui
+    n'est pas une cible unique, active et sûre. Retourne (uuid, titre, erreur).
+
+    Garde d'état — décidée pour cette opération, pas recopiée de
+    `complete-task` : seule la **Corbeille** est refusée. Y écrire déposerait
+    du contenu dans un objet que l'utilisateur a jeté : invisible dans
+    l'application, et perdu au premier vidage de corbeille. Une tâche
+    **terminée** ou **annulée** accepte au contraire des notes — annoter n'est
+    pas changer d'état, aucune décision de l'utilisateur n'est réécrite, et
+    documenter après coup (compte-rendu, lien vers le livrable, motif
+    d'abandon) est précisément l'usage attendu. C'est là que cette commande
+    diverge de `complete-task`, qui refuse `canceled` parce qu'il
+    *convertirait* cet état.
+    """
+    task_id = getattr(a, "task_id", None)
+    if not task_id:
+        task_id, err = _resolve_task_by_title(a.task, action_suffix)
+        if err:
+            return None, None, err
+
+    if not _TASK_ID_RE.match(task_id):
+        return None, None, f"uuid malformé : {task_id!r}, {action_suffix}"
+
+    rows = q("select title, trashed from TMTask where uuid=? and type=?",
+             (task_id, TYPE_TASK))
+    if not rows:
+        return None, None, f"introuvable : task uuid={task_id!r}, {action_suffix}"
+    title, trashed = rows[0]
+    if trashed:
+        return None, None, (
+            f"à la Corbeille Things : {title} ({task_id}) — la restaurer "
+            f"('Put Back') avant d'y écrire des notes : un objet jeté n'affiche "
+            f"rien dans l'application et disparaît au vidage de la corbeille. "
+            f"{action_suffix}")
+    return task_id, title, None
+
+
+def _resolve_project_for_notes(a, action_suffix: str) -> tuple[str | None, str | None, str | None]:
+    """Résout le projet visé par `--project-id`. Retourne (uuid, titre, erreur).
+
+    Troisième voie d'adressage des notes, à côté de `--project` (titre) et
+    `--task-id`. Elle existe parce que le vault ne connaît pas les titres
+    Things : il porte un identifiant en frontmatter (`things_id`). Résoudre cet
+    identifiant en titre pour le repasser à `--project` réintroduirait
+    l'homonymie que le projet refuse par principe.
+
+    Trois refus, tous **avant** toute sollicitation de l'application :
+
+    - **Heading** (`type=2`). Mesuré le 2026-08-12 sur la vraie base : `to do id
+      "<uuid de heading>"` RÉSOUT et `set notes` y retourne `0`, mais la valeur
+      n'est jamais stockée — ni relue par AppleScript, ni présente en base
+      plusieurs secondes après. C'est exactement le mode d'échec que la
+      constitution nomme (« code retour 0 » ≠ « effet constaté »). Envoyer
+      l'ordre quand même laisserait croire à un lien posé.
+    - **Tâche** (`type=0`). `--task-id` est sa voie, avec ses propres gardes ;
+      accepter l'une pour l'autre brouillerait les deux.
+    - **Corbeille**, même motif que pour une tâche : y écrire dépose du contenu
+      dans un objet qui n'affiche rien et disparaît au vidage.
+
+    Une **area** n'apparaît pas ici : elle vit dans `TMArea`, table qui n'a
+    aucune colonne `notes`, et la classe `area` du dictionnaire AppleScript
+    n'expose aucune propriété `notes` (elle hérite de `list`, pas de `to do`).
+    Son identifiant est donc « introuvable » côté `TMTask`, ce qui est le
+    comportement voulu : il n'y a rien à écrire dessus, par aucune surface.
+    """
+    project_id = getattr(a, "project_id", None)
+    if not _TASK_ID_RE.match(project_id or ""):
+        return None, None, f"uuid malformé : {project_id!r}, {action_suffix}"
+
+    rows = q("select title, type, trashed from TMTask where uuid=?", (project_id,))
+    if not rows:
+        return None, None, (
+            f"introuvable : projet uuid={project_id!r} — une area (table TMArea) "
+            f"n'a pas de champ notes et n'est pas adressable ici. {action_suffix}")
+    title, kind, trashed = rows[0]
+    if kind == TYPE_HEADING:
+        return None, None, (
+            f"heading (initiative) : {title} ({project_id}) — un heading Things "
+            f"n'a pas de notes exploitables. Mesuré : l'AppleScript accepte "
+            f"l'ordre et retourne 0, mais la valeur n'est ni relue ni stockée. "
+            f"Rien n'est envoyé à l'application. {action_suffix}")
+    if kind != TYPE_PROJECT:
+        return None, None, (
+            f"n'est pas un projet : {title} ({project_id}, type={kind}) — pour "
+            f"une tâche, utiliser --task-id. {action_suffix}")
+    if trashed:
+        return None, None, (
+            f"à la Corbeille Things : {title} ({project_id}) — le restaurer "
+            f"('Put Back') avant d'y écrire des notes : un objet jeté n'affiche "
+            f"rien dans l'application et disparaît au vidage de la corbeille. "
+            f"{action_suffix}")
+    return project_id, title, None
+
+
+def _read_task_notes(task_id: str) -> str:
+    """Notes d'une tâche OU d'un projet — les deux vivent dans `TMTask` et
+    s'écrivent par la même surface (`project` hérite de `to do` dans le
+    dictionnaire AppleScript). Le heading (`type=2`) est exclu : il n'a pas de
+    notes exploitables (cf. `_resolve_project_for_notes`)."""
+    rows = q("select notes from TMTask where uuid=? and type in (?,?)",
+             (task_id, TYPE_TASK, TYPE_PROJECT))
+    return (rows[0][0] or "") if rows else ""
+
+
+def _write_task_notes(task_id: str, title: str, notes: str, kind: str = "tâche") -> int:
+    """Écrit les notes d'une tâche par AppleScript ciblé, puis RELIT la base et
+    n'accepte que l'égalité exacte — `0` signifie « constaté écrit », jamais
+    « commande envoyée » (constitution § Zones sensibles 1).
+
+    Fidélité des caractères : MESURÉE de bout en bout le 2026-08-12 sur une
+    tâche jetable réelle (accents, tiret cadratin, saut de ligne, CR seul,
+    CRLF, tabulation, URI percent-encodée, guillemets et antislashs, emoji
+    hors BMP, U+2028) — la valeur relue en base est à chaque fois **exactement**
+    la chaîne source. Aucune classe n'étant altérée, aucune n'est refusée : le
+    garde de saisie de `create-heading` (`_untypable_chars`) ne s'applique pas
+    ici, son risque venait de `keystroke`, pas de `_esc`.
+    """
+    ensure_running()
+    rc, out = osa(f'tell application "Things3" to set notes of to do id '
+                  f'"{_esc(task_id)}" to "{_esc(notes)}"')
+    # La sonde COMPARE, elle ne teste pas la vérité de la valeur relue : `notes`
+    # peut légitimement valoir "" (effacement), et une sonde par truthiness
+    # attendrait alors le plafond avant d'échouer sur une écriture réussie.
+    # Elle est aussi la SOURCE du message : la seconde lecture qui la suivait
+    # pouvait rendre la valeur attendue si l'effet atterrissait entre le dernier
+    # sondage et le `print`, et l'échec affirmait alors deux longueurs
+    # identiques (motif de capture de `cmd_move_task`/`cmd_reschedule_task`).
+    seen: dict[str, str | None] = {"gap": None}
+
+    def _notes_settled() -> bool:
+        observed = _read_task_notes(task_id)
+        seen["gap"] = None if observed == notes else (
+            f"la valeur relue en base ({len(observed)} caractères) diffère de "
+            f"celle demandée ({len(notes)} caractères)")
+        return seen["gap"] is None
+
+    if not wait_for_effect(_notes_settled):
+        observed = seen["gap"] or _NO_OBSERVATION
+        print(f"ÉCHEC écriture des notes sur {title!r} ({task_id}) : {observed} "
+              f"— code retour = échec, pas 'commande envoyée'. {out}",
+              file=sys.stderr)
+        return 1
+    print(f"notes posées sur {'le' if kind == 'projet' else 'la'} {kind} : "
+          f"{title} ({task_id})")
+    return 0
+
+
+def cmd_set_notes(a) -> int:
+    if getattr(a, "project_id", None):
+        pid, title, err = _resolve_project_for_notes(a, "aucune note écrite")
+        if err:
+            print(err, file=sys.stderr)
+            return 1
+        return _write_task_notes(pid, title, a.notes, kind="projet")
+
+    if getattr(a, "task", None) or getattr(a, "task_id", None):
+        task_id, title, err = _resolve_task_for_notes(a, "aucune note écrite")
+        if err:
+            print(err, file=sys.stderr)
+            return 1
+        return _write_task_notes(task_id, title, a.notes)
+
+    ensure_running()
+    rc, out = osa(f'tell application "Things3" to set notes of project '
+                  f'"{_esc(a.project)}" to "{_esc(a.notes)}"')
+
+    def _notes_landed() -> bool:
+        rows = q("select notes from TMTask where title=? and type=1 and trashed=0",
+                 (a.project,))
+        return bool(rows) and (rows[0][0] or "") == a.notes
+
+    if not wait_for_effect(_notes_landed):
+        print(f"ÉCHEC écriture des notes sur {a.project!r} : {out}", file=sys.stderr)
+        return 1
+    print(f"notes posées sur : {a.project}")
+    return 0
+
+
+def cmd_append_notes(a) -> int:
+    if getattr(a, "project_id", None):
+        pid, title, err = _resolve_project_for_notes(a, "aucune note ajoutée")
+        if err:
+            print(err, file=sys.stderr)
+            return 1
+        cur = _read_task_notes(pid)
+        if a.line in cur:
+            print(f"déjà présent, rien à faire : {title} ({pid})")
+            return 0
+        # Concaténation, jamais réécriture — cf. cmd_append_notes sur --task.
+        return _write_task_notes(pid, title, cur + ("\n" if cur else "") + a.line,
+                                 kind="projet")
+
+    if getattr(a, "task", None) or getattr(a, "task_id", None):
+        task_id, title, err = _resolve_task_for_notes(a, "aucune note ajoutée")
+        if err:
+            print(err, file=sys.stderr)
+            return 1
+        cur = _read_task_notes(task_id)
+        if a.line in cur:
+            print(f"déjà présent, rien à faire : {title} ({task_id})")
+            return 0
+        # Concaténation, jamais réécriture : l'existant repart à l'octet près,
+        # la ligne s'ajoute derrière. Un append qui écrase serait un défaut
+        # silencieux et irrécupérable.
+        return _write_task_notes(task_id, title,
+                                 cur + ("\n" if cur else "") + a.line)
+
+    rows = q("select notes from TMTask where title=? and type=1 and trashed=0",
+             (a.project,))
+    if not rows:
+        print(f"projet introuvable : {a.project!r}", file=sys.stderr)
+        return 1
+    cur = rows[0][0] or ""
+    if a.line in cur:
+        print(f"déjà présent, rien à faire : {a.project}")
+        return 0
+    new = (cur + ("\n" if cur else "") + a.line)
+    ns = argparse.Namespace(project=a.project, notes=new)
+    return cmd_set_notes(ns)
+
+
+# Les identifiants Things constatés (ex. Sb8NEZwcJmzDSG3Veu6GCR) sont des
+# chaînes alphanumériques de 22 caractères, pas des UUID RFC4122 — la borne
+# est volontairement large (10-40) pour ne pas coupler la validation à une
+# longueur exacte non documentée.
+_TASK_ID_RE = re.compile(r"^[A-Za-z0-9]{10,40}$")
+
+
+def _resolve_task_by_title(title: str, action_suffix: str) -> tuple[str | None, str | None]:
+    """Résout une tâche ACTIVE par titre exact. Refuse sur 0 ou 2+
+    correspondances — ne prend jamais 'la première'.
+
+    Aucune jointure sur `project` : une tâche placée sous un heading a sa
+    colonne `project` VIDE (cf. docstring module), la joindre la raterait.
+    """
+    rows = q("select uuid from TMTask where title=? and type=? and trashed=0",
+             (title, TYPE_TASK))
+    if not rows:
+        return None, f"introuvable : aucune tâche active nommée {title!r}, {action_suffix}"
+    if len(rows) > 1:
+        return None, (f"AMBIGU : {len(rows)} tâches actives nommées {title!r} — "
+                      f"relancer avec --id, {action_suffix}")
+    return rows[0][0], None
+
+
+def cmd_complete_task(a) -> int:
+    """Marque une tâche comme terminée.
+
+    Surface d'écriture : AppleScript ciblé (`set status of to do id … to
+    completed`), et non automatisation d'interface — constaté le 2026-08-12 par
+    `sdef /Applications/Things3.app` : `status` est une propriété **rw** de la
+    classe `to do`, l'énumération valant exactement `open` / `completed` /
+    `canceled`. C'est la surface la moins invasive qui couvre le besoin
+    (cf. constitution § Écriture) : indépendante de la langue de l'interface,
+    et incapable de taper dans le mauvais champ.
+
+    Cas `canceled` : REFUS explicite. `canceled` et `completed` sont deux
+    valeurs distinctes de l'énumération, et l'annulation est une décision de
+    l'utilisateur (« on ne le fera pas »), pas un état intermédiaire vers la
+    complétion. La convertir en « terminée » réécrirait cette décision sans la
+    demander — ce n'est pas ce que défait `reopen-task` (2026-08-24), qui
+    ramène en `open`, jamais directement en `completed`. En cas de doute, ne
+    rien faire coûte moins cher que réécrire un historique.
+    """
+    task_id = a.id
+    if not task_id:
+        if not a.title:
+            print("erreur : --id ou --title requis, aucune complétion effectuée",
+                  file=sys.stderr)
+            return 1
+        task_id, err = _resolve_task_by_title(a.title, "aucune complétion effectuée")
+        if err:
+            print(err, file=sys.stderr)
+            return 1
+
+    if not _TASK_ID_RE.match(task_id):
+        print(f"uuid malformé : {task_id!r}, aucune complétion effectuée",
+              file=sys.stderr)
+        return 1
+
+    rows = q("select title, status, trashed from TMTask where uuid=? and type=?",
+             (task_id, TYPE_TASK))
+    if not rows:
+        print(f"introuvable : task uuid={task_id!r}, aucune complétion effectuée",
+              file=sys.stderr)
+        return 1
+    title, status, trashed = rows[0]
+
+    if status == STATUS_COMPLETED:
+        print(f"déjà terminée, rien à faire : {title} ({task_id})")
+        return 0
+    if status == STATUS_CANCELED:
+        print(f"tâche annulée, non complétée : {title} ({task_id}) — 'canceled' "
+              "et 'completed' sont deux états distincts ; la basculer "
+              "réécrirait une décision d'abandon prise dans l'application. "
+              "Pour rouvrir une tâche fermée par erreur : reopen-task.",
+              file=sys.stderr)
+        return 1
+    if trashed:
+        print(f"à la Corbeille Things : {title} ({task_id}) — la restaurer "
+              "('Put Back') avant de la terminer, aucune complétion effectuée",
+              file=sys.stderr)
+        return 1
+
+    ensure_running()
+    rc, out = osa(f'tell application "Things3" to set status of to do id '
+                  f'"{_esc(task_id)}" to completed')
+    seen: dict[str, str | None] = {"gap": None}
+
+    def _completed() -> bool:
+        seen["gap"] = _status_gap(_observed_status(task_id), STATUS_COMPLETED)
+        return seen["gap"] is None
+
+    if not wait_for_effect(_completed):
+        observed = seen["gap"] or _NO_OBSERVATION
+        print(f"ÉCHEC complétion tâche {title!r} ({task_id}) : {observed} — "
+              f"code retour = échec, pas 'commande envoyée'. {out}",
+              file=sys.stderr)
+        return 1
+    print(f"tâche terminée : {title} ({task_id})")
+    return 0
+
+
+def cmd_rename_task(a) -> int:
+    """Renomme le titre d'une tâche déjà créée (US-005), sans jamais la
+    supprimer/recréer — l'UUID de la tâche est INCHANGÉ après l'opération,
+    invariant central dont dépendent les liens `things:///show?id=<uuid>`
+    déjà posés dans le vault.
+
+    Surface d'écriture : AppleScript ciblé (`set name of to do id … to
+    "…"`), symétrique de `cmd_set_notes` — mesuré le 2026-08-18 par `sdef
+    /Applications/Things3.app` : `name` est une propriété de la classe
+    `to do` sans attribut `access` explicite (comme `notes`), donc rw par
+    défaut ; confirmé de bout en bout par écriture réelle sur une tâche
+    jetable, relue en base à l'identique. Aucune automatisation d'interface,
+    donc pas de garde `_untypable_chars` (son risque vient de `keystroke`,
+    absent ici).
+
+    Garde d'état — décidée pour CETTE opération, pas recopiée de
+    `complete-task`/`cancel-task` : une tâche `completed` ou `canceled`
+    accepte le renommage, comme `set-notes`. Corriger un titre inexact
+    n'est pas reconvertir une décision d'état ; le CLI n'écrit ainsi aucune
+    décision par défaut. Seule la Corbeille est refusée, même motif que
+    partout ailleurs dans ce module : un objet jeté n'affiche rien dans
+    l'application et disparaît au vidage.
+    """
+    task_id = a.id
+    if not task_id:
+        if not a.title:
+            print("erreur : --id ou --title requis, aucun renommage effectué",
+                  file=sys.stderr)
+            return 1
+        task_id, err = _resolve_task_by_title(a.title, "aucun renommage effectué")
+        if err:
+            print(err, file=sys.stderr)
+            return 1
+
+    if not getattr(a, "new_title", None):
+        print("erreur : --new-title requis, aucun renommage effectué",
+              file=sys.stderr)
+        return 1
+
+    if not _TASK_ID_RE.match(task_id):
+        print(f"uuid malformé : {task_id!r}, aucun renommage effectué",
+              file=sys.stderr)
+        return 1
+
+    rows = q("select title, trashed from TMTask where uuid=? and type=?",
+             (task_id, TYPE_TASK))
+    if not rows:
+        print(f"introuvable : task uuid={task_id!r}, aucun renommage effectué",
+              file=sys.stderr)
+        return 1
+    title, trashed = rows[0]
+    if trashed:
+        print(f"à la Corbeille Things : {title} ({task_id}) — la restaurer "
+              "('Put Back') avant de la renommer, aucun renommage effectué",
+              file=sys.stderr)
+        return 1
+
+    ensure_running()
+    rc, out = osa(f'tell application "Things3" to set name of to do id '
+                  f'"{_esc(task_id)}" to "{_esc(a.new_title)}"')
+
+    seen: dict[str, str | None] = {"gap": None}
+
+    def _renamed() -> bool:
+        rows = q("select title from TMTask where uuid=? and type=?",
+                 (task_id, TYPE_TASK))
+        if rows and rows[0][0] == a.new_title:
+            seen["gap"] = None
+        else:
+            shown = repr(rows[0][0]) if rows else "(ligne absente)"
+            seen["gap"] = (f"titre constaté en base = {shown}, attendu "
+                           f"{a.new_title!r}")
+        return seen["gap"] is None
+
+    if not wait_for_effect(_renamed):
+        observed = seen["gap"] or _NO_OBSERVATION
+        print(f"ÉCHEC renommage tâche {title!r} ({task_id}) : {observed} — "
+              f"code retour = échec, pas 'commande envoyée'. {out}",
+              file=sys.stderr)
+        return 1
+    print(f"tâche renommée : {title!r} -> {a.new_title!r} ({task_id})")
+    return 0
+
+
+def cmd_cancel_task(a) -> int:
+    """Marque une tâche comme annulée (`canceled`), distincte de `completed`.
+
+    Surface d'écriture : AppleScript ciblé (`set status of to do id … to
+    canceled`), symétrique de `cmd_complete_task` — même énumération `status`
+    (rw, `open`/`completed`/`canceled`, cf. docstring module), aucune
+    automatisation d'interface.
+
+    Gardes d'état, décidées par symétrie et non par recopie de
+    `cmd_complete_task` :
+
+      - déjà `canceled` : idempotent, succès sans solliciter l'application
+        (même logique que `complete-task` sur une tâche déjà `completed`).
+      - `completed` : REFUS explicite. `completed` affirme que le travail a
+        été fait ; l'annuler réécrirait ce fait sans qu'on le demande — ce
+        n'est pas ce que défait `reopen-task` (2026-08-24), qui ramène en
+        `open`, jamais directement en `canceled`. En cas de doute, ne rien
+        faire coûte moins cher que réécrire un historique — même
+        raisonnement que le refus symétrique de `complete-task` sur une
+        tâche `canceled`.
+      - Corbeille : refus, comme pour `complete-task`/`delete-task` — un objet
+        que l'utilisateur a déjà déplacé vers la Corbeille n'est pas
+        retouché par cette commande.
+    """
+    task_id = a.id
+    if not task_id:
+        if not a.title:
+            print("erreur : --id ou --title requis, aucune annulation effectuée",
+                  file=sys.stderr)
+            return 1
+        task_id, err = _resolve_task_by_title(a.title, "aucune annulation effectuée")
+        if err:
+            print(err, file=sys.stderr)
+            return 1
+
+    if not _TASK_ID_RE.match(task_id):
+        print(f"uuid malformé : {task_id!r}, aucune annulation effectuée",
+              file=sys.stderr)
+        return 1
+
+    rows = q("select title, status, trashed from TMTask where uuid=? and type=?",
+             (task_id, TYPE_TASK))
+    if not rows:
+        print(f"introuvable : task uuid={task_id!r}, aucune annulation effectuée",
+              file=sys.stderr)
+        return 1
+    title, status, trashed = rows[0]
+
+    if status == STATUS_CANCELED:
+        print(f"déjà annulée, rien à faire : {title} ({task_id})")
+        return 0
+    if status == STATUS_COMPLETED:
+        print(f"tâche terminée, non annulée : {title} ({task_id}) — 'completed' "
+              "et 'canceled' sont deux états distincts ; la basculer "
+              "réécrirait un fait déjà acquis (le travail a été fait). "
+              "Pour rouvrir une tâche fermée par erreur : reopen-task.",
+              file=sys.stderr)
+        return 1
+    if trashed:
+        print(f"à la Corbeille Things : {title} ({task_id}) — la restaurer "
+              "('Put Back') avant de l'annuler, aucune annulation effectuée",
+              file=sys.stderr)
+        return 1
+
+    ensure_running()
+    rc, out = osa(f'tell application "Things3" to set status of to do id '
+                  f'"{_esc(task_id)}" to canceled')
+    seen: dict[str, str | None] = {"gap": None}
+
+    def _canceled() -> bool:
+        seen["gap"] = _status_gap(_observed_status(task_id), STATUS_CANCELED)
+        return seen["gap"] is None
+
+    if not wait_for_effect(_canceled):
+        observed = seen["gap"] or _NO_OBSERVATION
+        print(f"ÉCHEC annulation tâche {title!r} ({task_id}) : {observed} — "
+              f"code retour = échec, pas 'commande envoyée'. {out}",
+              file=sys.stderr)
+        return 1
+    print(f"tâche annulée : {title} ({task_id})")
+    return 0
+
+
+def cmd_reopen_task(a) -> int:
+    """Remet une tâche `completed` ou `canceled` en `open`.
+
+    Surface d'écriture : AppleScript ciblé (`set status of to do id … to
+    open`), symétrique de `cmd_complete_task` / `cmd_cancel_task` — même
+    énumération `status` (rw, `open`/`completed`/`canceled`), aucune
+    automatisation d'interface.
+
+    Différence délibérée : `complete-task` refuse `canceled`, `cancel-task`
+    refuse `completed`, chacune parce que « aucune opération inverse n'existe
+    pour la défaire » — c'était vrai jusqu'à cette commande. Celle-ci EST
+    cette opération inverse, pour le cas où la fermeture elle-même était une
+    erreur (ex. un lot de complétions qui emporte des tâches encore vraies,
+    2026-08-18). Elle accepte donc indifféremment `completed` ET `canceled`
+    comme état de départ — aucun refus symétrique à opposer, puisque les deux
+    mènent au même état cible `open`. Idempotent sur une tâche déjà `open`.
+    Seule la Corbeille reste refusée, même motif que partout ailleurs dans ce
+    module : un objet jeté n'affiche rien dans l'application.
+    """
+    task_id = a.id
+    if not task_id:
+        if not a.title:
+            print("erreur : --id ou --title requis, aucune réouverture effectuée",
+                  file=sys.stderr)
+            return 1
+        task_id, err = _resolve_task_by_title(a.title, "aucune réouverture effectuée")
+        if err:
+            print(err, file=sys.stderr)
+            return 1
+
+    if not _TASK_ID_RE.match(task_id):
+        print(f"uuid malformé : {task_id!r}, aucune réouverture effectuée",
+              file=sys.stderr)
+        return 1
+
+    rows = q("select title, status, trashed from TMTask where uuid=? and type=?",
+             (task_id, TYPE_TASK))
+    if not rows:
+        print(f"introuvable : task uuid={task_id!r}, aucune réouverture effectuée",
+              file=sys.stderr)
+        return 1
+    title, status, trashed = rows[0]
+
+    if status == STATUS_OPEN:
+        print(f"déjà ouverte, rien à faire : {title} ({task_id})")
+        return 0
+    if trashed:
+        print(f"à la Corbeille Things : {title} ({task_id}) — la restaurer "
+              "('Put Back') avant de la rouvrir, aucune réouverture effectuée",
+              file=sys.stderr)
+        return 1
+
+    ensure_running()
+    rc, out = osa(f'tell application "Things3" to set status of to do id '
+                  f'"{_esc(task_id)}" to open')
+
+    # L'attente est une CONDITION OBSERVÉE, jamais une durée devinée
+    # (constitution § Conventions). Le prédicat est celui de `cmd_cancel_task`,
+    # sa jumelle en sens inverse : `_status_gap` met en forme ce que la sonde a
+    # LU, sans relire la base — le message d'échec cite donc la valeur observée
+    # au dernier sondage, pas une seconde lecture qui court après l'effet.
+    seen: dict[str, str | None] = {"gap": None}
+
+    def _reopened() -> bool:
+        seen["gap"] = _status_gap(_observed_status(task_id), STATUS_OPEN)
+        return seen["gap"] is None
+
+    if not wait_for_effect(_reopened):
+        observed = seen["gap"] or _NO_OBSERVATION
+        print(f"ÉCHEC réouverture tâche {title!r} ({task_id}) : {observed} — "
+              f"code retour = échec, pas 'commande envoyée'. {out}",
+              file=sys.stderr)
+        return 1
+    print(f"tâche rouverte : {title} ({task_id})")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# reschedule-task — replanification d'une tâche DÉJÀ créée (US-002).
+#
+# Surface choisie sur ce que chacune expose RÉELLEMENT, mesuré le 2026-08-17
+# sur une tâche jetable réelle (cf. docstring module) :
+#   - schéma d'URL `operation: update` -> exige un jeton d'authentification ;
+#     sans jeton, no-op SILENCIEUX. Écarté, pas « tenté ».
+#   - `activation date` -> access="r" dans le dictionnaire. Écarté.
+#   - `schedule … for <date construite>` -> pose start=2 + date (« À venir »).
+#   - `move … to list "<libellé>"` -> Aujourd'hui / À tout moment / Un jour ;
+#     libellés LOCALISÉS, donc une liste de candidats, jamais un littéral.
+#   - `set due date … to <date construite>` -> pose l'échéance ;
+#     `delete due date` -> la retire (`missing value` lève -1700).
+# ---------------------------------------------------------------------------
+
+# Libellés connus des listes intégrées. Mesuré : `exists list "Anytime"` rend
+# `false` sur un poste français, `"À tout moment"` rend `true` — même risque de
+# localisation que HEADING_MENU_LABELS, traité de la même façon. L'apostrophe
+# d'« Aujourd'hui » est U+2019, telle que Things la renvoie.
+THINGS_LIST_LABELS = {
+    "today": ("Aujourd’hui", "Today"),
+    "anytime": ("À tout moment", "Anytime"),
+    "someday": ("Un jour", "Someday"),
+}
+
+_NO_LIST_MARKER = "THINGSKIT_NO_LIST"
+
+_ISO_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# Mots-clés de `--when` que Things n'expose par AUCUNE surface sans jeton, et
+# le motif mesuré du refus. Les ignorer en silence poserait une planification
+# différente de celle demandée — un quasi-succès, que ce projet traite comme un
+# échec.
+_WHEN_UNSUPPORTED = {
+    "evening": (
+        "aucune liste « Ce soir » n'existe dans Things (mesuré le 2026-08-17 : "
+        "`exists list` rend false pour 'Evening', 'Ce soir' et 'This Evening') "
+        "et aucune propriété AppleScript ne porte ce créneau. Seul le schéma "
+        "d'URL le saurait, et il exige un jeton d'authentification"),
+}
+
+
+def _parse_when(value: str) -> tuple[tuple[str, str | None] | None, str | None]:
+    """Interprète `--when` -> ((kind, date ISO|None), None) ou (None, erreur).
+
+    `kind` vaut `today` / `anytime` / `someday` (voie `move to list`) ou `date`
+    (voie `schedule`). Pure.
+
+    Deux refus qui ne sont pas des restrictions de confort :
+      - le suffixe `@HH:MM` : `reminderTime` n'est exposé par aucune propriété
+        AppleScript. L'accepter poserait la date sans l'alerte, en silence.
+      - une date ISO valant AUJOURD'HUI est routée vers la liste « Aujourd'hui »
+        et non vers `schedule` : mesuré, `schedule` pour la date du jour pose
+        start=2 (« À venir »), pas start=1 (« Aujourd'hui »).
+    """
+    if "@" in (value or ""):
+        return None, (
+            f"heure d'alerte refusée dans {value!r} : le suffixe `@HH:MM` n'est "
+            "pas replanifiable — `reminderTime` n'est exposé par aucune "
+            "propriété du dictionnaire AppleScript de Things (mesuré le "
+            "2026-08-17). Poser la date sans l'alerte serait un quasi-succès "
+            "silencieux. Régler l'alerte dans l'application")
+    if value in _WHEN_UNSUPPORTED:
+        return None, f"--when {value!r} refusé : {_WHEN_UNSUPPORTED[value]}"
+    if value == "today":
+        return ("today", dt.date.today().isoformat()), None
+    if value in ("anytime", "someday"):
+        return (value, None), None
+    if value == "tomorrow":
+        return ("date", (dt.date.today() + dt.timedelta(days=1)).isoformat()), None
+    if not _ISO_DAY_RE.match(value or ""):
+        return None, (
+            f"--when {value!r} non reconnu : attendu "
+            "today|tomorrow|anytime|someday|AAAA-MM-JJ")
+    try:
+        day = dt.date.fromisoformat(value)
+    except ValueError as exc:
+        return None, f"--when {value!r} n'est pas une date valide : {exc}"
+    if day == dt.date.today():
+        # `schedule` pour la date du jour donne « À venir », pas « Aujourd'hui ».
+        return ("today", day.isoformat()), None
+    return ("date", day.isoformat()), None
+
+
+def _parse_deadline(value: str) -> tuple[str | None, str | None]:
+    """Interprète `--deadline` -> (date ISO, None) ou (None, erreur). Pure."""
+    if not _ISO_DAY_RE.match(value or ""):
+        return None, f"--deadline {value!r} non reconnu : attendu AAAA-MM-JJ"
+    try:
+        return dt.date.fromisoformat(value).isoformat(), None
+    except ValueError as exc:
+        return None, f"--deadline {value!r} n'est pas une date valide : {exc}"
+
+
+def _applescript_date_lines(var: str, iso: str) -> str:
+    """Construit une date AppleScript CHAMP PAR CHAMP.
+
+    Un littéral `date "2026-09-05"` est interprété selon la locale de la
+    session : mesuré le 2026-08-17, il a produit **2011-03-19** (jour/mois
+    inversés puis reinterprétés). Aucune date ne doit donc traverser le script
+    sous forme de chaîne. Pure.
+    """
+    y, m, d = (int(x) for x in iso.split("-"))
+    return (f"set {var} to current date\n"
+            f"set time of {var} to 0\n"
+            f"set day of {var} to 1\n"          # évite un débordement de mois
+            f"set year of {var} to {y}\n"
+            f"set month of {var} to {m}\n"
+            f"set day of {var} to {d}\n")
+
+
+def _build_reschedule_script(task_id: str, when: tuple[str, str | None] | None,
+                             deadline: str | None, clear_deadline: bool,
+                             labels: dict[str, tuple[str, ...]] | None = None) -> str:
+    """Compose l'AppleScript de replanification. Pure — testable sans Things.
+
+    Les libellés de liste sont essayés un à un (`exists list`), comme les
+    libellés de menu de `create-heading` : le premier qui existe réellement est
+    utilisé, et si aucun n'existe le script échoue explicitement plutôt que
+    d'agir au hasard.
+    """
+    labels = labels or THINGS_LIST_LABELS
+    body = ['tell application "Things3"']
+    if when is not None:
+        kind, iso = when
+        if kind == "date":
+            body.append(_applescript_date_lines("whenDate", iso).rstrip("\n"))
+            body.append(f'schedule to do id "{_esc(task_id)}" for whenDate')
+        else:
+            candidates = ", ".join(f'"{_esc(l)}"' for l in labels[kind])
+            body.append("set targetList to missing value")
+            body.append(f"repeat with candidate in {{{candidates}}}")
+            body.append("  try")
+            body.append("    if exists list candidate then")
+            body.append("      set targetList to candidate")
+            body.append("      exit repeat")
+            body.append("    end if")
+            body.append("  end try")
+            body.append("end repeat")
+            body.append(f'if targetList is missing value then error "{_NO_LIST_MARKER}"')
+            body.append(f'move to do id "{_esc(task_id)}" to list targetList')
+    if deadline is not None:
+        body.append(_applescript_date_lines("dueDate", deadline).rstrip("\n"))
+        body.append(f'set due date of to do id "{_esc(task_id)}" to dueDate')
+    if clear_deadline:
+        # `set due date … to missing value` lève -1700 (mesuré) ; `delete`
+        # retire bien l'échéance.
+        body.append(f'delete due date of to do id "{_esc(task_id)}"')
+    body.append("end tell")
+    body.append('return "OK"')
+    return "\n".join(body) + "\n"
+
+
+def _interpret_reschedule_outcome(rc: int, out: str) -> tuple[bool, str]:
+    """Classifie le retour d'`osa`. Pure.
+
+    Contrairement à `_interpret_ui_outcome`, le code retour d'`osascript` suffit
+    ici à distinguer l'échec : aucune automatisation d'interface n'est en jeu,
+    et toute erreur AppleScript (libellé de liste absent, identifiant
+    introuvable, propriété en lecture seule) sort en rc non nul — mesuré sur
+    chacun de ces cas le 2026-08-17. Le succès de l'ordre reste de toute façon
+    une condition NÉCESSAIRE et non suffisante : c'est la relecture en base qui
+    tranche.
+    """
+    if rc == 0:
+        return True, "ok"
+    if _NO_LIST_MARKER in out:
+        return False, (
+            "aucun libellé de liste connu n'existe dans ce Things — les listes "
+            "intégrées sont localisées et l'interface est peut-être dans une "
+            "langue non couverte")
+    return False, f"échec AppleScript : {out or '(vide)'}"
+
+
+def _observed_schedule(task_id: str) -> tuple[int | None, str | None, str | None]:
+    """(start, when ISO|None, deadline ISO|None) relus en base."""
+    rows = q("select start, startDate, deadline from TMTask where uuid=? and type=?",
+             (task_id, TYPE_TASK))
+    if not rows:
+        return None, None, None
+    start, start_date, deadline = rows[0]
+    return start, decode_things_date(start_date), decode_things_date(deadline)
+
+
+def cmd_reschedule_task(a) -> int:
+    """Change la date `when` et/ou la `deadline` d'une tâche DÉJÀ créée, sans
+    la détruire ni la recréer — son identifiant ne bouge pas, donc les liens
+    `things:///` déjà posés dans le vault survivent.
+
+    Gardes d'état, décidées POUR CETTE opération et non recopiées de la
+    voisine :
+
+    - **Corbeille** : refus. Même motif que `set-notes` et `complete-task` —
+      un objet jeté n'apparaît nulle part et disparaît au vidage ; y poser une
+      date produirait une planification invisible.
+    - **`completed` / `canceled`** : refus, et c'est ici que cette commande
+      diverge de `set-notes` (qui, lui, les accepte). Annoter ne change aucun
+      état ; replanifier en change un. Mesuré le 2026-08-17 : `schedule` sur
+      une tâche terminée RÉUSSIT, pose la date et laisse le statut
+      `completed` — la date atterrit sur un objet qui n'apparaît dans aucune
+      liste de planification. La vérification post-action ne rattraperait
+      rien (la date EST constatée en base) : c'est le seul endroit où le
+      défaut peut être arrêté. Rouvrir la tâche par `reopen-task` si elle
+      doit être replanifiée.
+    """
+    if not a.when and not a.deadline and not a.clear_deadline:
+        print("erreur : au moins --when, --deadline ou --clear-deadline requis, "
+              "aucune replanification effectuée", file=sys.stderr)
+        return 1
+    if a.deadline and a.clear_deadline:
+        print("erreur : --deadline et --clear-deadline sont contradictoires, "
+              "aucune replanification effectuée", file=sys.stderr)
+        return 1
+
+    when = None
+    if a.when:
+        when, err = _parse_when(a.when)
+        if err:
+            print(f"{err}, aucune replanification effectuée", file=sys.stderr)
+            return 1
+    deadline = None
+    if a.deadline:
+        deadline, err = _parse_deadline(a.deadline)
+        if err:
+            print(f"{err}, aucune replanification effectuée", file=sys.stderr)
+            return 1
+
+    task_id = a.id
+    if not task_id:
+        if not a.title:
+            print("erreur : --id ou --title requis, aucune replanification "
+                  "effectuée", file=sys.stderr)
+            return 1
+        task_id, err = _resolve_task_by_title(a.title,
+                                              "aucune replanification effectuée")
+        if err:
+            print(err, file=sys.stderr)
+            return 1
+
+    if not _TASK_ID_RE.match(task_id):
+        print(f"uuid malformé : {task_id!r}, aucune replanification effectuée",
+              file=sys.stderr)
+        return 1
+
+    rows = q("select title, status, trashed from TMTask where uuid=? and type=?",
+             (task_id, TYPE_TASK))
+    if not rows:
+        print(f"introuvable : task uuid={task_id!r}, aucune replanification "
+              "effectuée", file=sys.stderr)
+        return 1
+    title, status, trashed = rows[0]
+
+    if trashed:
+        print(f"à la Corbeille Things : {title} ({task_id}) — la restaurer "
+              "('Put Back') avant de la replanifier : un objet jeté n'apparaît "
+              "dans aucune liste et disparaît au vidage de la corbeille. "
+              "Aucune replanification effectuée.", file=sys.stderr)
+        return 1
+    if status in (STATUS_COMPLETED, STATUS_CANCELED):
+        print(f"tâche {STATUS_LABELS.get(status, status)} : {title} ({task_id}) "
+              "— replanifier poserait une date sur un objet qui n'apparaît dans "
+              "aucune liste de planification (mesuré : l'AppleScript accepte "
+              "l'ordre, pose la date et laisse le statut inchangé). La rouvrir "
+              "par reopen-task si elle doit être replanifiée. Aucune "
+              "replanification effectuée, l'application n'a pas été sollicitée.",
+              file=sys.stderr)
+        return 1
+
+    ensure_running()
+    rc, out = osa(_build_reschedule_script(task_id, when, deadline,
+                                           bool(a.clear_deadline)))
+    ok, msg = _interpret_reschedule_outcome(rc, out)
+    if not ok:
+        print(f"ÉCHEC replanification {title!r} ({task_id}) : {msg}", file=sys.stderr)
+        return 1
+
+    # La vérification est INCHANGÉE — elle est seulement nommée, pour servir à
+    # la fois de sonde d'attente et de source du message d'échec. Deux copies
+    # divergeraient : celle qui attend cesserait de décrire celle qui juge.
+    def _schedule_problems() -> list[str]:
+        obs_start, obs_when, obs_deadline = _observed_schedule(task_id)
+        problems = []
+        if when is not None:
+            kind, iso = when
+            expected = {
+                "today": (START_ANYTIME, iso),
+                "anytime": (START_ANYTIME, None),
+                "someday": (START_SOMEDAY, None),
+                "date": (START_SOMEDAY, iso),
+            }[kind]
+            if (obs_start, obs_when) != expected:
+                problems.append(
+                    f"when : attendu (start={expected[0]}, {expected[1] or 'sans date'}) "
+                    f"soit « {scheduling_list(*expected[:1], None) or ''} », constaté "
+                    f"(start={obs_start}, {obs_when or 'sans date'})")
+        if deadline is not None and obs_deadline != deadline:
+            problems.append(f"deadline : attendue {deadline}, constatée "
+                            f"{obs_deadline or '(aucune)'}")
+        if a.clear_deadline and obs_deadline is not None:
+            problems.append(f"deadline : attendue absente, constatée {obs_deadline}")
+        return problems
+
+    # Même forme que `cmd_move_task`, moins visible : un second appel rendrait
+    # une liste VIDE si l'effet atterrit entre le dernier sondage et la
+    # composition, et `" ; ".join([])` produit une chaîne vide — l'échec ne
+    # nomme plus l'écart constaté. La valeur observée est donc capturée.
+    seen: dict[str, list[str]] = {"problems": []}
+
+    def _schedule_settled() -> bool:
+        seen["problems"] = _schedule_problems()
+        return not seen["problems"]
+
+    if not wait_for_effect(_schedule_settled):
+        problems = " ; ".join(seen["problems"]) or _NO_OBSERVATION
+        print(f"ÉCHEC replanification {title!r} ({task_id}) — code retour = "
+              f"échec, pas 'commande envoyée' : {problems}. {out}",
+              file=sys.stderr)
+        return 1
+
+    done = []
+    if when is not None:
+        done.append(f"when → {when[1] or when[0]}")
+    if deadline is not None:
+        done.append(f"deadline → {deadline}")
+    if a.clear_deadline:
+        done.append("deadline retirée")
+    print(f"tâche replanifiée : {title} ({task_id}) — {', '.join(done)}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# move-task — déplacement d'une tâche DÉJÀ créée vers un autre projet ou une
+# autre area (US-006).
+#
+# Surface choisie sur ce que chacune expose RÉELLEMENT, mesuré le 2026-08-19
+# sur une tâche/projet/area jetables réels :
+#   - `move to do id … to project "Titre"` / `to project id "…"` échouent
+#     toutes les deux (« Impossible de déplacer la tâche ») : `project`
+#     hérite de `to do` dans le dictionnaire AppleScript, pas de `list`, et la
+#     commande `move` (cocoa `moveToList:`) ne l'accepte pas comme cible.
+#   - `move to do id … to list "Titre"` fonctionne pour une AREA (qui hérite
+#     bien de `list`), échoue pour un projet.
+#   - Les PROPRIÉTÉS `project` et `area` de la classe `to do`, elles, sont
+#     rw sans restriction : `set project of to do id … to project id "<uuid>"`
+#     et `set area of to do id … to area id "<uuid>"` fonctionnent toutes
+#     les deux, et chacune efface silencieusement l'autre colonne (constaté
+#     par relecture SQL sur la vraie base) — Things applique lui-même
+#     l'exclusivité d'appartenance à une seule liste. C'est donc la
+#     propriété, jamais `move`, qui est utilisée ici, et toujours adressée
+#     par IDENTIFIANT Things (jamais par titre littéral interpolé), pour ne
+#     dépendre d'aucun libellé localisé.
+#   - Aucune surface (`move`, propriété) n'expose de `heading` : la classe
+#     `heading` n'existe même pas dans le `sdef` de Things3, et aucune
+#     propriété `heading` ne figure dans le dictionnaire de la classe
+#     `to do`. Le déplacement vers un heading n'est donc PAS couvert par
+#     cette commande — mesuré non faisable, pas simplement non tenté
+#     (US-006 § Spécifications techniques : à ne pas exiger sans preuve de
+#     faisabilité).
+# ---------------------------------------------------------------------------
+
+def _resolve_project_by_title(title: str, action_suffix: str) -> tuple[str | None, str | None]:
+    """Résout un projet par titre exact. Refuse sur 0 ou 2+ correspondances —
+    ne prend jamais 'le premier', même règle que `delete-task`/`create-heading`.
+    """
+    rows = q("select uuid from TMTask where title=? and type=? and trashed=0",
+             (title, TYPE_PROJECT))
+    if not rows:
+        return None, (f"projet introuvable : {title!r} — {action_suffix}. La "
+                      "tâche n'est jamais déplacée vers une cible non résolue "
+                      "(elle atterrirait sinon en Inbox sans le dire).")
+    if len(rows) > 1:
+        return None, (f"AMBIGU : {len(rows)} projets nommés {title!r} — "
+                      f"{action_suffix}")
+    return rows[0][0], None
+
+
+def _resolve_area_by_title(title: str, action_suffix: str) -> tuple[str | None, str | None]:
+    """Résout une area par titre exact, même contrat que
+    `_resolve_project_by_title` (`TMArea`, pas `TMTask`)."""
+    rows = q("select uuid from TMArea where title=?", (title,))
+    if not rows:
+        return None, (f"area introuvable : {title!r} — {action_suffix}. La "
+                      "tâche n'est jamais déplacée vers une cible non résolue "
+                      "(elle atterrirait sinon en Inbox sans le dire).")
+    if len(rows) > 1:
+        return None, (f"AMBIGU : {len(rows)} areas nommées {title!r} — "
+                      f"{action_suffix}")
+    return rows[0][0], None
+
+
+def cmd_move_task(a) -> int:
+    """Déplace une tâche déjà créée vers un autre projet ou une autre area,
+    sans jamais changer son UUID (pas de suppression puis recréation).
+
+    Garde d'état — décidée POUR CETTE opération, pas recopiée de la voisine :
+    seule la **Corbeille** est refusée. Un objet jeté n'apparaît dans aucune
+    liste et disparaît au vidage ; le déplacer serait un ordre posé sur un
+    objet invisible. Une tâche **terminée** ou **annulée**, en revanche, est
+    acceptée : déplacer ne change aucun statut ni ne convertit une décision
+    de l'utilisateur — c'est le même raisonnement que `set-notes`/
+    `append-notes` (qui acceptent les deux), pas celui de `complete-task`
+    (qui refuse `canceled` parce qu'il *convertirait* cet état).
+    """
+    action_suffix = "aucun déplacement effectué"
+
+    task_id = a.id
+    if not task_id:
+        if not a.title:
+            print(f"erreur : --id ou --title requis, {action_suffix}",
+                  file=sys.stderr)
+            return 1
+        task_id, err = _resolve_task_by_title(a.title, action_suffix)
+        if err:
+            print(err, file=sys.stderr)
+            return 1
+
+    if not _TASK_ID_RE.match(task_id):
+        print(f"uuid malformé : {task_id!r}, {action_suffix}", file=sys.stderr)
+        return 1
+
+    if not getattr(a, "to_project", None) and not getattr(a, "to_area", None):
+        print(f"erreur : --to-project ou --to-area requis, {action_suffix}",
+              file=sys.stderr)
+        return 1
+    if getattr(a, "to_project", None) and getattr(a, "to_area", None):
+        print(f"erreur : --to-project et --to-area sont exclusifs, "
+              f"{action_suffix}", file=sys.stderr)
+        return 1
+
+    rows = q("select title, trashed from TMTask where uuid=? and type=?",
+             (task_id, TYPE_TASK))
+    if not rows:
+        print(f"introuvable : task uuid={task_id!r}, {action_suffix}",
+              file=sys.stderr)
+        return 1
+    title, trashed = rows[0]
+    if trashed:
+        print(f"à la Corbeille Things : {title} ({task_id}) — la restaurer "
+              f"('Put Back') avant de la déplacer : un objet jeté n'apparaît "
+              f"dans aucune liste et disparaît au vidage. {action_suffix}",
+              file=sys.stderr)
+        return 1
+
+    if a.to_project:
+        target_id, err = _resolve_project_by_title(a.to_project, action_suffix)
+        if err:
+            print(err, file=sys.stderr)
+            return 1
+        script = (f'tell application "Things3" to set project of to do id '
+                  f'"{_esc(task_id)}" to project id "{_esc(target_id)}"')
+        target_kind, target_label = "project", a.to_project
+    else:
+        target_id, err = _resolve_area_by_title(a.to_area, action_suffix)
+        if err:
+            print(err, file=sys.stderr)
+            return 1
+        script = (f'tell application "Things3" to set area of to do id '
+                  f'"{_esc(task_id)}" to area id "{_esc(target_id)}"')
+        target_kind, target_label = "area", a.to_area
+
+    ensure_running()
+    rc, out = osa(script)
+
+    # La vérification est INCHANGÉE — elle est seulement nommée, pour servir à
+    # la fois de sonde d'attente et de source du message d'échec, comme dans
+    # `cmd_reschedule_task`. Deux copies divergeraient : celle qui attend
+    # cesserait de décrire celle qui juge. La cascade distingue toujours ses
+    # trois causes, qui ne se diagnostiquent pas de la même façon.
+    def _move_problem() -> str | None:
+        rows = q("select uuid, project, area, heading from TMTask where uuid=? "
+                 "and type=?", (task_id, TYPE_TASK))
+        if not rows:
+            return "tâche introuvable après l'opération"
+        obs_uuid, obs_project, obs_area, obs_heading = rows[0]
+        if obs_uuid != task_id:
+            return (f"l'UUID relu ({obs_uuid!r}) diffère de celui déplacé — "
+                    "invariant violé")
+        if target_kind == "project":
+            ok = obs_project == target_id and obs_area is None
+        else:
+            ok = obs_area == target_id and obs_project is None
+        if not ok:
+            return (f"vers {target_kind} {target_label!r}, appartenance relue "
+                    f"en base = (project={obs_project!r}, area={obs_area!r}, "
+                    f"heading={obs_heading!r}), attendu ({target_kind}="
+                    f"{target_id!r})")
+        return None
+
+    # La valeur qui compose le message est celle que la sonde a OBSERVÉE, pas
+    # une seconde lecture : entre le dernier sondage et la composition, l'effet
+    # peut atterrir — la relecture rendait alors `None` et le message imprimait
+    # littéralement « None », cessant de dire pourquoi il échouait au moment où
+    # il en a le plus besoin. Motif de capture repris de `cmd_create_heading`.
+    seen: dict[str, str | None] = {"problem": None}
+
+    def _move_settled() -> bool:
+        seen["problem"] = _move_problem()
+        return seen["problem"] is None
+
+    if not wait_for_effect(_move_settled):
+        observed = seen["problem"] or _NO_OBSERVATION
+        print(f"ÉCHEC déplacement {title!r} ({task_id}) : {observed} — "
+              f"code retour = échec, pas 'commande envoyée'. {out}",
+              file=sys.stderr)
+        return 1
+
+    print(f"tâche déplacée : {title} ({task_id}) → {target_kind} "
+          f"{target_label!r}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# move-project — déplacement d'un projet DÉJÀ créé vers une autre area.
+#
+# Surface mesurée le 2026-08-24 sur une area/projet jetables réels : un
+# projet vit dans `TMTask` (`type=1`), hérite de `to do` dans le
+# dictionnaire AppleScript (même constat que `move-task`) — `set area of to
+# do id "<uuid du projet>" to area id "<uuid area>"` déplace bien un PROJET
+# d'une area à l'autre, constaté par relecture SQL (colonne `area` change,
+# `uuid` inchangé). Adressé par IDENTIFIANT, jamais par titre littéral
+# interpolé, pour ne dépendre d'aucun libellé localisé. Un projet ne se
+# déplace jamais vers un autre projet ni vers un heading : Things ne
+# structure les projets qu'à l'intérieur d'une area.
+# ---------------------------------------------------------------------------
+
+def _resolve_project_target(a, action_suffix: str) -> tuple[str | None, str | None, str | None]:
+    """Résout le projet à déplacer, par `--project-id` (voie sûre) ou
+    `--project` (titre exact, refuse sur 0 ou 2+ correspondances). Retourne
+    (uuid, title, err). Refuse explicitement une cible qui n'est pas un
+    projet (tâche, heading) plutôt que de laisser `to do id` résoudre un
+    autre type d'objet en silence."""
+    project_id = getattr(a, "project_id", None)
+    title_arg = getattr(a, "project", None)
+
+    if not project_id and not title_arg:
+        return None, None, (f"erreur : --project ou --project-id requis, "
+                            f"{action_suffix}")
+    if project_id and title_arg:
+        return None, None, (f"erreur : --project et --project-id sont "
+                            f"exclusifs, {action_suffix}")
+
+    if project_id:
+        if not _TASK_ID_RE.match(project_id):
+            return None, None, f"uuid malformé : {project_id!r}, {action_suffix}"
+        rows = q("select title, type, trashed from TMTask where uuid=?",
+                 (project_id,))
+        if not rows:
+            return None, None, (f"introuvable : projet uuid={project_id!r} — "
+                                f"{action_suffix}. Le déplacement n'est jamais "
+                                f"tenté sur une cible non résolue.")
+        title, kind, trashed = rows[0]
+        if kind != TYPE_PROJECT:
+            kind_label = {TYPE_TASK: "une tâche", TYPE_HEADING: "un heading"}.get(
+                kind, f"type={kind}")
+            return None, None, (f"n'est pas un projet : {title} "
+                                f"({project_id}) est {kind_label} — "
+                                f"move-project ne déplace que des projets. "
+                                f"{action_suffix}")
+    else:
+        rows = q("select uuid from TMTask where title=? and type=? and trashed=0",
+                 (title_arg, TYPE_PROJECT))
+        if not rows:
+            return None, None, (f"projet introuvable : {title_arg!r} — "
+                                f"{action_suffix}. Le déplacement n'est jamais "
+                                f"tenté sur une cible non résolue.")
+        if len(rows) > 1:
+            return None, None, (f"AMBIGU : {len(rows)} projets nommés "
+                                f"{title_arg!r} — {action_suffix}")
+        project_id = rows[0][0]
+        title2 = q("select title, trashed from TMTask where uuid=?", (project_id,))
+        title, trashed = title2[0]
+
+    if trashed:
+        return None, None, (f"à la Corbeille Things : {title} ({project_id}) — "
+                            f"le restaurer ('Put Back') avant de le déplacer : "
+                            f"un objet jeté n'apparaît dans aucune liste et "
+                            f"disparaît au vidage. {action_suffix}")
+
+    return project_id, title, None
+
+
+def cmd_move_project(a) -> int:
+    """Déplace un projet déjà créé vers une autre area, via la même propriété
+    AppleScript (`area`) que `move-task`, adressée par identifiant —
+    l'UUID du projet ne change jamais.
+
+    Garde d'état : seule la Corbeille est refusée (même raisonnement que
+    `move-task` — un objet jeté est invisible, le déplacer n'a pas de sens ;
+    aucun statut n'existe sur un projet qui justifierait un refus
+    supplémentaire).
+    """
+    action_suffix = "aucun déplacement effectué"
+
+    project_id, title, err = _resolve_project_target(a, action_suffix)
+    if err:
+        print(err, file=sys.stderr)
+        return 1
+
+    area_title = getattr(a, "area", None)
+    if not area_title:
+        print(f"erreur : --area requis, {action_suffix}", file=sys.stderr)
+        return 1
+
+    target_id, err = _resolve_area_by_title(area_title, action_suffix)
+    if err:
+        print(err, file=sys.stderr)
+        return 1
+
+    # Idempotence par vérification PRÉALABLE (constitution § Conventions), et
+    # elle n'est pas facultative ici : `move-project` vise une appartenance —
+    # un état que la cible peut déjà avoir avant l'ordre — même situation que
+    # sa jumelle `move-task` (`cmd_move_task`), qui vise elle aussi une
+    # appartenance. Sans ce pré-check, la vérification post-action serait déjà
+    # verte AVANT l'ordre : un projet déjà dans l'area cible la satisfait sans
+    # qu'aucun déplacement ait eu lieu — la relecture ne distingue alors pas
+    # « fait » de « rien fait », et la commande annonçait « projet déplacé »
+    # dans les deux cas. Le message est donc DISTINCT, et l'application n'est
+    # pas sollicitée : c'est l'absence d'appel qui est testée, comme pour
+    # `complete-task` sur une tâche déjà terminée. `move-task` N'A PAS ce
+    # pré-check aujourd'hui (`cmd_move_task` appelle `osa` sans jamais
+    # comparer l'appartenance actuelle à la cible, et `tests/test_move_task.py`
+    # ne couvre pas ce cas) — extension à traiter par un ticket de suivi
+    # séparé, pas par ce commit-ci.
+    current = q("select area from TMTask where uuid=? and type=?",
+                (project_id, TYPE_PROJECT))
+    if current and current[0][0] == target_id:
+        print(f"déjà dans l'area {area_title!r}, rien à faire : {title} "
+              f"({project_id})")
+        return 0
+
+    script = (f'tell application "Things3" to set area of to do id '
+              f'"{_esc(project_id)}" to area id "{_esc(target_id)}"')
+
+    ensure_running()
+    rc, out = osa(script)
+
+    # La vérification est INCHANGÉE dans sa substance ; elle est seulement
+    # nommée, pour servir à la fois de sonde de l'attente bornée et de source
+    # du message d'échec — même motif que `cmd_move_task`, dont c'est la
+    # commande jumelle. Deux copies divergeraient : celle qui attend cesserait
+    # de décrire celle qui juge. La cascade distingue toujours ses causes, qui
+    # ne se diagnostiquent pas de la même façon.
+    def _placement_problem() -> str | None:
+        rows = q("select uuid, area from TMTask where uuid=? and type=?",
+                 (project_id, TYPE_PROJECT))
+        if not rows:
+            return "projet introuvable après l'opération"
+        obs_uuid, obs_area = rows[0]
+        if obs_uuid != project_id:
+            return (f"l'UUID relu ({obs_uuid!r}) diffère de celui déplacé — "
+                    "invariant violé")
+        if obs_area != target_id:
+            return (f"vers area {area_title!r}, area relue = {obs_area!r}, "
+                    f"attendu {target_id!r}")
+        return None
+
+    # La valeur qui compose le message est celle que la sonde a OBSERVÉE, pas
+    # une seconde lecture : entre le dernier sondage et la composition, l'effet
+    # peut atterrir, et le message affirmerait un échec en citant la valeur
+    # attendue. Capture par fermeture, motif commun aux six autres sites.
+    seen: dict[str, str | None] = {"problem": None}
+
+    def _placed() -> bool:
+        seen["problem"] = _placement_problem()
+        return seen["problem"] is None
+
+    if not wait_for_effect(_placed):
+        observed = seen["problem"] or _NO_OBSERVATION
+        print(f"ÉCHEC déplacement {title!r} ({project_id}) : {observed} — "
+              f"code retour = échec, pas 'commande envoyée'. {out}",
+              file=sys.stderr)
+        return 1
+
+    print(f"projet déplacé : {title} ({project_id}) → area {area_title!r}")
+    return 0
+
+
+def cmd_delete_task(a) -> int:
+    """Supprime une tâche — constaté par test le 2026-08-12 : `delete to do id`
+    déplace la tâche vers la Corbeille Things (colonne `trashed` -> 1, la ligne
+    SUBSISTE en base, `status` inchangé). Ce n'est PAS une destruction
+    définitive : récupérable via "Put Back" dans l'application. Ni le schéma
+    d'URL ni cette commande ne demandent de jeton d'authentification — c'est
+    l'AppleScript `delete`, identique à la suppression manuelle dans l'app.
+    """
+    task_id = a.id
+    if not task_id:
+        if not a.title:
+            print("erreur : --id ou --title requis, aucune suppression effectuée",
+                  file=sys.stderr)
+            return 1
+        task_id, err = _resolve_task_by_title(a.title, "aucune suppression effectuée")
+        if err:
+            print(err, file=sys.stderr)
+            return 1
+
+    if not _TASK_ID_RE.match(task_id):
+        print(f"uuid malformé : {task_id!r}, aucune suppression effectuée",
+              file=sys.stderr)
+        return 1
+
+    rows = q("select title, trashed from TMTask where uuid=? and type=?",
+              (task_id, TYPE_TASK))
+    if not rows:
+        print(f"introuvable : task uuid={task_id!r}, aucune suppression effectuée",
+              file=sys.stderr)
+        return 1
+    title, trashed = rows[0]
+    if trashed:
+        print(f"déjà à la Corbeille Things : {title} ({task_id})")
+        return 0
+
+    ensure_running()
+    rc, out = osa(f'tell application "Things3" to delete to do id "{_esc(task_id)}"')
+    def _trashed() -> bool:
+        rows = q("select trashed from TMTask where uuid=? and type=?",
+                 (task_id, TYPE_TASK))
+        return bool(rows) and rows[0][0] == 1
+
+    if not wait_for_effect(_trashed):
+        print(f"ÉCHEC suppression tâche {title!r} ({task_id}) : {out}", file=sys.stderr)
+        return 1
+    print(f"tâche déplacée vers la Corbeille Things (récupérable, pas de destruction "
+          f"définitive) : {title} ({task_id})")
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="thingskit", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add(name, fn, **kw):
+        s = sub.add_parser(name, **kw)
+        s.set_defaults(fn=fn)
+        return s
+
+    s = add("areas", cmd_areas); s.add_argument("--json", action="store_true")
+    s = add("projects", cmd_projects)
+    s.add_argument("--area"); s.add_argument("--json", action="store_true")
+    s = add("headings", cmd_headings)
+    s.add_argument("--project"); s.add_argument("--json", action="store_true")
+    s = add("tasks", cmd_tasks)
+    s.add_argument("--project"); s.add_argument("--area")
+    s.add_argument("--inbox", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s = add("uuid", cmd_uuid)
+    s.add_argument("--type", required=True, choices=list(_TYPE_SQL))
+    s.add_argument("--title", required=True)
+    s = add("find-task", cmd_find_task,
+            description="Recherche une tâche OUVERTE bornée à une liste de "
+                        "rattachement (projet ou area via --list, heading via "
+                        "--heading dans ce projet). Lecture pure, aucune "
+                        "écriture. Codes de sortie distincts et exploitables "
+                        "en shell sans parser la sortie : 0 = trouvée, "
+                        "1 = non trouvée (cible résolue, rien de ce titre "
+                        "ouvert), 2 = erreur (cible de rattachement "
+                        "introuvable ou ambiguë — jamais un faux 'non "
+                        "trouvé', cf. précédent BUG-003 d'omnifocus-task qui "
+                        "partageait un code entre absence de correspondance "
+                        "et échec réel).")
+    s.add_argument("title")
+    s.add_argument("--list", required=True, help="titre exact du projet ou de l'area")
+    s.add_argument("--heading", help="titre exact du heading, dans le projet de --list")
+    s.add_argument("--json", action="store_true")
+    s = add("deeplink", cmd_deeplink)
+    s.add_argument("--type", required=True, choices=list(_TYPE_SQL))
+    s.add_argument("--title", required=True)
+    s = add("create-area", cmd_create_area); s.add_argument("name")
+    s = add("create-project", cmd_create_project)
+    s.add_argument("title"); s.add_argument("--area", required=True)
+    s.add_argument("--notes"); s.add_argument("--heading", action="append")
+    s = add("create-heading", cmd_create_heading,
+            description="Ajoute un en-tête à un projet EXISTANT, via "
+                        "automatisation d'interface (aucune surface API ne le "
+                        "permet — cf. docstring module). Idempotent : si un "
+                        "heading du même titre existe déjà dans ce projet, ne "
+                        "recrée rien. Refuse si le projet ne peut pas être "
+                        "résolu sans ambiguïté (0 ou 2+ correspondances). Ne "
+                        "sort en succès que si le heading est constaté en base "
+                        "après coup.")
+    s.add_argument("title")
+    s.add_argument("--project", required=True, help="titre exact du projet")
+    s = add("add-task", cmd_add_task,
+            description="Crée une tâche dans un projet ou une area, via le "
+                        "schéma d'URL JSON. Refuse une cible (--list, "
+                        "--heading) qui ne correspond à aucun projet/area "
+                        "existant, plutôt que de laisser Things la faire "
+                        "atterrir en Inbox sans le dire. Refuse toute "
+                        "résolution par titre ambiguë ou nulle. Ne sort en "
+                        "succès que si le rattachement d'une tâche NOUVELLE à "
+                        "la cible exacte est constaté en base après coup — "
+                        "l'existence d'une tâche de ce titre ne prouve rien.")
+    s.add_argument("title"); s.add_argument("--list", required=True)
+    s.add_argument("--heading"); s.add_argument("--notes")
+    s.add_argument("--when", help="today|tomorrow|evening|anytime|someday|AAAA-MM-JJ, "
+                                  "suffixable de @HH:MM pour une alerte")
+    s.add_argument("--deadline", help="AAAA-MM-JJ — échéance DURE, rare par nature")
+    s = add("agenda", cmd_agenda)
+    s.add_argument("--horizon", choices=["today", "week"], default="today")
+    s.add_argument("--json", action="store_true")
+    s = add("delete-task", cmd_delete_task,
+            description="Supprime une tâche (déplacement vers la Corbeille Things, "
+                        "récupérable — pas une destruction définitive). --id "
+                        "obligatoire par défaut ; --title en confort, refuse toute "
+                        "correspondance ambiguë ou nulle sans jamais prendre 'la "
+                        "première'.")
+    s.add_argument("--id", help="identifiant Things de la tâche (recommandé)")
+    s.add_argument("--title", help="titre exact ; refuse si 0 ou 2+ correspondances")
+    s = add("complete-task", cmd_complete_task,
+            description="Marque une tâche comme terminée, via AppleScript ciblé "
+                        "(`set status … to completed`) — aucune automatisation "
+                        "d'interface. Idempotent : une tâche déjà terminée sort "
+                        "en succès sans solliciter l'application. Refuse une "
+                        "tâche annulée ('canceled' n'est pas 'completed'), et "
+                        "toute résolution par titre ambiguë ou nulle. Ne sort en "
+                        "succès que si le statut est constaté en base après coup.")
+    s.add_argument("--id", help="identifiant Things de la tâche (recommandé)")
+    s.add_argument("--title", help="titre exact ; refuse si 0 ou 2+ correspondances")
+    s = add("rename-task", cmd_rename_task,
+            description="Renomme le titre d'une tâche déjà créée, via "
+                        "AppleScript ciblé (`set name of to do id … to`) — "
+                        "aucune automatisation d'interface. L'UUID de la "
+                        "tâche ne change jamais : pas de suppression puis "
+                        "recréation. Accepte une tâche terminée ou annulée "
+                        "(corriger un titre n'est pas reconvertir un état) ; "
+                        "refuse la Corbeille et toute résolution par titre "
+                        "ambiguë ou nulle. Ne sort en succès que si le titre "
+                        "exact est constaté en base après coup.")
+    s.add_argument("--id", help="identifiant Things de la tâche (recommandé)")
+    s.add_argument("--title", help="titre exact actuel ; refuse si 0 ou 2+ "
+                                   "correspondances")
+    s.add_argument("--new-title", required=True, help="nouveau titre")
+    s = add("cancel-task", cmd_cancel_task,
+            description="Marque une tâche comme annulée ('status' -> 'canceled'), "
+                        "via AppleScript ciblé — aucune automatisation "
+                        "d'interface. Distinct de complete-task : annuler dit "
+                        "'on ne le fera pas', terminer dit 'le travail est "
+                        "fait'. Idempotent : une tâche déjà annulée sort en "
+                        "succès sans solliciter l'application. Refuse une "
+                        "tâche déjà terminée ('completed' n'est pas "
+                        "'canceled'), et toute résolution par titre ambiguë "
+                        "ou nulle. Ne sort en succès que si le statut est "
+                        "constaté en base après coup.")
+    s.add_argument("--id", help="identifiant Things de la tâche (recommandé)")
+    s.add_argument("--title", help="titre exact ; refuse si 0 ou 2+ correspondances")
+    s = add("reopen-task", cmd_reopen_task,
+            description="Remet une tâche `completed` ou `canceled` en "
+                        "'open', via AppleScript ciblé (`set status … to "
+                        "open`) — aucune automatisation d'interface. "
+                        "Contrairement à complete-task/cancel-task, accepte "
+                        "indifféremment les DEUX états de départ : c'est "
+                        "l'opération inverse qui manquait aux deux, pour "
+                        "corriger une fermeture erronée plutôt que défaire "
+                        "une décision. Idempotent : une tâche déjà 'open' "
+                        "sort en succès sans solliciter l'application. "
+                        "Refuse la Corbeille, et toute résolution par titre "
+                        "ambiguë ou nulle. Ne sort en succès que si le "
+                        "statut est constaté en base après coup.")
+    s.add_argument("--id", help="identifiant Things de la tâche (recommandé)")
+    s.add_argument("--title", help="titre exact ; refuse si 0 ou 2+ correspondances")
+    s = add("reschedule-task", cmd_reschedule_task,
+            description="Change la date `when` et/ou la `deadline` d'une tâche "
+                        "DÉJÀ créée, sans la détruire ni la recréer : son "
+                        "identifiant ne bouge pas, les liens things:/// déjà "
+                        "posés survivent. Surface : AppleScript ciblé "
+                        "(`schedule`, `move to list`, `due date`) — le schéma "
+                        "d'URL `update` exige un jeton d'authentification et "
+                        "est un no-op SILENCIEUX sans lui. Refuse une tâche à "
+                        "la Corbeille, terminée ou annulée, et toute résolution "
+                        "par titre ambiguë ou nulle. Ne sort en succès que si "
+                        "l'état exact visé est constaté en base après coup.")
+    s.add_argument("--id", help="identifiant Things de la tâche (recommandé)")
+    s.add_argument("--title", help="titre exact ; refuse si 0 ou 2+ correspondances")
+    s.add_argument("--when", help="today|tomorrow|anytime|someday|AAAA-MM-JJ. "
+                                  "`anytime`/`someday` RETIRENT la date posée. "
+                                  "`evening` et le suffixe @HH:MM ne sont pas "
+                                  "replanifiables (aucune surface sans jeton)")
+    s.add_argument("--deadline", help="AAAA-MM-JJ — échéance DURE, rare par nature")
+    s.add_argument("--clear-deadline", action="store_true",
+                   help="retire l'échéance existante")
+    s = add("move-task", cmd_move_task,
+            description="Déplace une tâche DÉJÀ créée vers un autre projet "
+                        "ou une autre area, via une propriété AppleScript "
+                        "adressée par identifiant (jamais `move`, qui échoue "
+                        "sur un projet, ni un libellé littéral) — l'UUID de "
+                        "la tâche ne change jamais. Refuse une cible "
+                        "(--to-project / --to-area) qui ne correspond à "
+                        "aucun projet/area existant, plutôt que de laisser "
+                        "Things la faire atterrir en Inbox sans le dire. "
+                        "Refuse toute résolution par titre ambiguë ou nulle, "
+                        "pour la tâche comme pour la cible, et la Corbeille. "
+                        "Ne sort en succès que si l'appartenance à la cible "
+                        "exacte est constatée en base après coup. Ne couvre "
+                        "PAS le déplacement vers un heading : aucune surface "
+                        "AppleScript ne l'expose (mesuré, cf. docstring "
+                        "module).")
+    s.add_argument("--id", help="identifiant Things de la tâche (recommandé)")
+    s.add_argument("--title", help="titre exact ; refuse si 0 ou 2+ correspondances")
+    g = s.add_mutually_exclusive_group(required=True)
+    g.add_argument("--to-project", help="titre exact du projet cible")
+    g.add_argument("--to-area", help="titre exact de l'area cible")
+
+    s = add("move-project", cmd_move_project,
+            description="Déplace un projet DÉJÀ créé vers une autre area, "
+                        "via la même propriété AppleScript (`area`) que "
+                        "move-task, adressée par identifiant — l'UUID du "
+                        "projet ne change jamais. Refuse une area "
+                        "(--area) qui ne correspond à aucune area "
+                        "existante, plutôt que de laisser Things faire "
+                        "atterrir le projet ailleurs sans le dire. Refuse "
+                        "toute résolution par titre ambiguë ou nulle, pour "
+                        "le projet comme pour l'area cible, une cible qui "
+                        "n'est pas un projet (tâche, heading), et la "
+                        "Corbeille. Ne sort en succès que si l'appartenance "
+                        "à l'area exacte est constatée en base après coup.")
+    g = s.add_mutually_exclusive_group(required=True)
+    g.add_argument("--project", help="titre exact du projet ; refuse si 0 "
+                                     "ou 2+ correspondances")
+    g.add_argument("--project-id", help="identifiant Things du projet "
+                                        "(voie sûre, sans ambiguïté possible)")
+    s.add_argument("--area", required=True, help="titre exact de l'area cible")
+
+    def add_notes_target(parser):
+        """`--project` / `--task` / `--task-id` : exclusifs, et l'un des trois
+        obligatoire — aucune écriture ne part sans cible explicite."""
+        g = parser.add_mutually_exclusive_group(required=True)
+        g.add_argument("--project", help="titre exact du projet")
+        g.add_argument("--project-id", help="identifiant Things du projet "
+                                            "(voie sûre, sans ambiguïté possible)")
+        g.add_argument("--task", help="titre exact de la tâche ; refuse si 0 ou "
+                                      "2+ correspondances actives")
+        g.add_argument("--task-id", help="identifiant Things de la tâche "
+                                         "(voie sûre, sans ambiguïté possible)")
+        return parser
+
+    s = add("set-notes", cmd_set_notes,
+            description="Remplace les notes d'un projet ou d'une tâche. Refuse "
+                        "une tâche à la Corbeille ; accepte une tâche terminée "
+                        "ou annulée (annoter n'est pas changer d'état). Ne sort "
+                        "en succès que si les notes sont constatées en base, à "
+                        "l'identique, après coup.")
+    add_notes_target(s); s.add_argument("--notes", required=True)
+    s = add("append-notes", cmd_append_notes,
+            description="Ajoute une ligne à la FIN des notes existantes d'un "
+                        "projet ou d'une tâche, sans jamais écraser l'existant. "
+                        "Idempotent : une ligne déjà présente n'est pas "
+                        "réécrite et l'application n'est pas sollicitée.")
+    add_notes_target(s); s.add_argument("--line", required=True)
+
+    a = p.parse_args()
+    return a.fn(a)
+
+
+if __name__ == "__main__":
+    _refusal = code_identity_refusal()
+    if _refusal is not None:
+        print(_refusal, file=sys.stderr)
+        raise SystemExit(IDENTITY_REFUSAL_CODE)
+    raise SystemExit(main())

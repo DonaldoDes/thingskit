@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+
+      - name: Installer les dépendances de test
+        run: python3 -m pip install --upgrade pip "pytest==9.1.1"
+
+      - name: Jouer la suite de tests
+        run: python3 -m pytest -q -p no:cacheprovider
+
+# Périmètre exécuté sur ce runner : la suite complète.
+#
+# Aucun test n'est exclu par ce workflow. La suite est conçue pour ne
+# dépendre ni de Things 3, ni d'un bundle `thingskit.app` installé, ni des
+# identités de signature du mainteneur (tests/conftest.py, invariant C-4) :
+# - `requires_conforming_bundle` (tests/conftest.py, tests/test_code_identity.py,
+#   tests/test_bundle.py, tests/test_shim.py) saute quand
+#   /Applications/thingskit.app est absent — c'est le cas d'un runner CI, qui
+#   ne construit ni n'installe le bundle.
+# - Les tests de tests/test_bundle.py qui manipulent la signature de code
+#   utilisent `security`/`codesign`/`openssl` en signature ad-hoc, tous
+#   présents sur macos-latest — ils ne requièrent aucune identité
+#   d'équipe Apple réelle.
+# - `requires_osascript` (tests/test_create_heading.py) ne saute que si
+#   `osascript` est absent (hors macOS) ; sur macos-latest il est présent et
+#   les scripts exécutés sont des AppleScript de test autonomes, sans
+#   dépendance à Things 3 installé.
+#
+# Établi par exécution réelle sur ce workflow (pas supposé) : voir la
+# première exécution de la Pull Request qui introduit ce fichier — c'est la
+# preuve retenue, pas une lecture de code seule.

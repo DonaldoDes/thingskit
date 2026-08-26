@@ -1,0 +1,232 @@
+/* Shim de lancement de thingskit — ADR-002.
+ *
+ * Gabarit : `build/bundle.py` y injecte les chemins, l'exigence de code et la
+ * table du regime rapide (lue dans `bin/thingskit`), puis compile et signe le
+ * resultat dans `Contents/MacOS/`. Ce fichier ne porte AUCUNE liste de
+ * sous-commandes ecrite a la main (INV-002-3) : la source de verite est
+ * unique, et le couplage lanceur <-> script est un couplage de BUILD, pas de
+ * maintenance.
+ *
+ * Pourquoi un Mach-O la ou un script `sh` suffisait
+ * -------------------------------------------------
+ * `kTCCServiceAppleEvents` ne s'evalue pas sur le processus mais sur son
+ * processus RESPONSABLE. Un `exec` depuis `sh` preserve le PID, donc la chaine
+ * de responsabilite : le processus porte bien `app.sowell.thingskit`, mais son
+ * responsable reste le terminal ou l'agent qui l'a lance — un sujet TCC par
+ * terminal, par hote, et par VERSION d'hote. `sh` ne sait pas appeler
+ * `responsibility_spawnattrs_setdisclaim`, et la responsabilite se decide
+ * AVANT le chargement de l'image : elle ne peut donc pas etre posee depuis
+ * Python non plus, sans second chargement complet de l'interpreteur.
+ *
+ * `POSIX_SPAWN_SETEXEC` remplace l'image au lieu de forker : aucun processus
+ * intermediaire n'apparait, `argv`, stdio et code de sortie traversent
+ * structurellement (INV-002-4, reconduction d'INV-001-2).
+ *
+ * Fail-closed, dans les deux dimensions
+ * -------------------------------------
+ * - Regime : ce qui n'est pas explicitement declare rapide est disclaime.
+ *   L'inconnu paie de l'ordre de la seconde a CHAQUE appel — surcout
+ *   permanent, mesure le 2026-08-21 sur toute sous-commande, y compris
+ *   celles qui n'envoient aucun Apple Event (+1,88 s en A/B strict) —, mais
+ *   il ne perd jamais le consentement. C'est ce cout que la partition
+ *   epargne au chemin chaud. Deux enonces faux ont figure ici avant
+ *   celui-ci : « ~830 ms » (mesure prise juste apres un rebuild) puis
+ *   « au plus un premier appel lent apres un build » (invocation morte dans
+ *   argparse, rc=2, qui n'atteignait ni SQLite ni tccd).
+ * - Sceau : un controle inexecutable, bloque ou tue vaut REFUS, jamais
+ *   passage. « Je ne peux pas verifier » n'est pas « c'est bon » —
+ *   transposition de `code_identity_refusal` et de BUG-011.
+ */
+
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <spawn.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+/* SPI : absente des en-tetes publics, presente dans libsystem. C'est elle qui
+ * rend le processus son propre responsable, donc le sujet TCC stable dont
+ * l'enfant `osascript` herite. */
+extern int responsibility_spawnattrs_setdisclaim(posix_spawnattr_t *attr,
+                                                 int disclaim);
+extern char **environ;
+
+#define APP_PATH "@APP_PATH@"
+#define BUNDLE_NAME "@BUNDLE_NAME@"
+#define CODESIGN_PATH "@CODESIGN@"
+#define CODE_REQUIREMENT "@CODE_REQUIREMENT@"
+#define SEAL_REFUSAL_CODE @SEAL_REFUSAL_CODE@
+#define CODESIGN_TIMEOUT_SECONDS @CODESIGN_TIMEOUT_SECONDS@
+
+#define EXEC_PATH APP_PATH "/Contents/MacOS/" BUNDLE_NAME
+#define SCRIPT_PATH APP_PATH "/Contents/Resources/" BUNDLE_NAME
+
+/* Table injectee au build depuis `FAST_PATH_COMMANDS` de `bin/thingskit`. */
+static const char *const FAST_PATH_COMMANDS[] = {
+@FAST_PATH_COMMANDS@
+    NULL,
+};
+
+/* Le refus nomme sa cause et l'artefact : un silence, ou un code ambigu,
+ * reintroduirait le doute que le projet interdit. Le message reste au moins
+ * aussi nomme que celui du lanceur `sh` qu'il remplace. */
+static int refuse(const char *reason) {
+    fprintf(stderr, "thingskit: %s\n", reason);
+    fprintf(stderr,
+            "thingskit: execution refusee — reconstruire via build/bundle.py\n");
+    return SEAL_REFUSAL_CODE;
+}
+
+/* Borne de temps du controle de sceau. `sigtimedwait` n'existe pas sur Darwin :
+ * la borne passe par `alarm` + un `waitpid` volontairement INTERRUPTIBLE
+ * (`sa_flags` sans `SA_RESTART`, sans quoi le noyau relancerait l'attente et
+ * la borne ne bornerait rien). */
+static volatile sig_atomic_t codesign_timed_out = 0;
+
+static void on_codesign_timeout(int signo) {
+    (void)signo;
+    codesign_timed_out = 1;
+}
+
+/* Rend 1 si le sceau est valide. `*checked` dit si le verificateur a pu rendre
+ * un verdict : c'est ce qui distingue « sceau invalide » de « identite non
+ * etablie », deux refus au meme code mais pas au meme diagnostic. */
+/* Le verificateur ne recoit RIEN de l'appelant.
+ *
+ * `codesign` est protege par SIP, donc les `DYLD_*` y sont ignores : il n'y a
+ * pas d'exploitation directe a fermer ici. Mais transmettre l'environnement du
+ * terminal au processus dont le role est precisement d'etablir l'identite de
+ * code est une surface gratuite, dans un fichier dont l'invariant tenu est que
+ * ce controle ne depende PAS de l'environnement — c'est deja le motif du chemin
+ * ABSOLU `CODESIGN_PATH`, et c'est le meme ici. L'environnement est vide, pas
+ * filtre : une liste d'exceptions serait une liste a maintenir, donc a oublier.
+ * Cela ne concerne QUE le verificateur : la commande scellee, elle, recoit
+ * l'environnement de l'appelant intact (`TERM`, `LANG`, `HOME`...). */
+static char *const CODESIGN_ENVIRON[] = {NULL};
+
+static int seal_is_valid(int *checked) {
+    char *const argv[] = {
+        (char *)CODESIGN_PATH, (char *)"--verify", (char *)"--strict",
+        (char *)"-R=" CODE_REQUIREMENT, (char *)APP_PATH, NULL,
+    };
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null",
+                                     O_WRONLY, 0);
+    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null",
+                                     O_WRONLY, 0);
+
+    pid_t pid = -1;
+    int spawned =
+        posix_spawn(&pid, CODESIGN_PATH, &actions, NULL, argv, CODESIGN_ENVIRON);
+    posix_spawn_file_actions_destroy(&actions);
+
+    *checked = 0;
+    if (spawned != 0) return 0;
+
+    struct sigaction timeout, previous;
+    memset(&timeout, 0, sizeof timeout);
+    timeout.sa_handler = on_codesign_timeout;
+    sigemptyset(&timeout.sa_mask);
+    timeout.sa_flags = 0;
+    codesign_timed_out = 0;
+    sigaction(SIGALRM, &timeout, &previous);
+    alarm(CODESIGN_TIMEOUT_SECONDS);
+
+    int status = 0;
+    pid_t reaped;
+    do {
+        reaped = waitpid(pid, &status, 0);
+    } while (reaped < 0 && errno == EINTR && !codesign_timed_out);
+
+    alarm(0);
+    sigaction(SIGALRM, &previous, NULL);
+
+    if (reaped != pid) {
+        kill(pid, SIGKILL);
+        waitpid(pid, &status, 0);
+        return 0;
+    }
+    /* `WIFEXITED` d'abord : un verificateur TUE n'a rien verifie, et son code
+     * de sortie ne veut rien dire. */
+    *checked = WIFEXITED(status);
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static int is_fast_path(const char *subcommand) {
+    for (const char *const *entry = FAST_PATH_COMMANDS; *entry != NULL; entry++)
+        if (strcmp(*entry, subcommand) == 0) return 1;
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    /* On reprend `SIGCHLD` au lieu de subir la disposition de l'appelant.
+     *
+     * Ce qui est en jeu n'est PAS le controle de sceau : mesure du 2026-08-21
+     * sur ce poste, un `SIGCHLD` a `SIG_IGN` (ou un `SA_NOCLDWAIT`) pose par
+     * l'appelant ne traverse PAS `exec` — `waitpid` ci-dessous recolte
+     * normalement, et l'hypothese d'un refus 126 sur un sceau valide ne se
+     * reproduit pas.
+     *
+     * Ce qui se reproduit vise le coeur du projet : `SIGCHLD` a `SIG_IGN` DANS
+     * le processus courant fait rendre `0` a `subprocess.run` de Python pour
+     * une commande qui a ECHOUE (mesure : `/usr/bin/false` rend 1 sans, 0
+     * avec). Or `osa()` invoque `osascript` par `subprocess` dans l'image
+     * finale : une disposition heritee jusque-la ferait lire « osascript a
+     * reussi » sur un AppleScript en echec — le « commande envoyee != effet
+     * constate » que ce depot traite comme le pire mode de defaut.
+     *
+     * La plateforme referme ce chemin aujourd'hui ; cette ligne cesse de faire
+     * dependre l'invariant central d'une semantique d'`exec` que le depot ne
+     * controle pas. */
+    signal(SIGCHLD, SIG_DFL);
+
+    int checked = 0;
+    if (!seal_is_valid(&checked)) {
+        return checked
+                   ? refuse("sceau du bundle invalide : " APP_PATH)
+                   : refuse("verificateur de sceau inexecutable, bloque ou tue "
+                            "— identite de code non etablie : " CODESIGN_PATH);
+    }
+
+    /* `argc >= 2` seulement : sans sous-commande, on ne sait rien, donc on
+     * disclaime. C'est le sens fail-closed. */
+    const int fast = (argc >= 2) && is_fast_path(argv[1]);
+
+    posix_spawnattr_t attr;
+    if (posix_spawnattr_init(&attr) != 0)
+        return refuse("attributs de lancement indisponibles");
+    if (posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETEXEC) != 0)
+        return refuse("remplacement d'image indisponible");
+    if (!fast && responsibility_spawnattrs_setdisclaim(&attr, 1) != 0)
+        return refuse("responsabilite de processus non disclaimee — le "
+                      "consentement AppleEvents serait redemande");
+
+    char **next = calloc((size_t)argc + 4, sizeof *next);
+    if (next == NULL) return refuse("memoire insuffisante");
+    int n = 0;
+    next[n++] = (char *)EXEC_PATH;
+    /* `-I` isole l'interpreteur AVANT le script : pose apres, il deviendrait un
+     * `argv` inerte du script et l'isolation tomberait (ADR-001). */
+    next[n++] = (char *)"-I";
+    next[n++] = (char *)SCRIPT_PATH;
+    for (int i = 1; i < argc; i++) next[n++] = argv[i];
+    next[n] = NULL;
+
+    int failure = posix_spawn(NULL, EXEC_PATH, NULL, &attr, next, environ);
+    /* On n'arrive ici que si l'image N'A PAS ete remplacee. Le processus se
+     * termine juste apres, donc ces liberations ne changent rien a
+     * l'execution : elles sont la pour que le chemin d'echec se lise comme le
+     * chemin nominal, au meme titre que le `file_actions_destroy` de
+     * `seal_is_valid`. Un chemin d'erreur qui deroge aux regles du fichier est
+     * celui qu'on recopiera mal la prochaine fois. */
+    posix_spawnattr_destroy(&attr);
+    free(next);
+    fprintf(stderr, "thingskit: image non remplacee (%s) : %s\n", EXEC_PATH,
+            strerror(failure));
+    return refuse("execution de l'interpreteur scelle impossible");
+}
