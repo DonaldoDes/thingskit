@@ -2853,15 +2853,6 @@ def cmd_move_task(a) -> int:
         print(f"uuid malformé : {task_id!r}, {action_suffix}", file=sys.stderr)
         return 1
 
-    if not getattr(a, "to_project", None) and not getattr(a, "to_area", None):
-        print(f"erreur : --to-project ou --to-area requis, {action_suffix}",
-              file=sys.stderr)
-        return 1
-    if getattr(a, "to_project", None) and getattr(a, "to_area", None):
-        print(f"erreur : --to-project et --to-area sont exclusifs, "
-              f"{action_suffix}", file=sys.stderr)
-        return 1
-
     # Un titre d'en-tête n'est unique QUE dans son projet — deux projets qui
     # portent une « Section » chacun est le cas NORMAL, pas une ambiguïté.
     # Résoudre `--to-heading` sans projet reviendrait donc à « prendre le
@@ -2872,6 +2863,15 @@ def cmd_move_task(a) -> int:
         print(f"erreur : --to-heading exige --to-project (un titre d'en-tête "
               f"n'est unique que dans son projet), {action_suffix}",
               file=sys.stderr)
+        return 1
+
+    if not getattr(a, "to_project", None) and not getattr(a, "to_area", None):
+        print(f"erreur : --to-project ou --to-area requis, {action_suffix}",
+              file=sys.stderr)
+        return 1
+    if getattr(a, "to_project", None) and getattr(a, "to_area", None):
+        print(f"erreur : --to-project et --to-area sont exclusifs, "
+              f"{action_suffix}", file=sys.stderr)
         return 1
 
     rows = q("select title, trashed from TMTask where uuid=? and type=?",

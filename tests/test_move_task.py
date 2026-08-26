@@ -587,7 +587,8 @@ def _rig_effective_heading_move(thingskit, monkeypatch, calls,
 
 # --- refus AVANT toute sollicitation ------------------------------------
 
-def test_to_heading_without_a_project_scope_refuses(thingskit, rigged):
+def test_to_heading_without_a_project_scope_refuses(thingskit, rigged,
+                                                    capsys):
     """Un titre d'en-tête n'est unique QUE dans son projet : le résoudre sans
     projet reviendrait à « prendre le premier », ce que ce projet refuse."""
     calls, set_rows = rigged
@@ -595,15 +596,24 @@ def test_to_heading_without_a_project_scope_refuses(thingskit, rigged):
     rc = thingskit.cmd_move_task(_ns(id=TARGET, to_heading="Section"))
     assert rc == 1
     assert calls["osa"] == [] and calls["url"] == []
+    # Le code retour seul ne discrimine RIEN : sans cette garde, la résolution
+    # échoue de toute façon sur un projet nommé `None` et rend 1 sans rien
+    # envoyer. Le test ne vaut donc que par le MESSAGE — c'est lui qui dit à
+    # l'utilisateur ce qui manque, et lui seul qui rougit si la garde saute.
+    assert "--to-heading exige --to-project" in capsys.readouterr().err
 
 
-def test_to_heading_with_an_area_target_refuses(thingskit, rigged):
+def test_to_heading_with_an_area_target_refuses(thingskit, rigged, capsys):
+    """Une area n'a pas d'en-tête. Ici encore le code retour ne discrimine
+    pas — sans la garde, la résolution échoue sur un projet nommé `None` et
+    rend 1 elle aussi. Seul le MESSAGE distingue les deux."""
     calls, set_rows = rigged
     set_rows(_heading_world(), [(AREA, "Une area")])
     rc = thingskit.cmd_move_task(_ns(id=TARGET, to_area="Une area",
                                      to_heading="Section"))
     assert rc == 1
     assert calls["osa"] == [] and calls["url"] == []
+    assert "--to-heading exige --to-project" in capsys.readouterr().err
 
 
 def test_unknown_heading_refuses_without_any_solicitation(thingskit, rigged,
