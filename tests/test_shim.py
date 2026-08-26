@@ -21,10 +21,18 @@ from pathlib import Path
 import pytest
 
 from build import bundle
-from conftest import requires_conforming_bundle
+from conftest import installed_bundle_requirement, requires_conforming_bundle
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_PATH = REPO_ROOT / "bin" / "thingskit"
+
+# ADR-003 : l'exigence de code n'est plus une constante du module — elle est
+# composée depuis la configuration de construction. Les fixtures en emploient
+# une, synthétique ; les tests qui touchent au bundle installé lisent la
+# sienne dans son propre fichier scellé.
+FAKE_ID = "app.example.thingskit"
+FAKE_TEAM = "TEAM000001"
+REQUIREMENT = bundle.code_requirement(FAKE_ID, FAKE_TEAM)
 
 
 # ------------------------------------------------------------------ outillage
@@ -86,6 +94,7 @@ def _shim(tmp_path, app, *, commands=("areas",), codesign=None, name="thingskit-
     source = bundle.shim_source(
         commands,
         app_path=str(app),
+        requirement=REQUIREMENT,
         codesign=str(codesign if codesign is not None else _stub_codesign(tmp_path)),
     )
     return bundle.compile_shim(source, tmp_path / name)
@@ -161,19 +170,21 @@ def test_an_unreadable_source_is_a_refusal_not_an_empty_list(tmp_path):
 def test_the_shim_source_refuses_to_be_generated_without_a_list():
     """Un shim sans table disclaimerait tout — l'option 1, sans l'avoir décidé."""
     with pytest.raises(bundle.BundleError):
-        bundle.shim_source([])
+        bundle.shim_source([], app_path="/tmp/x.app", requirement=REQUIREMENT)
 
 
 @pytest.mark.parametrize("hostile", ['a"b', "a\\b", "a\nb"])
 def test_the_shim_source_refuses_a_command_it_cannot_embed_safely(hostile):
     """Une sous-commande hostile ne doit pas pouvoir s'échapper de sa chaîne C."""
     with pytest.raises(bundle.BundleError):
-        bundle.shim_source([hostile])
+        bundle.shim_source([hostile], app_path="/tmp/x.app",
+                           requirement=REQUIREMENT)
 
 
 def test_the_requirement_traverses_the_generation_with_its_quotes_intact():
-    source = bundle.shim_source(["areas"])
-    assert bundle.CODE_REQUIREMENT.replace('"', '\\"') in source
+    source = bundle.shim_source(
+        ["areas"], app_path="/tmp/x.app", requirement=REQUIREMENT)
+    assert REQUIREMENT.replace('"', '\\"') in source
 
 
 # ------------------------------------- INV-002-1 : la partition, mesurée
@@ -408,13 +419,15 @@ def test_a_verifier_killed_by_a_signal_is_not_a_success(tmp_path):
 
 def test_the_shim_verifies_the_seal_through_an_absolute_path():
     """Un `codesign` résolu par PATH rendrait le contrôle détournable."""
-    source = bundle.shim_source(["areas"])
+    source = bundle.shim_source(
+        ["areas"], app_path="/tmp/x.app", requirement=REQUIREMENT)
     assert '"/usr/bin/codesign"' in source
 
 
 def test_the_shim_opposes_the_requirement_not_just_a_valid_signature():
     """Sans `-R`, `codesign` constate « une signature valide », jamais « LA »."""
-    source = bundle.shim_source(["areas"])
+    source = bundle.shim_source(
+        ["areas"], app_path="/tmp/x.app", requirement=REQUIREMENT)
     assert '"--verify"' in source and '"--strict"' in source
     assert '"-R="' in source or '-R=' in source
 
@@ -427,7 +440,9 @@ def test_a_tampered_copy_of_the_real_bundle_is_refused_by_the_shim(tmp_path):
     copy = tmp_path / "thingskit.app"
     shutil.copytree("/Applications/thingskit.app", copy, symlinks=True)
     shim = bundle.compile_shim(
-        bundle.shim_source(["areas"], app_path=str(copy)), tmp_path / "shim"
+        bundle.shim_source(["areas"], app_path=str(copy),
+                           requirement=installed_bundle_requirement()),
+        tmp_path / "shim"
     )
     ok = subprocess.run([str(shim), "areas"], capture_output=True, text=True)
     assert ok.returncode == 0, ok.stderr

@@ -74,6 +74,19 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_PATH = REPO_ROOT / "bin" / "thingskit"
 
 ESCAPE_FUNCTION = "_esc"
+# Second neutraliseur, et il ne neutralise PAS de la même façon : `_esc`
+# échappe, `_requirement_value` REFUSE. Il garde l'unique gabarit du script
+# qui n'est pas de l'AppleScript — l'exigence de code composée depuis le
+# fichier d'identité scellé (ADR-003) —, où un échappement AppleScript serait
+# le mauvais outil : la grammaire de `csreq` n'est pas celle d'`osascript`, et
+# échapper y ferait passer une valeur que le dépôt veut voir refusée.
+#
+# La dispense qu'il ouvre est plus étroite que celle d'`_esc` : elle exige une
+# forme, elle ne rend pas une valeur portable. Les deux passent par les MÊMES
+# contrôles de portée — un `_requirement_value = lambda v, f: v` posé en tête
+# de fonction dispenserait autrement tout ce qu'il couvre.
+REQUIREMENT_VALUE_FUNCTION = "_requirement_value"
+NEUTRALISING_FUNCTIONS = (ESCAPE_FUNCTION, REQUIREMENT_VALUE_FUNCTION)
 
 
 def _globally_rebound_names(tree: ast.Module) -> set[str]:
@@ -157,12 +170,16 @@ def _module_literal_names(tree: ast.Module,
     return names
 
 
+def _neutralising_call(node: ast.AST) -> str | None:
+    """Nom du neutraliseur appelé par `node`, ou `None`."""
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id in NEUTRALISING_FUNCTIONS):
+        return node.func.id
+    return None
+
+
 def _is_escape_call(node: ast.AST) -> bool:
-    return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == ESCAPE_FUNCTION
-    )
+    return _neutralising_call(node) == ESCAPE_FUNCTION
 
 
 def _escape_definition_is_sound(tree: ast.Module,
@@ -178,15 +195,22 @@ def _escape_definition_is_sound(tree: ast.Module,
     Un module qui ne lie pas `_esc` du tout n'a rien à dire : la fonction vient
     d'ailleurs, et l'exiger ici refuserait toutes les épreuves partielles.
     """
-    bound = _module_level_bound_names(tree, owner).get(ESCAPE_FUNCTION, 0)
+    return all(_neutraliser_definition_is_sound(tree, owner, name)
+               for name in NEUTRALISING_FUNCTIONS)
+
+
+def _neutraliser_definition_is_sound(tree: ast.Module,
+                                     owner: dict[int, ast.AST | None],
+                                     name: str) -> bool:
+    bound = _module_level_bound_names(tree, owner).get(name, 0)
     if bound == 0:
         return True
     definitions = [node for node in ast.walk(tree)
                    if owner.get(id(node)) is None
                    and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                   and node.name == ESCAPE_FUNCTION]
+                   and node.name == name]
     return (bound == 1 and len(definitions) == 1
-            and ESCAPE_FUNCTION not in _globally_rebound_names(tree))
+            and name not in _globally_rebound_names(tree))
 
 
 def _escape_is_shadowed_at(site: ast.AST,
@@ -198,7 +222,8 @@ def _escape_is_shadowed_at(site: ast.AST,
     """
     scope = owner.get(id(site))
     while scope is not None:
-        if ESCAPE_FUNCTION in _locally_bound_names(scope, owner):
+        bound = _locally_bound_names(scope, owner)
+        if any(name in bound for name in NEUTRALISING_FUNCTIONS):
             return True
         scope = owner.get(id(scope))
     return False
@@ -329,11 +354,11 @@ def _unescaped_quoted_interpolations(path: Path | None = None) -> list[str]:
             if not inside:
                 continue
             expression = part.value
-            if _is_escape_call(expression):
+            if _neutralising_call(expression) is not None:
                 if _escape_is_shadowed_at(node, owner) or not escape_is_sound:
                     offenders.append(
                         f"ligne {node.lineno} : {ast.unparse(expression)} — "
-                        f"{ESCAPE_FUNCTION} est relié dans la portée du site, "
+                        f"un neutraliseur est relié dans la portée du site, "
                         f"la dispense ne tient pas"
                     )
                 continue
@@ -756,7 +781,7 @@ def test_an_escape_call_shadowed_by_a_local_binding_does_not_dispense(tmp_path):
             return f'make new area with properties {{name:"{_esc(a.name)}"}}'
         ''')
     assert _unescaped_quoted_interpolations(fake) == [
-        "ligne 5 : _esc(a.name) — _esc est relié dans la portée du site, "
+        "ligne 5 : _esc(a.name) — un neutraliseur est relié dans la portée du site, "
         "la dispense ne tient pas"
     ]
 
@@ -771,7 +796,7 @@ def test_an_escape_function_rebound_at_module_level_does_not_dispense(tmp_path):
             return f'error "{_esc(a.name)}"'
         ''')
     assert _unescaped_quoted_interpolations(fake) == [
-        "ligne 5 : _esc(a.name) — _esc est relié dans la portée du site, "
+        "ligne 5 : _esc(a.name) — un neutraliseur est relié dans la portée du site, "
         "la dispense ne tient pas"
     ]
 

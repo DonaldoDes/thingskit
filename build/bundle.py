@@ -47,9 +47,7 @@ from pathlib import Path
 from . import macho
 
 BUNDLE_NAME = "thingskit"
-BUNDLE_IDENTIFIER = "app.sowell.thingskit"
 BUNDLE_VERSION = "1.0"
-INSTALL_PATH = "/Applications/thingskit.app"
 # Chemin ABSOLU, jamais résolu par PATH : un vérificateur de sceau que
 # l'environnement peut détourner ne vérifie rien (même classe de défaut que
 # `PYTHONPATH`, cf. `launcher_script`).
@@ -74,13 +72,33 @@ PACKAGE_MANAGER_STARTUP_HOOK_NAMES = ("sitecustomize.py", "usercustomize.py", "*
 # quelle identité de code sera apposée au bundle.
 SECURITY = "/usr/bin/security"
 OPENSSL = "/usr/bin/openssl"
-# Identifiant d'équipe du certificat de signature, relevé sur l'artefact réel :
-# `codesign -dv --verbose=4` rend `TeamIdentifier=56AP2NSB54` (mesuré le
-# 2026-08-18). C'est la SEULE propriété d'identité que le build impose au
-# certificat : l'exigence de code ci-dessous ne nomme jamais la feuille, donc
-# nommer un certificat précis (ce que faisait `SIGNING_IDENTITY` jusqu'à
-# BUG-010) liait le build à un poste sans rien garantir de plus.
-TEAM_IDENTIFIER = "56AP2NSB54"
+# ADR-003 : quelle identité de code est attendue n'est plus écrite ici. Elle
+# vient d'une ORIGINE UNIQUE de configuration, locale et non versionnée, lue
+# par le seul build — jamais par un chemin d'exécution du CLI. Le dépôt est
+# public : y écrire l'identifiant d'équipe du mainteneur le publierait, et
+# rendrait le dépôt inconstructible par un tiers, qui devrait éditer le code
+# pour signer sous sa propre identité.
+#
+# Aucune valeur par défaut versionnée : le fichier est absent d'un clone, et
+# le build refuse en le NOMMANT. Coût assumé, écrit plutôt qu'escamoté : le
+# mainteneur le recrée après un `git clean`. Format et exemple : CONTRIBUTING.
+BUILD_IDENTITY_CONFIG = Path(__file__).resolve().parent / "identity.conf"
+BUILD_IDENTITY_FIELDS = ("bundle_identifier", "team_identifier", "install_path")
+# Nom du fichier d'identité scellé dans `Contents/Resources/`. Il DOIT être
+# celui que `bin/thingskit` dérive de `sys.executable` : l'accord des deux
+# côtés est mesuré (`tests/test_build_identity.py`), pas relu.
+CODE_IDENTITY_FILE = "code-identity"
+# Formes STRICTES, pas seulement échappables — mêmes classes que celles de
+# `bin/thingskit`, et leur accord est mesuré plutôt que relu (le script source
+# ne peut rien importer d'ici : ce serait une surface d'exécution sur le
+# chemin de démarrage de la garde, et `verify_embedded_copy` l'interdit par
+# ailleurs). Un guillemet ou un espace admis ici injecterait une clause dans
+# l'exigence de code ; un caractère de contrôle, dans la source C du shim.
+_BUNDLE_IDENTIFIER_FORM = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,127}\Z")
+_TEAM_IDENTIFIER_FORM = re.compile(r"[A-Z0-9]{10}\Z")
+# Le chemin d'installation traverse une chaîne C (le shim) ET un `sh` (le
+# lanceur) : la classe exclut tout ce qui a un sens dans l'un ou l'autre.
+_INSTALL_PATH_FORM = re.compile(r"/[A-Za-z0-9 ._/-]{0,255}\.app\Z")
 # Exigence de code opposée au bundle AVANT l'exec. Sans elle, `--verify
 # --strict` constate « une signature valide », jamais « LA signature » :
 # mesuré le 2026-08-18, altérer `Contents/Resources/thingskit` sur une copie
@@ -92,9 +110,8 @@ TEAM_IDENTIFIER = "56AP2NSB54"
 # lanceur `sh`, ses guillemets doubles y traversent sans échappement.
 # Marqueur d'extension X.509 du TYPE de certificat (ADR-002 § Decision 5).
 #
-# Le `csreq` que TCC a enregistre pour `app.sowell.thingskit` pinne
-# l'identifier, l'ancre Apple, le CN du certificat FEUILLE et le marqueur de
-# l'intermediaire — jamais le Team ID (mesure du 2026-08-21). L'exigence du
+# Le `csreq` que TCC a enregistre pour le bundle pinne l'identifier, l'ancre
+# Apple, le CN du certificat FEUILLE et le marqueur de l'intermediaire — jamais le Team ID (mesure du 2026-08-21). L'exigence du
 # depot, elle, ne portait que l'equipe : les deux ne coincidaient donc pas, et
 # l'ecart avait une consequence precise et UNIDIRECTIONNELLE — un bundle
 # pouvait satisfaire l'exigence du depot ET avoir perdu le grant. Le cas
@@ -127,12 +144,29 @@ CERTIFICATE_TYPE_OID = "1.2.840.113635.100.6.1.2"
 # guillemets SIMPLES dans le lanceur `sh`. Le porteur est desormais une chaine C
 # (ADR-002), mais la contrainte est conservee — elle ne coute rien et l'exigence
 # reste copiable telle quelle dans un `sh` de diagnostic.
-CODE_REQUIREMENT = (
-    'anchor apple generic'
-    f' and identifier "{BUNDLE_IDENTIFIER}"'
-    f' and certificate leaf[field.{CERTIFICATE_TYPE_OID}] exists'
-    f' and certificate leaf[subject.OU]="{TEAM_IDENTIFIER}"'
-)
+
+
+def code_requirement(bundle_identifier: str, team_identifier: str) -> str:
+    """Compose l'exigence de code opposee au bundle et au shim.
+
+    Le PLANCHER de forme n'est pas configurable : l'ancrage Apple generique et
+    le marqueur d'extension de TYPE de certificat sont ecrits ICI, et aucune
+    configuration ne peut les retirer. Une configuration ne peut que
+    RESTREINDRE l'exigence, jamais l'elargir — sans quoi une configuration
+    degradee affaiblirait la garde en silence, seule degradation invisible
+    puisque le build reussirait et que le CLI demarrerait.
+
+    `bin/thingskit` compose la meme chaine a partir du fichier scelle ; leur
+    egalite est LITTERALE et mesuree (INV-003-5).
+    """
+    return (
+        'anchor apple generic'
+        f' and identifier "{bundle_identifier}"'
+        f' and certificate leaf[field.{CERTIFICATE_TYPE_OID}] exists'
+        f' and certificate leaf[subject.OU]="{team_identifier}"'
+    )
+
+
 # Code de refus du lanceur. Distinct de tout code du chemin nominal
 # (`main()` rend 0/1, argparse rend 2) : C-1 exige que le contrat
 # « 0 = effet constaté » remonte intact.
@@ -173,6 +207,108 @@ class BundleError(RuntimeError):
     """Le build refuse de produire un artefact dont il ne peut pas répondre."""
 
 
+# ------------------------------------------------- ADR-003 : la configuration
+
+
+def parse_build_identity(text: str, origin: Path | str) -> dict[str, str]:
+    """Analyse la configuration de construction, ou REFUSE.
+
+    Aucune tolérance : ligne sans séparateur, champ inconnu, dupliqué,
+    manquant, vide ou hors forme valent refus. Ce fichier décide de l'identité
+    de code que l'artefact exigera de lui-même — « la dernière valeur gagne »
+    y serait un choix implicite, et ce dépôt n'en fait aucun.
+
+    Les valeurs fautives sont CONVERTIES (`!r`) dans le message : elles sont
+    d'origine non contrôlée, et une séquence de contrôle recopiée telle quelle
+    ferait lire au mainteneur autre chose que ce que le build a écrit.
+    """
+    fields: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition("=")
+        if not sep:
+            raise BundleError(
+                f"configuration de construction illisible ({origin}) : ligne "
+                f"sans separateur {line!r}. Champs attendus : "
+                + ", ".join(BUILD_IDENTITY_FIELDS))
+        key, value = key.strip(), value.strip()
+        if key not in BUILD_IDENTITY_FIELDS:
+            raise BundleError(
+                f"configuration de construction ({origin}) : champ inconnu "
+                f"{key!r}. Champs attendus : " + ", ".join(BUILD_IDENTITY_FIELDS))
+        if key in fields:
+            raise BundleError(
+                f"configuration de construction ({origin}) : champ duplique "
+                f"{key!r} — aucune valeur ne l'emporte sur l'autre.")
+        fields[key] = value
+    for name in BUILD_IDENTITY_FIELDS:
+        if name not in fields:
+            raise BundleError(
+                f"configuration de construction incomplete ({origin}) : champ "
+                f"{name} absent. Champs attendus : "
+                + ", ".join(BUILD_IDENTITY_FIELDS))
+    forms = {
+        "bundle_identifier": _BUNDLE_IDENTIFIER_FORM,
+        "team_identifier": _TEAM_IDENTIFIER_FORM,
+        "install_path": _INSTALL_PATH_FORM,
+    }
+    for name, form in forms.items():
+        if not form.match(fields[name]):
+            raise BundleError(
+                f"configuration de construction ({origin}) : {name} hors "
+                f"forme {fields[name]!r} — attendu {form.pattern!r}.")
+    return fields
+
+
+def read_build_identity(path: Path | str = BUILD_IDENTITY_CONFIG) -> dict[str, str]:
+    """Lit l'origine unique de configuration, ou REFUSE en la nommant.
+
+    Le build gagne ici un mode d'échec de plus — configuration manquante — et
+    il doit se diagnostiquer sans lire le code : le message nomme le fichier
+    attendu et les trois champs.
+    """
+    path = Path(path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        raise BundleError(
+            f"configuration de construction absente ou illisible : {path} "
+            f"({exc.__class__.__name__}). Ce depot ne porte AUCUNE valeur "
+            "d'identite par defaut : creer ce fichier avec les champs "
+            + ", ".join(BUILD_IDENTITY_FIELDS)
+            + " (cf. CONTRIBUTING.md)."
+        ) from exc
+    return parse_build_identity(text, path)
+
+
+def code_identity_file_text(bundle_identifier: str, team_identifier: str) -> str:
+    """Contenu du fichier d'identite scelle dans `Contents/Resources/`.
+
+    C'est de la DONNEE, pas du Python : `bin/thingskit` la parse, il ne
+    l'importe jamais (ADR-003, option 5 ecartee).
+    """
+    return (
+        "# thingskit — identite de code attendue par le CLI (ADR-003).\n"
+        "# Ecrit par build/bundle.py AVANT la signature, donc couvert par le\n"
+        "# sceau des ressources. Ne pas editer : toute retouche invalide le\n"
+        "# sceau, et le lanceur refuse alors le bundle.\n"
+        f"bundle_identifier = {bundle_identifier}\n"
+        f"team_identifier = {team_identifier}\n"
+    )
+
+
+def write_code_identity(contents: Path | str, bundle_identifier: str,
+                        team_identifier: str) -> Path:
+    """Ecrit le fichier d'identite dans `Contents/Resources/` et rend son chemin."""
+    dest = Path(contents) / "Resources" / CODE_IDENTITY_FILE
+    dest.write_text(
+        code_identity_file_text(bundle_identifier, team_identifier),
+        encoding="utf-8")
+    return dest
+
+
 # ------------------------------------------------- BNDL-02b (BUG-010)
 
 
@@ -200,9 +336,9 @@ def split_rdns(subject_line: str) -> list[str]:
     RFC2253 §2.4 échappe par antislash une virgule appartenant à une valeur.
     Couper sur toutes les virgules fabrique donc des RDN qui n'existent pas :
     mesuré le 2026-08-19, le sujet
-    `CN=Apple Development: Mallory (X)\\,OU=56AP2NSB54,OU=EVILTEAM1,O=Evil`
+    `CN=Apple Development: Mallory (X)\\,OU=<equipe attendue>,OU=EVILTEAM1,O=Evil`
     n'a qu'UN seul OU (`EVILTEAM1`), et un découpage naïf y lit d'abord
-    `56AP2NSB54` — l'équipe même que le build exige.
+    l'équipe même que le build exige.
     """
     line = subject_line
     if line.startswith("subject="):
@@ -247,11 +383,18 @@ def subject_ou(subject_line: str) -> str | None:
     l'une pour l'autre donnerait un build qui croit vérifier l'équipe et ne
     vérifie rien.
     """
-    for rdn in split_rdns(subject_line):
-        key, sep, value = rdn.partition("=")
-        if sep and key.strip().upper() == "OU":
-            return unescape_rfc2253(value)
-    return None
+    units = [unescape_rfc2253(value)
+             for key, sep, value in (rdn.partition("=")
+                                     for rdn in split_rdns(subject_line))
+             if sep and key.strip().upper() == "OU"]
+    # Deux unités d'organisation : « la première gagne » serait un choix
+    # implicite sur la valeur qui décide de l'identité du build. Ce dépôt
+    # refuse sur ambiguïté plutôt que de trancher (même règle que les
+    # résolutions par titre du CLI). Fail-closed : le certificat devient
+    # inéligible, il ne devient jamais éligible par erreur.
+    if len(units) != 1:
+        return None
+    return units[0]
 
 
 def host_identities() -> list[tuple[str, str]]:
@@ -299,7 +442,7 @@ def certificate_team(sha1: str, name: str, *, dump: str | None = None) -> str | 
 
 
 def eligible_signing_identities(
-    team: str = TEAM_IDENTIFIER, *, listing: str | None = None, team_of=None
+    team: str, *, listing: str | None = None, team_of=None
 ) -> list[tuple[str, str]]:
     """Identités du poste appartenant à `team`, triées par (nom, empreinte).
 
@@ -315,7 +458,7 @@ def eligible_signing_identities(
 
 
 def resolve_signing_identity(
-    team: str = TEAM_IDENTIFIER, *, listing: str | None = None, team_of=None
+    team: str, *, listing: str | None = None, team_of=None
 ) -> str:
     """Empreinte de l'identité de signature à employer sur ce poste.
 
@@ -331,8 +474,9 @@ def resolve_signing_identity(
         raise BundleError(
             f"aucune identité de signature de l'équipe {team} sur ce poste — "
             "impossible de construire un bundle satisfaisant l'exigence de "
-            f"code {CODE_REQUIREMENT!r}. Émettre un certificat Apple "
-            "Development pour cette équipe et le vérifier avec "
+            "code composée depuis la configuration de construction. Émettre "
+            "un certificat Apple Development pour cette équipe et le vérifier "
+            "avec "
             f"`{SECURITY} find-identity -v -p codesigning`."
         )
     if len(eligible) > 1:
@@ -350,8 +494,8 @@ def resolve_signing_identity(
 
 
 def info_plist_xml(
+    identifier: str,
     *,
-    identifier: str = BUNDLE_IDENTIFIER,
     executable: str = BUNDLE_NAME,
     name: str = BUNDLE_NAME,
     version: str = BUNDLE_VERSION,
@@ -401,8 +545,8 @@ def codesign_command(
     if not identity or not identity.strip() or identity.strip() == "-":
         raise BundleError(
             "signature ad-hoc ou identité vide refusée : le bundle doit porter "
-            f"une identité de l'équipe {TEAM_IDENTIFIER} (identité reçue : "
-            f"{identity!r})"
+            "une identité de l'équipe nommée par la configuration de "
+            f"construction (identité reçue : {identity!r})"
         )
     cmd = [CODESIGN, "--force", "--timestamp=none", "--options", "runtime"]
     if entitlements is not None:
@@ -410,7 +554,7 @@ def codesign_command(
     if identifier is not None:
         # `-i` n'est pose que sur le shim : sans lui, `codesign` derive
         # l'identifiant d'un Mach-O IMBRIQUE de son nom de fichier, et
-        # l'exigence unique du depot — qui nomme `app.sowell.thingskit` — ne
+        # l'exigence unique du build — qui nomme l'identifiant configure — ne
         # pourrait pas lui etre opposee. Le depot n'aurait alors qu'une
         # exigence pour le bundle et aucune pour le premier code qui s'execute.
         cmd += ["-i", identifier]
@@ -511,10 +655,10 @@ def _c_string(value: str) -> str:
 def shim_source(
     commands,
     *,
-    app_path: str = INSTALL_PATH,
+    app_path: str,
+    requirement: str,
     bundle_name: str = BUNDLE_NAME,
     codesign: str = CODESIGN,
-    requirement: str = CODE_REQUIREMENT,
     template: Path | str = SHIM_TEMPLATE,
     timeout: int = SHIM_CODESIGN_TIMEOUT_SECONDS,
 ) -> str:
@@ -584,7 +728,7 @@ def compile_shim(source_text: str, dest: Path | str, *, cc: str = CC) -> Path:
 
 
 def launcher_script(
-    app_path: str = INSTALL_PATH,
+    app_path: str,
     shim: str = SHIM_NAME,
 ) -> str:
     """Rend le lanceur installe en `~/.local/bin/thingskit`.
@@ -716,7 +860,7 @@ def assert_interpreter_is_self_contained(bundle_path: Path | str) -> None:
 def assert_bundle_satisfies_requirement(
     bundle_path: Path | str,
     identity: str,
-    requirement: str = CODE_REQUIREMENT,
+    requirement: str,
     codesign: str = CODESIGN,
 ) -> None:
     """Oppose l'exigence de code à l'artefact RÉELLEMENT produit (BUG-013).
@@ -829,18 +973,30 @@ def _version_dir_name(framework: Path) -> str:
     raise BundleError("version du framework Python introuvable")
 
 
-def build(dest: Path, source: Path = SOURCE_SCRIPT, identity: str | None = None,
+def build(dest: Path | None = None, source: Path = SOURCE_SCRIPT,
+          identity: str | None = None,
           entitlements: str | None = None, *, listing: str | None = None,
-          team_of=None) -> Path:
+          team_of=None, config: Path | str = BUILD_IDENTITY_CONFIG) -> Path:
     """Construit, relocalise et signe le bundle. Idempotent : reconstruit à neuf.
 
-    L'identité est résolue AVANT toute écriture : `dest` est détruit puis
-    reconstruit, donc échouer plus tard laisserait le poste sans bundle du tout
-    — ce que le lanceur traduit en refus d'exécution (BUG-009), soit une panne
-    franche là où le poste marchait avant le build.
+    La configuration et l'identité sont lues AVANT toute écriture : `dest` est
+    détruit puis reconstruit, donc échouer plus tard laisserait le poste sans
+    bundle du tout — ce que le lanceur traduit en refus d'exécution (BUG-009),
+    soit une panne franche là où le poste marchait avant le build.
+
+    Les DEUX porteurs de l'exigence — la chaîne compilée dans le shim et le
+    fichier d'identité scellé dans `Contents/Resources/` — sortent de CETTE
+    lecture, la seule du build (INV-003-5). Deux lectures, ce seraient deux
+    vérités possibles dans un même artefact.
     """
+    fields = read_build_identity(config)
+    bundle_identifier = fields["bundle_identifier"]
+    requirement = code_requirement(bundle_identifier, fields["team_identifier"])
+    if dest is None:
+        dest = Path(fields["install_path"])
     if identity is None:
-        identity = resolve_signing_identity(listing=listing, team_of=team_of)
+        identity = resolve_signing_identity(
+            fields["team_identifier"], listing=listing, team_of=team_of)
     framework = _python_framework()
     version = _version_dir_name(framework)
 
@@ -851,18 +1007,26 @@ def build(dest: Path, source: Path = SOURCE_SCRIPT, identity: str | None = None,
     (contents / "Resources").mkdir(parents=True)
     (contents / "Frameworks").mkdir(parents=True)
 
-    (contents / "Info.plist").write_text(info_plist_xml(), encoding="utf-8")
+    (contents / "Info.plist").write_text(
+        info_plist_xml(bundle_identifier), encoding="utf-8")
 
     embedded = contents / "Resources" / BUNDLE_NAME
     shutil.copy2(source, embedded)
     verify_embedded_copy(source, embedded)
+
+    # Second porteur de l'exigence, et le seul que le CLI lise : écrit ICI,
+    # donc AVANT `_sign_everything` — un fichier ajouté après la signature
+    # invaliderait le sceau des ressources au lieu d'être couvert par lui
+    # (INV-003-3, mesuré dans ADR-002 § R-2).
+    write_code_identity(contents, bundle_identifier, fields["team_identifier"])
 
     # Le shim est compile AVANT la copie du framework : la lecture de
     # `FAST_PATH_COMMANDS` et la compilation sont les deux etapes qui peuvent
     # echouer pour une raison de SOURCE, et il vaut mieux qu'elles echouent
     # avant les minutes de copie et de re-signature.
     compile_shim(
-        shim_source(read_fast_path_commands(source), app_path=str(dest)),
+        shim_source(read_fast_path_commands(source), app_path=str(dest),
+                    requirement=requirement),
         contents / "MacOS" / SHIM_NAME,
     )
 
@@ -887,16 +1051,17 @@ def build(dest: Path, source: Path = SOURCE_SCRIPT, identity: str | None = None,
     # paquets du Cellar à CHAQUE démarrage, `-I` compris.
     _strip_package_manager_startup_hooks(dest)
     assert_no_package_manager_refs(dest)
-    _sign_everything(dest, identity, entitlements, framework_version=vdir)
+    _sign_everything(dest, identity, entitlements, framework_version=vdir,
+                     bundle_identifier=bundle_identifier)
     # Dernier geste avant de se déclarer réussi : l'artefact réel est opposé
     # à l'exigence que le lanceur lui opposera (BUG-013).
-    assert_bundle_satisfies_requirement(dest, identity)
+    assert_bundle_satisfies_requirement(dest, identity, requirement)
     # Le shim est le PREMIER code du bundle a s'executer, et le seul a decider
     # de la responsabilite de processus : l'exigence lui est opposee pour
     # lui-meme, pas seulement par ricochet du sceau de la racine (ADR-002,
     # INV-002-6).
     assert_bundle_satisfies_requirement(
-        dest / "Contents" / "MacOS" / SHIM_NAME, identity
+        dest / "Contents" / "MacOS" / SHIM_NAME, identity, requirement
     )
     # Dernier contrôle, et le seul qui MESURE l'autonomie au lieu de l'inférer
     # d'une inspection statique. Il vient après la signature parce qu'un Mach-O
@@ -1114,7 +1279,8 @@ def _relocate(contents: Path, vdir: Path, exe: Path, dylib_id: str) -> None:
 
 
 def _sign_everything(dest: Path, identity: str, entitlements: str | None,
-                     framework_version: Path | None = None) -> None:
+                     framework_version: Path | None = None,
+                     bundle_identifier: str | None = None) -> None:
     """Signe du plus profond vers la racine.
 
     `install_name_tool` a invalidé les signatures ad-hoc d'origine ; un Mach-O
@@ -1132,7 +1298,7 @@ def _sign_everything(dest: Path, identity: str, entitlements: str | None,
         shim = macho == dest / "Contents" / "MacOS" / SHIM_NAME
         _run(codesign_command(
             str(macho), identity, entitlements,
-            identifier=BUNDLE_IDENTIFIER if shim else None,
+            identifier=bundle_identifier if shim else None,
         ))
     if framework_version is not None:
         # Le framework est un bundle versionné : il se scelle lui-même, sans quoi
@@ -1142,9 +1308,21 @@ def _sign_everything(dest: Path, identity: str, entitlements: str | None,
 
 
 def main(argv: list[str]) -> int:
-    dest = Path(argv[1]) if len(argv) > 1 else Path(INSTALL_PATH)
+    """`python3 -m build.bundle [destination] [--config <fichier>]`.
+
+    Sans destination, celle de la configuration : le chemin d'installation
+    n'est plus une décision gravée dans la source publiée (INV-003-8).
+    """
+    args, config = list(argv[1:]), BUILD_IDENTITY_CONFIG
+    if "--config" in args:
+        index = args.index("--config")
+        if index + 1 >= len(args):
+            print("build: --config attend un chemin", file=sys.stderr)
+            return 1
+        config = Path(args[index + 1])
+        del args[index:index + 2]
     try:
-        build(dest)
+        dest = build(Path(args[0]) if args else None, config=config)
     except (BundleError, subprocess.CalledProcessError) as exc:
         detail = getattr(exc, "stderr", "") or ""
         print(f"build: {exc}\n{detail}", file=sys.stderr)

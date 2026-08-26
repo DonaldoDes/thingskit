@@ -21,11 +21,32 @@ from pathlib import Path
 import pytest
 
 from build import bundle
-from conftest import requires_conforming_bundle
+from conftest import INSTALLED_BUNDLE, requires_conforming_bundle
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "bin" / "thingskit"
 LAUNCHER = Path.home() / ".local" / "bin" / "thingskit"
+
+# Identite de fixture (ADR-003). Aucune valeur reelle : le depot est public, et
+# le script source n'en porte plus aucune.
+FAKE_ID = "app.example.thingskit"
+FAKE_TEAM = "TEAM000001"
+REQUIREMENT = bundle.code_requirement(FAKE_ID, FAKE_TEAM)
+
+
+def _sealed_bundle(tmp_path, identifier, team, name="thingskit.app"):
+    """Arborescence minimale d'un bundle portant son fichier d'identite.
+
+    Rend le chemin de l'interpreteur, celui dont la garde derive le fichier.
+    """
+    contents = tmp_path / name / "Contents"
+    (contents / "MacOS").mkdir(parents=True)
+    (contents / "Resources").mkdir(parents=True)
+    if identifier is not None:
+        bundle.write_code_identity(contents, identifier, team)
+    exe = contents / "MacOS" / "thingskit"
+    exe.write_text("", encoding="utf-8")
+    return exe
 
 # ---------------------------------------------------------------- BUG-017
 # Une assertion LEXICALE sur la sortie d'un sous-processus n'éprouve pas ce
@@ -112,7 +133,8 @@ def test_the_refusal_names_the_cause_and_the_supported_entry_point():
         [sys.executable, str(SCRIPT), "areas"], capture_output=True, text=True
     )
     assert "thingskit:" in proc.stderr
-    assert "app.sowell.thingskit" in proc.stderr
+    assert "identite de code" in proc.stderr
+    assert "~/.local/bin/thingskit" in proc.stderr
 
 
 # ------------------------------------------------------- garde, en unitaire
@@ -120,37 +142,51 @@ def test_the_refusal_names_the_cause_and_the_supported_entry_point():
 
 def test_guard_lets_through_an_interpreter_that_satisfies_the_requirement(thingskit):
     run = _FakeRun(0)
-    assert thingskit.code_identity_refusal("/any/exe", runner=run) is None
+    assert thingskit.code_identity_refusal(
+        "/any/exe", runner=run, requirement=REQUIREMENT) is None
 
 
 def test_guard_refuses_an_interpreter_that_fails_the_requirement(thingskit):
     run = _FakeRun(3)
-    message = thingskit.code_identity_refusal("/opt/homebrew/bin/python3", runner=run)
+    message = thingskit.code_identity_refusal(
+        "/opt/homebrew/bin/python3", runner=run, requirement=REQUIREMENT)
     assert message is not None
     assert "~/.local/bin/thingskit" in message
 
 
 def test_guard_opposes_the_bundle_requirement_to_the_running_interpreter(thingskit):
     run = _FakeRun(0)
-    thingskit.code_identity_refusal("/some/python3", runner=run)
+    thingskit.code_identity_refusal(
+        "/some/python3", runner=run, requirement=REQUIREMENT)
     assert run.cmd[0] == "/usr/bin/codesign", "chemin absolu : PATH ne doit pas détourner le vérificateur"
     assert "--strict" in run.cmd
-    assert f"-R={thingskit.CODE_REQUIREMENT}" in run.cmd
+    assert f"-R={REQUIREMENT}" in run.cmd
     assert run.cmd[-1] == "/some/python3"
+
+
+def test_the_guard_reads_its_requirement_from_the_sealed_file(thingskit, tmp_path):
+    """Sans exigence injectée, elle vient du fichier scellé du bundle — jamais
+    d'une constante du script, qui n'en porte plus aucune."""
+    exe = _sealed_bundle(tmp_path, FAKE_ID, FAKE_TEAM)
+    run = _FakeRun(0)
+    assert thingskit.code_identity_refusal(str(exe), runner=run) is None
+    assert f"-R={REQUIREMENT}" in run.cmd
 
 
 def test_guard_refuses_when_codesign_cannot_even_be_run(thingskit):
     def boom(cmd, **kw):
         raise OSError("codesign absent")
 
-    assert thingskit.code_identity_refusal("/some/python3", runner=boom) is not None
+    assert thingskit.code_identity_refusal(
+        "/some/python3", runner=boom, requirement=REQUIREMENT) is not None
 
 
-def test_the_requirement_matches_the_one_the_build_signs_with(thingskit):
-    """Anti-dérive : le script et le build parlent de la MÊME identité."""
-    assert thingskit.CODE_REQUIREMENT == bundle.CODE_REQUIREMENT
-    assert thingskit.BUNDLE_IDENTIFIER == bundle.BUNDLE_IDENTIFIER
-    assert thingskit.TEAM_IDENTIFIER == bundle.TEAM_IDENTIFIER
+def test_the_requirement_is_composed_the_same_way_on_both_sides(thingskit):
+    """Anti-dérive : le script et le build composent la MÊME exigence à partir
+    des mêmes valeurs. Ils ne partagent plus de constante — ADR-003 les retire
+    du script —, donc l'accord se mesure au lieu de se relire."""
+    assert (thingskit.compose_code_requirement(FAKE_ID, FAKE_TEAM)
+            == bundle.code_requirement(FAKE_ID, FAKE_TEAM))
 
 
 # ---------------------------------------------------------------- BUG-009-02
@@ -233,7 +269,7 @@ def test_the_decolorisation_closes_the_absence_direction_too():
 @requires_conforming_bundle
 def test_the_real_bundle_interpreter_satisfies_the_requirement(thingskit):
     """Le vrai `codesign`, opposé au vrai interpréteur embarqué : rc 0."""
-    exe = f"{bundle.INSTALL_PATH}/Contents/MacOS/thingskit"
+    exe = f"{INSTALLED_BUNDLE}/Contents/MacOS/thingskit"
     assert thingskit.code_identity_refusal(exe) is None
 
 
@@ -260,7 +296,8 @@ class _RecordingRun:
 def test_the_guard_bounds_the_time_it_gives_codesign(thingskit):
     """Un `timeout` est transmis à l'invocation, et il est fini et positif."""
     run = _RecordingRun()
-    thingskit.code_identity_refusal("/some/python3", runner=run)
+    thingskit.code_identity_refusal(
+        "/some/python3", runner=run, requirement=REQUIREMENT)
     assert "timeout" in run.kwargs, "sans timeout, un codesign bloqué fait pendre le CLI"
     timeout = run.kwargs["timeout"]
     assert isinstance(timeout, (int, float)) and 0 < timeout < 60
@@ -281,7 +318,8 @@ def test_a_codesign_that_hangs_is_refused_instead_of_hanging_the_cli(thingskit, 
         return subprocess.run(["/bin/sleep", "30"], **kw)
 
     started = time.monotonic()
-    message = thingskit.code_identity_refusal("/some/python3", runner=hanging)
+    message = thingskit.code_identity_refusal(
+        "/some/python3", runner=hanging, requirement=REQUIREMENT)
     elapsed = time.monotonic() - started
     assert seen["timeout"] == 0.5, "la constante doit être lue à l'appel, pas figée au `def`"
     assert elapsed < 10, f"la garde a pendu {elapsed:.1f}s"
@@ -293,9 +331,10 @@ def test_the_guard_refuses_on_a_non_oserror_failure(thingskit):
     def boom(cmd, **kw):
         raise ValueError("embedded null byte")
 
-    message = thingskit.code_identity_refusal("/some/python3", runner=boom)
+    message = thingskit.code_identity_refusal(
+        "/some/python3", runner=boom, requirement=REQUIREMENT)
     assert message is not None
-    assert "app.sowell.thingskit" in message
+    assert "~/.local/bin/thingskit" in message
 
 
 def test_a_non_oserror_failure_exits_with_the_identity_refusal_code(thingskit):
@@ -340,7 +379,8 @@ def test_the_requirement_is_what_rejects_an_apple_signed_third_party_binary():
     ).returncode
     with_requirement = subprocess.run(
         ["/usr/bin/codesign", "--verify", "--strict",
-         f"-R={_bundle.CODE_REQUIREMENT}", APPLE_THIRD_PARTY_BINARY],
+         f"-R={_bundle.code_requirement(FAKE_ID, FAKE_TEAM)}",
+         APPLE_THIRD_PARTY_BINARY],
         capture_output=True, text=True,
     ).returncode
     assert without == 0, "témoin invalide : ce binaire n'est pas signé"
@@ -354,4 +394,122 @@ def test_the_requirement_is_what_rejects_an_apple_signed_third_party_binary():
 def test_the_guard_refuses_an_apple_signed_third_party_binary_for_real(thingskit):
     """La garde elle-même, sans sonde : un binaire Apple valide mais étranger
     au bundle est refusé."""
-    assert thingskit.code_identity_refusal(APPLE_THIRD_PARTY_BINARY) is not None
+    assert thingskit.code_identity_refusal(
+        APPLE_THIRD_PARTY_BINARY, requirement=REQUIREMENT) is not None
+
+
+# ------------------------------------------------------------------ ADR-003
+# L'identite de code attendue n'est plus une constante du script : elle est
+# LUE dans le fichier scelle du bundle qui porte l'interpreteur. INV-003-1 —
+# aucune configuration absente, vide, illisible ou malformee ne peut produire
+# une execution : les six formes degenerees sont opposees ici au chemin de
+# lecture, sur le modele de la branche `except` de la garde.
+
+
+def test_the_identity_file_sits_beside_the_resolved_interpreter(thingskit, tmp_path):
+    """Chemin ABSOLU derive de `sys.executable` RESOLU : un lien symbolique
+    ne doit pas deplacer la source de l'attente."""
+    exe = _sealed_bundle(tmp_path, FAKE_ID, FAKE_TEAM)
+    link = tmp_path / "lien-vers-thingskit"
+    link.symlink_to(exe)
+    expected = exe.parent.parent / "Resources" / thingskit.CODE_IDENTITY_FILE
+    assert Path(thingskit.code_identity_path(str(exe))) == expected
+    assert Path(thingskit.code_identity_path(str(link))) == expected
+
+
+def test_an_absent_identity_file_refuses_the_execution(thingskit, tmp_path):
+    exe = _sealed_bundle(tmp_path, None, None)
+    run = _FakeRun(0)
+    message = thingskit.code_identity_refusal(str(exe), runner=run)
+    assert message is not None
+    assert run.cmd is None, "le refus precede toute invocation de codesign"
+
+
+def test_an_unreadable_identity_file_refuses_the_execution(thingskit, tmp_path):
+    exe = _sealed_bundle(tmp_path, None, None)
+    (exe.parent.parent / "Resources" / thingskit.CODE_IDENTITY_FILE).mkdir()
+    assert thingskit.code_identity_refusal(str(exe), runner=_FakeRun(0)) is not None
+
+
+def test_an_undecodable_identity_file_refuses_the_execution(thingskit, tmp_path):
+    exe = _sealed_bundle(tmp_path, None, None)
+    (exe.parent.parent / "Resources" / thingskit.CODE_IDENTITY_FILE).write_bytes(
+        b"bundle_identifier = \xff\xfe\n")
+    assert thingskit.code_identity_refusal(str(exe), runner=_FakeRun(0)) is not None
+
+
+DEGENERATE_IDENTITY_FILES = [
+    ("", "vide"),
+    ("# rien\n", "commentaires seuls"),
+    ("bundle_identifier\n", "aucun separateur"),
+    (f"bundle_identifier = {FAKE_ID}\n", "champ manquant"),
+    (f"team_identifier = {FAKE_TEAM}\n", "champ manquant"),
+    (f"bundle_identifier =\nteam_identifier = {FAKE_TEAM}\n", "valeur vide"),
+    (f"bundle_identifier = {FAKE_ID}\nteam_identifier =   \n", "valeur blanche"),
+    (f'bundle_identifier = app.evil" or true\nteam_identifier = {FAKE_TEAM}\n',
+     "clause injectee"),
+    (f"bundle_identifier = {FAKE_ID}\nteam_identifier = team000001\n", "hors forme"),
+    (f"bundle_identifier = {FAKE_ID}\nteam_identifier = {FAKE_TEAM}\n"
+     "install_path = /tmp/x.app\n", "champ inconnu"),
+    (f"bundle_identifier = {FAKE_ID}\nbundle_identifier = app.autre\n"
+     f"team_identifier = {FAKE_TEAM}\n", "champ duplique"),
+    (f"bundle_identifier = {FAKE_ID}\x00\nteam_identifier = {FAKE_TEAM}\n",
+     "octet nul"),
+]
+
+
+@pytest.mark.parametrize(
+    "text,label", DEGENERATE_IDENTITY_FILES,
+    ids=[label for _text, label in DEGENERATE_IDENTITY_FILES],
+)
+def test_a_degenerate_identity_file_refuses_the_execution(
+        thingskit, tmp_path, text, label):
+    """Fail-closed sur la CLASSE, pas sur le cas rencontre : chacune de ces
+    formes laisserait autrement le CLI s'executer sous une attente que
+    personne n'a ecrite."""
+    exe = _sealed_bundle(tmp_path, None, None)
+    (exe.parent.parent / "Resources" / thingskit.CODE_IDENTITY_FILE).write_text(
+        text, encoding="utf-8")
+    run = _FakeRun(0)
+    assert thingskit.code_identity_refusal(str(exe), runner=run) is not None, label
+    assert run.cmd is None, "aucune verification n'est lancee sur une attente non etablie"
+
+
+def test_a_wellformed_identity_file_is_let_through(thingskit, tmp_path):
+    """Contre-epreuve : un fail-closed qui refuse TOUT ne prouve rien."""
+    exe = _sealed_bundle(tmp_path, FAKE_ID, FAKE_TEAM)
+    run = _FakeRun(0)
+    assert thingskit.code_identity_refusal(str(exe), runner=run) is None
+    assert run.cmd is not None
+
+
+def test_the_configuration_refusal_names_the_file_and_the_entry_point(
+        thingskit, tmp_path):
+    exe = _sealed_bundle(tmp_path, None, None)
+    message = thingskit.code_identity_refusal(str(exe), runner=_FakeRun(0))
+    assert thingskit.CODE_IDENTITY_FILE in message
+    assert "~/.local/bin/thingskit" in message
+
+
+def test_the_refusal_never_relays_a_control_sequence_from_the_file(
+        thingskit, tmp_path):
+    """Le fichier peut n'etre pas scelle — c'est precisement le cas ou la
+    garde refuse. Sa valeur ne doit donc pas atteindre le terminal telle
+    quelle : la conversion est `!r`, jamais un filtre de caracteres enumeres.
+    """
+    exe = _sealed_bundle(tmp_path, None, None)
+    (exe.parent.parent / "Resources" / thingskit.CODE_IDENTITY_FILE).write_text(
+        "bundle_identifier = app.evil\x1b[2K\rtout va bien\n"
+        f"team_identifier = {FAKE_TEAM}\n", encoding="utf-8")
+    message = thingskit.code_identity_refusal(str(exe), runner=_FakeRun(0))
+    assert "\x1b" not in message and "\r" not in message
+
+
+def test_the_identity_refusal_of_a_bare_interpreter_carries_its_own_exit_code():
+    """Bout en bout : le python du venv ne vit dans aucun bundle, donc aucune
+    attente n'est etablie — 125, et pas un code du chemin nominal."""
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT), "areas"], capture_output=True, text=True)
+    assert proc.returncode == 125
+    assert proc.stdout == ""
+    assert "Traceback" not in proc.stderr

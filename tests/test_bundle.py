@@ -16,19 +16,28 @@ from pathlib import Path
 import pytest
 
 from build import bundle
-from conftest import requires_conforming_bundle
+from conftest import (
+    INSTALLED_BUNDLE, installed_bundle_requirement, requires_conforming_bundle,
+)
+
+# ADR-003 : le module ne porte plus AUCUNE valeur d'identite. Les fixtures en
+# emploient une, synthetique, et les tests qui touchent au bundle INSTALLE
+# lisent la sienne dans son propre fichier scelle.
+FAKE_ID = "app.example.thingskit"
+FAKE_TEAM = "TEAM000001"
+REQUIREMENT = bundle.code_requirement(FAKE_ID, FAKE_TEAM)
 
 # ---------------------------------------------------------------- BNDL-01
 
 
-def test_info_plist_carries_the_fixed_bundle_identifier():
-    parsed = plistlib.loads(bundle.info_plist_xml().encode("utf-8"))
-    assert parsed["CFBundleIdentifier"] == "app.sowell.thingskit"
+def test_info_plist_carries_the_configured_bundle_identifier():
+    parsed = plistlib.loads(bundle.info_plist_xml(FAKE_ID).encode("utf-8"))
+    assert parsed["CFBundleIdentifier"] == FAKE_ID
     assert parsed["CFBundleExecutable"] == "thingskit"
 
 
 def test_info_plist_is_valid_plist_and_names_the_bundle():
-    parsed = plistlib.loads(bundle.info_plist_xml().encode("utf-8"))
+    parsed = plistlib.loads(bundle.info_plist_xml(FAKE_ID).encode("utf-8"))
     assert parsed["CFBundleName"] == "thingskit"
     assert parsed["CFBundlePackageType"] == "APPL"
 
@@ -77,6 +86,7 @@ def _fake_bundle(tmp_path, body, shim_commands=("areas",), codesign=None):
         bundle.shim_source(
             shim_commands,
             app_path=str(app),
+            requirement=REQUIREMENT,
             codesign=str(codesign or _stub_codesign(tmp_path)),
         ),
         app / "Contents" / "MacOS" / bundle.SHIM_NAME,
@@ -245,9 +255,14 @@ def test_build_refuses_when_the_embedded_copy_is_missing(tmp_path):
 # atteindre le systeme de fichiers a ce chemin. Nommer le chemin pour en
 # engendrer une chaine (`launcher_script`, `shim_source`) n'en depend pas — la
 # fonction rend du texte, sur un poste nu comme sur un poste equipe.
-INSTALL_PATH = bundle.INSTALL_PATH
+INSTALL_PATH = INSTALLED_BUNDLE
 INSTALL_PATH_NAME = "INSTALL_PATH"  # la meme cible, nommee par la constante
 CANONICAL_PREDICATE = "conforming_bundle_missing"
+# Seconde fonction structurellement exemptee, et la derniere : elle LIT
+# l'identite du bundle installe pour la rendre aux tests gardes. Comme le
+# predicat, elle doit atteindre le disque, et elle vit a cote de lui dans
+# `conftest.py`. Toute autre occurrence reste soumise a la garde.
+CANONICAL_REQUIREMENT_READER = "installed_bundle_requirement"
 CANONICAL_MARKER = "requires_conforming_bundle"
 
 _FILESYSTEM_REACH = frozenset({
@@ -269,7 +284,8 @@ def _installed_bundle_reaches(source: str) -> list[str]:
             #     c'est sa raison d'etre. Exemption structurelle — attachee au
             #     mecanisme, pas a un nom de fichier.
             # (b) tout test dont le saut est decide par ce predicat.
-            if node.name == CANONICAL_PREDICATE or any(
+            if node.name in (CANONICAL_PREDICATE,
+                             CANONICAL_REQUIREMENT_READER) or any(
                 CANONICAL_MARKER in _ast.unparse(dec) for dec in node.decorator_list
             ):
                 exempt.update(id(sub) for sub in _ast.walk(node))
@@ -534,11 +550,12 @@ def test_the_seal_check_pins_the_signing_identity_not_just_any_valid_signature()
     chaine C. Ce qui est garde reste ce qui compte : que `-R` soit oppose, et
     qu'il porte les trois clauses de l'exigence du depot.
     """
-    source = bundle.shim_source(["areas"])
+    source = bundle.shim_source(
+        ["areas"], app_path="/tmp/x.app", requirement=REQUIREMENT)
     assert '"-R="' in source
     assert "anchor apple generic" in source
-    assert f'identifier \\"{bundle.BUNDLE_IDENTIFIER}\\"' in source
-    assert f'certificate leaf[subject.OU]=\\"{bundle.TEAM_IDENTIFIER}\\"' in source
+    assert f'identifier \\"{FAKE_ID}\\"' in source
+    assert f'certificate leaf[subject.OU]=\\"{FAKE_TEAM}\\"' in source
 
 
 @requires_conforming_bundle
@@ -547,7 +564,8 @@ def test_the_real_bundle_satisfies_the_requirement_the_launcher_demands():
     rc = subprocess.run(
         [
             "/usr/bin/codesign", "--verify", "--strict",
-            f"-R={bundle.CODE_REQUIREMENT}", "/Applications/thingskit.app",
+            f"-R={installed_bundle_requirement()}",
+            "/Applications/thingskit.app",
         ],
         capture_output=True, text=True,
     )
@@ -566,7 +584,9 @@ def test_an_adhoc_resigned_copy_is_refused_by_the_shim(tmp_path):
     copy = tmp_path / "thingskit.app"
     _sh.copytree("/Applications/thingskit.app", copy, symlinks=True)
     shim = bundle.compile_shim(
-        bundle.shim_source(["areas"], app_path=str(copy)), tmp_path / "shim"
+        bundle.shim_source(["areas"], app_path=str(copy),
+                           requirement=installed_bundle_requirement()),
+        tmp_path / "shim"
     )
     ok = subprocess.run([str(shim), "areas"], capture_output=True, text=True)
     assert ok.returncode == 0, ok.stderr
@@ -707,10 +727,11 @@ _FICTIONAL_NAMES = {
 # Les SEULS identifiants réels admis, nommés un par un avec ce qui les rend
 # publics. Un ajout muet est impossible : il faut écrire le motif.
 _REAL_IDENTIFIERS_ADMITTED = {
-    bundle.TEAM_IDENTIFIER:
-        "équipe du projet — publique par construction : elle est dans "
-        "`bundle.CODE_REQUIREMENT`, donc dans le sceau de tout artefact "
-        "distribué. Une garde qui la refuserait serait ininstallable.",
+    # L'équipe du projet N'Y EST PLUS (ADR-003, INV-003-4). Elle y figurait
+    # parce qu'elle était dans `CODE_REQUIREMENT`, donc inévitable ; elle ne
+    # l'est plus : quelle identité est attendue vient d'une configuration
+    # locale non versionnée. Le dépôt public n'a plus de raison de la porter,
+    # et la garde la refuse désormais comme n'importe quelle autre.
     "JLMPQHK86H":
         "équipe de Cultured Code — publique : c'est le préfixe du Group "
         "Container de Things 3, lisible dans le chemin de la base "
@@ -813,10 +834,12 @@ def _allowlist_digest() -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-# Épinglé le 2026-08-26. Le régénérer :
+# Épinglé le 2026-08-26. Ré-épinglé le même jour par ADR-003, qui RETIRE
+# l'équipe du projet des identifiants réels admis : elle n'est plus dans
+# l'exigence de code, donc plus inévitable dans l'arbre publié. Le régénérer :
 #     .venv/bin/python -c "import sys;sys.path.insert(0,'tests');\
 # import test_bundle as t;print(t._allowlist_digest())"
-_ALLOWLIST_DIGEST = "9273db2c853685e6ba4ce3d7bee62a4127471e2816f488a1abafea8dff8e8432"
+_ALLOWLIST_DIGEST = "9b035eaff8487c2684ca8ccd0d4ddfc6d714a552dfa02a1e8ebb356f0ce0c2b5"
 
 
 def _swept_sources():
@@ -930,12 +953,23 @@ def test_the_leak_sweep_actually_sees_a_real_identity():
     ])
 
 
-def test_the_leak_sweep_does_not_flag_the_projects_own_team_identifier():
-    """Contre-épreuve : le Team ID du projet est PUBLIC par construction — il
-    est dans le sceau de tout artefact distribué. Le refuser rendrait la garde
-    ininstallable, donc désactivée."""
-    source = f'DN = "subject=OU={bundle.TEAM_IDENTIFIER},CN=Apple Development: Zoe (1)"\n'
-    assert _leaked_identities([(Path("fixture.py"), source)]) == []
+def test_the_only_admitted_real_identifier_is_the_third_partys():
+    """ADR-003, INV-003-4 : l'équipe du projet cesse d'être admise.
+
+    Elle n'était admise que parce que l'exigence de code la nommait, donc
+    qu'elle était inévitable dans l'arbre publié. Elle ne l'est plus. Le seul
+    identifiant réel qui subsiste est celui de Cultured Code, qui préfixe le
+    Group Container de Things et ne désigne personne ici.
+    """
+    assert set(_REAL_IDENTIFIERS_ADMITTED) == {"JLMPQHK86H"}
+
+
+def test_the_leak_sweep_flags_a_team_identifier_that_is_not_admitted():
+    """Contre-épreuve : la garde voit bien ce qu'elle n'admet plus."""
+    forged = "Z1Z2" + "Z3Z4" + "Z5"  # compose : l'ecrire d'un tenant le
+    # ferait detecter dans CE fichier, qui est lui-meme balaye.
+    source = f'DN = "subject=OU={forged},CN=Apple Development: Zoe (1)"\n'
+    assert _leaked_identities([(Path("fixture.py"), source)]) != []
 
 
 def test_no_certificate_name_is_hardcoded_in_the_build():
@@ -959,14 +993,15 @@ def test_identity_listing_of_a_bare_machine_parses_to_nothing():
 
 
 def test_the_team_is_read_from_the_certificate_never_from_the_identity_name():
-    """Le nom porte `(XXXXXXXXXX)`, l'équipe est `56AP2NSB54` : deux valeurs
-    distinctes sur le certificat réel. Déduire l'équipe du nom serait faux."""
+    """Le nom porte son propre identifiant entre parenthèses, l'équipe est
+    l'unité d'organisation : deux valeurs distinctes sur le certificat réel.
+    Déduire l'équipe du nom serait faux."""
     assert (
         bundle.subject_ou(
-            "subject=C=US,O=SoWell,OU=56AP2NSB54,"
+            f"subject=C=US,O=Exemple,OU={FAKE_TEAM},"
             "CN=Apple Development: Prenom NOM (XXXXXXXXXX),UID=YYYYYYYYYY"
         )
-        == "56AP2NSB54"
+        == FAKE_TEAM
     )
 
 
@@ -974,7 +1009,7 @@ def test_an_identity_of_another_team_is_not_eligible():
     listing = '  1) AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA "Apple Development: Quelqu un (XXXX)"\n'
     assert (
         bundle.eligible_signing_identities(
-            listing=listing, team_of=_team_of({"A" * 40: "ZZZZZZZZZZ"})
+            FAKE_TEAM, listing=listing, team_of=_team_of({"A" * 40: "ZZZZZZZZZZ"})
         )
         == []
     )
@@ -983,9 +1018,10 @@ def test_an_identity_of_another_team_is_not_eligible():
 def test_the_studio_identity_is_still_the_one_retained():
     """AC-5 / BUG-010-04 : comportement inchangé sur ce poste."""
     assert bundle.resolve_signing_identity(
+        FAKE_TEAM,
         listing=_LISTING_STUDIO,
         team_of=_team_of(
-            {"1A2B3C4D5E6F708192A3B4C5D6E7F80912345678": bundle.TEAM_IDENTIFIER}
+            {"1A2B3C4D5E6F708192A3B4C5D6E7F80912345678": FAKE_TEAM}
         ),
     ) == "1A2B3C4D5E6F708192A3B4C5D6E7F80912345678"
 
@@ -994,15 +1030,17 @@ def test_no_eligible_identity_is_a_clean_refusal_naming_the_team():
     """BUG-010-02 : échec net, jamais un bundle non signé."""
     with pytest.raises(bundle.BundleError) as exc:
         bundle.resolve_signing_identity(
+            FAKE_TEAM,
             listing='  1) AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA "Apple Development: Autre equipe (XXXX)"\n',
             team_of=_team_of({"A" * 40: "ZZZZZZZZZZ"}),
         )
-    assert bundle.TEAM_IDENTIFIER in str(exc.value)
+    assert FAKE_TEAM in str(exc.value)
 
 
 def test_an_empty_keychain_is_a_clean_refusal_too():
     with pytest.raises(bundle.BundleError):
         bundle.resolve_signing_identity(
+            FAKE_TEAM,
             listing="     0 valid identities found\n", team_of=_team_of({})
         )
 
@@ -1012,30 +1050,31 @@ def test_several_eligible_identities_resolve_deterministically():
     dépend pas de l'ordre dans lequel `security` a listé les identités."""
     a = '  1) FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF "Apple Development: Zoe (1)"\n'
     b = '  2) 0000000000000000000000000000000000000000 "Apple Development: Adele (2)"\n'
-    teams = _team_of({"F" * 40: bundle.TEAM_IDENTIFIER, "0" * 40: bundle.TEAM_IDENTIFIER})
-    assert bundle.resolve_signing_identity(listing=a + b, team_of=teams) == "0" * 40
-    assert bundle.resolve_signing_identity(listing=b + a, team_of=teams) == "0" * 40
+    teams = _team_of({"F" * 40: FAKE_TEAM, "0" * 40: FAKE_TEAM})
+    assert bundle.resolve_signing_identity(FAKE_TEAM, listing=a + b, team_of=teams) == "0" * 40
+    assert bundle.resolve_signing_identity(FAKE_TEAM, listing=b + a, team_of=teams) == "0" * 40
 
 
 def test_ties_on_the_name_are_broken_by_the_fingerprint():
     same = '  1) FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF "Apple Development: X (1)"\n  2) 0000000000000000000000000000000000000000 "Apple Development: X (1)"\n'
-    teams = _team_of({"F" * 40: bundle.TEAM_IDENTIFIER, "0" * 40: bundle.TEAM_IDENTIFIER})
-    assert bundle.resolve_signing_identity(listing=same, team_of=teams) == "0" * 40
+    teams = _team_of({"F" * 40: FAKE_TEAM, "0" * 40: FAKE_TEAM})
+    assert bundle.resolve_signing_identity(FAKE_TEAM, listing=same, team_of=teams) == "0" * 40
 
 
 def test_several_eligible_identities_are_announced_not_chosen_in_silence(capsys):
     a = '  1) FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF "Apple Development: Zoe (1)"\n  2) 0000000000000000000000000000000000000000 "Apple Development: Adele (2)"\n'
-    teams = _team_of({"F" * 40: bundle.TEAM_IDENTIFIER, "0" * 40: bundle.TEAM_IDENTIFIER})
-    bundle.resolve_signing_identity(listing=a, team_of=teams)
+    teams = _team_of({"F" * 40: FAKE_TEAM, "0" * 40: FAKE_TEAM})
+    bundle.resolve_signing_identity(FAKE_TEAM, listing=a, team_of=teams)
     err = capsys.readouterr().err
     assert "Zoe" in err and "Adele" in err
 
 
 def test_a_single_eligible_identity_says_nothing(capsys):
     bundle.resolve_signing_identity(
+        FAKE_TEAM,
         listing=_LISTING_STUDIO,
         team_of=_team_of(
-            {"1A2B3C4D5E6F708192A3B4C5D6E7F80912345678": bundle.TEAM_IDENTIFIER}
+            {"1A2B3C4D5E6F708192A3B4C5D6E7F80912345678": FAKE_TEAM}
         ),
     )
     assert capsys.readouterr().err == ""
@@ -1104,7 +1143,7 @@ def _minimal_app(tmp_path, name="thingskit.app"):
     macos = app / "Contents" / "MacOS"
     macos.mkdir(parents=True)
     (app / "Contents" / "Info.plist").write_text(
-        bundle.info_plist_xml(), encoding="utf-8"
+        bundle.info_plist_xml(FAKE_ID), encoding="utf-8"
     )
     _sh.copyfile("/bin/echo", macos / "thingskit")
     (macos / "thingskit").chmod(0o755)
@@ -1133,9 +1172,10 @@ def test_an_adhoc_signed_artifact_is_refused_by_the_build_verification(tmp_path)
     assert plain.returncode == 0, "le sceau ad-hoc devait être valide"
 
     with pytest.raises(bundle.BundleError) as exc:
-        bundle.assert_bundle_satisfies_requirement(app, "ADHOC-FINGERPRINT")
+        bundle.assert_bundle_satisfies_requirement(
+            app, "ADHOC-FINGERPRINT", REQUIREMENT)
     message = str(exc.value)
-    assert bundle.CODE_REQUIREMENT in message
+    assert REQUIREMENT in message
     assert str(app) in message
     assert "ADHOC-FINGERPRINT" in message
 
@@ -1146,7 +1186,7 @@ def test_an_adhoc_signed_artifact_is_refused_by_the_build_verification(tmp_path)
 def test_an_unsigned_artifact_is_refused_too(tmp_path):
     app = _minimal_app(tmp_path)
     with pytest.raises(bundle.BundleError) as exc:
-        bundle.assert_bundle_satisfies_requirement(app, "DEADBEEF")
+        bundle.assert_bundle_satisfies_requirement(app, "DEADBEEF", REQUIREMENT)
     assert str(app) in str(exc.value)
 
 
@@ -1154,7 +1194,8 @@ def test_an_unsigned_artifact_is_refused_too(tmp_path):
 def test_the_installed_bundle_passes_the_very_check_the_build_runs():
     """Cas nominal : la vérification ne rougit pas sur un artefact conforme."""
     bundle.assert_bundle_satisfies_requirement(
-        "/Applications/thingskit.app", "identité du poste"
+        "/Applications/thingskit.app", "identité du poste",
+        installed_bundle_requirement(),
     )
 
 
@@ -1168,7 +1209,7 @@ def test_a_requirement_the_artifact_cannot_satisfy_is_named_in_the_refusal(tmp_p
         ["/usr/bin/codesign", "--force", "-s", "-", str(app)],
         capture_output=True, text=True, check=True,
     )
-    bogus = 'identifier "app.sowell.absent"'
+    bogus = 'identifier "app.example.absent"'
     with pytest.raises(bundle.BundleError) as exc:
         bundle.assert_bundle_satisfies_requirement(app, "X1", requirement=bogus)
     assert bogus in str(exc.value)
@@ -1193,15 +1234,15 @@ def test_the_build_verifies_the_artifact_it_produced_before_returning():
 def test_an_escaped_comma_cannot_forge_the_team():
     """Le sujet ci-dessous n'a qu'UN seul OU : `EVILTEAM1`.
 
-    `CN=…\\,OU=56AP2NSB54` est une valeur CN contenant une virgule LITTÉRALE,
-    pas deux RDN. Un analyseur qui coupe sur toutes les virgules y lit un OU
-    qui n'existe pas, et le premier trouvé gagne — il rendrait `56AP2NSB54`,
-    soit exactement l'équipe attendue par le build, pour un certificat d'une
-    tout autre équipe.
+    `CN=…\\,OU=<equipe attendue>` est une valeur CN contenant une virgule
+    LITTÉRALE, pas deux RDN. Un analyseur qui coupe sur toutes les virgules y
+    lit un OU qui n'existe pas, et le premier trouvé gagne — il rendrait
+    l'équipe attendue par le build, pour un certificat d'une tout autre
+    équipe.
     """
     assert (
         bundle.subject_ou(
-            "subject=CN=Apple Development: Mallory (X)\\,OU=56AP2NSB54,"
+            f"subject=CN=Apple Development: Mallory (X)\\,OU={FAKE_TEAM},"
             "OU=EVILTEAM1,O=Evil,C=US"
         )
         == "EVILTEAM1"
@@ -1300,13 +1341,15 @@ def test_certificate_team_is_none_when_no_certificate_matches(tmp_path):
 )
 def test_a_certificate_forging_an_ou_in_its_cn_is_read_for_what_it_is(tmp_path):
     """Points 1 et 2 réunis, de bout en bout : un certificat RÉEL dont le CN
-    contient `,OU=56AP2NSB54` ne doit jamais passer pour l'équipe du build."""
-    name = "Apple Development: Mallory (X),OU=" + bundle.TEAM_IDENTIFIER
+    contient `,OU=<equipe attendue>` ne doit jamais passer pour l'équipe du
+    build."""
+    name = "Apple Development: Mallory (X),OU=" + FAKE_TEAM
     evil = _synthetic_certificate(tmp_path, "evil", f"/CN={name}/OU=EVILTEAM1/O=Evil")
     dump = _find_certificate_dump(evil)
     assert bundle.certificate_team(evil[0], name, dump=dump) == "EVILTEAM1"
     assert (
         bundle.eligible_signing_identities(
+            FAKE_TEAM,
             listing=f'  1) {evil[0]} "{name}"\n',
             team_of=lambda sha1, n: bundle.certificate_team(sha1, n, dump=dump),
         )
@@ -1317,7 +1360,7 @@ def test_a_certificate_forging_an_ou_in_its_cn_is_read_for_what_it_is(tmp_path):
 # ------------------------------------------- ADR-002 § Decision 5 : le TYPE
 # de certificat
 #
-# Le `csreq` que TCC a enregistre pour `app.sowell.thingskit` pinne l'identifier,
+# Le `csreq` que TCC a enregistre pour le bundle pinne l'identifier,
 # l'ancre Apple, le CN du certificat FEUILLE et le marqueur de l'intermediaire —
 # jamais le Team ID (mesure du 2026-08-21). L'exigence du depot, elle, ne portait
 # que l'equipe. Les deux ne coincidaient donc pas, et l'ecart avait une
@@ -1326,33 +1369,34 @@ def test_a_certificate_forging_an_ou_in_its_cn_is_read_for_what_it_is(tmp_path):
 #
 # Le cas concret est un changement de TYPE de certificat (Apple Development ->
 # Developer ID Application, la voie de repli d'ADR-001 § NC-3) : le Team ID reste
-# `56AP2NSB54`, le sceau tient, le build se declare reussi — et l'utilisateur
+# celui qu'attend la configuration, le sceau tient, le build se declare reussi
+# — et l'utilisateur
 # recolte une invite TCC au premier lancement, sans que rien ne l'ait signale.
 
 
 def test_the_requirement_carries_a_certificate_type_discriminant():
     """L'exigence du depot doit etre au moins aussi stricte que celle de TCC."""
-    assert "1.2.840.113635.100.6.1.2" in bundle.CODE_REQUIREMENT
+    assert "1.2.840.113635.100.6.1.2" in REQUIREMENT
 
 
 def test_the_requirement_does_not_pin_the_individual_certificate():
     """Le CN change a chaque renouvellement : le pinner casserait le lanceur a
     echeance fixe sans rien proteger de plus. C'est l'ecart assume avec le
     `csreq` de TCC, qui le pinne, lui."""
-    assert "subject.CN" not in bundle.CODE_REQUIREMENT
+    assert "subject.CN" not in REQUIREMENT
     # Aucun nom de certificat, quel qu'il soit : la garde porte sur la
     # CLASSE, pas sur le nom du mainteneur du jour (US-010).
-    assert "Apple Development" not in bundle.CODE_REQUIREMENT
-    assert "Developer ID" not in bundle.CODE_REQUIREMENT
+    assert "Apple Development" not in REQUIREMENT
+    assert "Developer ID" not in REQUIREMENT
 
 
 def test_the_requirement_still_carries_what_it_carried_before():
     """L'amendement AJOUTE une clause, il n'en retire aucune (BUG-010, BUG-013)."""
-    assert "anchor apple generic" in bundle.CODE_REQUIREMENT
-    assert f'identifier "{bundle.BUNDLE_IDENTIFIER}"' in bundle.CODE_REQUIREMENT
+    assert "anchor apple generic" in REQUIREMENT
+    assert f'identifier "{FAKE_ID}"' in REQUIREMENT
     assert (
-        f'certificate leaf[subject.OU]="{bundle.TEAM_IDENTIFIER}"'
-        in bundle.CODE_REQUIREMENT
+        f'certificate leaf[subject.OU]="{FAKE_TEAM}"'
+        in REQUIREMENT
     )
 
 
@@ -1408,7 +1452,8 @@ def test_the_installed_bundle_satisfies_the_amended_requirement():
     """Un amendement qui rendrait le bundle en place irrecevable serait une
     panne, pas un durcissement."""
     bundle.assert_bundle_satisfies_requirement(
-        "/Applications/thingskit.app", "identité du poste"
+        "/Applications/thingskit.app", "identité du poste",
+        installed_bundle_requirement(),
     )
 
 
@@ -1450,7 +1495,7 @@ def test_the_root_seal_does_not_vouch_for_the_shim(tmp_path):
         return subprocess.run(
             [
                 "/usr/bin/codesign", "--verify", "--strict",
-                f"-R={bundle.CODE_REQUIREMENT}", str(target),
+                f"-R={installed_bundle_requirement()}", str(target),
             ],
             capture_output=True, text=True,
         ).returncode
