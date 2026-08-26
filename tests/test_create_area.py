@@ -106,7 +106,9 @@ def test_creating_an_area_calls_the_applescript_surface_and_returns_zero(
     assert thingskit.cmd_create_area(_ns("Cible")) == 0
     assert len(calls["osa"]) == 1
     assert 'make new area with properties {name:"Cible"}' in calls["osa"][0]
-    assert "area créée : Cible" in capsys.readouterr().out
+    # Le nom est RENDU, jamais recopié brut (BUG-026) : la confirmation le
+    # cite, comme `add-task` le fait de son titre depuis BUG-005.
+    assert "area créée : 'Cible'" in capsys.readouterr().out
 
 
 def test_the_application_is_started_before_the_write(thingskit, monkeypatch, rigged):

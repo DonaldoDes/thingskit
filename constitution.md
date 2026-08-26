@@ -582,6 +582,21 @@ redevient obligatoire.
       .venv/bin/python -m pytest tests/test_bundle.py -q -> 106 passed, 1 skipped
       .venv/bin/python -m pytest tests/test_create_area.py -q -> 19 passed
       .venv/bin/python -m pytest -q -p no:cacheprovider -> 809 passed, 1 skipped
+
+  Baseline relevée à **810** le 2026-08-26 avant BUG-026, **843** après.
+  L'écart de 33 se décompose, et chaque terme est mesuré : 32 dans
+  `tests/test_untrusted_rendering.py` (le balayage de la classe, ses six
+  formes en contre-épreuve, la manipulation réelle du script, les deux
+  contre-épreuves de sur-refus, la borne de `_rendered` sur le plan
+  multilingue de base, et huit épreuves de bout en bout sur trois natures de
+  sortie) ; +1 au contrôle paramétré de `test_annotations_resolve.py`, qui
+  balaie les fichiers de test (34 -> 35, un fichier de plus). Les commandes :
+
+      .venv/bin/python -m pytest --collect-only -q | tail -1 -> 843 tests collected
+      .venv/bin/python -m pytest tests/test_untrusted_rendering.py -q -> 32 passed
+      .venv/bin/python -m pytest tests/test_annotations_resolve.py -q -> 35 passed
+      .venv/bin/python -m pytest tests/test_create_area.py -q -> 19 passed
+      .venv/bin/python -m pytest -q -p no:cacheprovider -> 842 passed, 1 skipped
 - **Une fixture ne porte jamais une identité de signature réelle, ni une
   valeur personnelle citée en clair.** Le dépôt est public. Les fixtures dites
   « mesurées » documentent la FORME d'une sortie `security find-identity` ou
@@ -826,19 +841,68 @@ irréversible pour un gestionnaire de tâches personnel utilisé au quotidien.
   sur-échappement, et par
   `test_the_observed_placement_renders_all_four_values_the_same_way`.
 
-  **Portée réelle, dite plutôt que tue : seul `add-task` tient cet invariant
-  au 2026-08-25.** Le reste du script ne le tient pas, et l'écrire sans le
-  dire ferait de cette ligne une description fausse du dépôt. L'ampleur n'est
-  **pas établie ici** — deux balayages indépendants du 2026-08-25 ne mesurent
-  pas la même chose et ne se corroborent donc pas : la revue de sécurité rend
-  24 sites sur prédicat d'origine explicite plus 13 faibles (non rejoué ici),
-  tandis qu'un balayage d'AST des interpolations non converties
-  (`ast.JoinedStr` / `FormattedValue`, conversion absente) rend 237 champs
-  bruts sur 326, dont 11 nommant directement un argument CLI. Ces 11
-  comportent au moins un **faux positif** — `where = a.list + (f" › {a.heading}" …)`
-  compose `a.heading` brut, mais `where` n'est émis que par `{where!r}` :
-  aucun de ces deux chiffres n'est un compte de défauts. Le compte réel est
-  l'objet d'un ticket de suivi dédié, avec sa propre mesure.
+  **Portée réelle au 2026-08-26 : le script entier tient cet invariant**, et
+  la propriété est tenue par un BALAYAGE, pas par une relecture —
+  `test_no_untrusted_value_reaches_the_output_unconverted`
+  (`tests/test_untrusted_rendering.py`), compte résiduel exigé NUL. Jusqu'au
+  2026-08-25 seul `add-task` le tenait ; c'est BUG-026 qui a fermé la classe.
+
+  **Ce qui a permis de la fermer n'est pas un comptage, c'est un prédicat.**
+  Cinq mesures l'avaient précédée et avaient rendu cinq résultats — 24 sites
+  plus 13 faibles, 237 champs sur 326, 82, 117, 37. Aucune n'était un
+  comptage fautif : chacune présumait une définition de « valeur d'origine
+  non contrôlée » au lieu de l'écrire. Le prédicat à cinq racines (namespace
+  argparse, `q(...)`, `osa(...)`, paramètre alimenté, retour par slot de
+  tuple), son trajet et ses conversions sont écrits en tête de
+  `tests/test_untrusted_rendering.py` ; c'est lui qu'il faut contester pour
+  contester le chiffre. **La mesure sous ce prédicat : 87 valeurs dans 32
+  fonctions.** Elle se rejoue :
+
+      python3 - <<'EOF'
+      import importlib.util, sys
+      s = importlib.util.spec_from_file_location(
+          "m", "tests/test_untrusted_rendering.py")
+      m = importlib.util.module_from_spec(s); sys.modules["m"] = m
+      s.loader.exec_module(m)
+      v = m.Sweep(m._script_source()).violations()
+      print(len(v), "valeurs,", len({x[0] for x in v}), "fonctions")
+      EOF
+
+  Cette unité n'est PAS un nombre de `print` : une valeur est comptée à son
+  ORIGINE dans sa fonction, et un même `task_id` alimente jusqu'à six lignes.
+  Le correctif a touché 85 emplacements de texte par cette voie.
+
+  Deux inclusions décident du chiffre, et les deux manquaient aux balayages
+  antérieurs. La sortie d'`osascript` est une valeur d'origine non contrôlée —
+  son exclusion est ce qui a rendu FAUX le balayage à 37 sites. Un conteneur
+  peuplé par `append` transporte la valeur — sans cette règle, la table
+  d'`agenda` sortait du balayage (60 valeurs mesurées sans, 80 avec). Une
+  exclusion décide autant : une valeur composée brute mais émise convertie
+  plus loin n'est pas un défaut — `where = a.list + (f" › {a.heading}" …)`,
+  émis par `{where!r}`, est le faux positif vérifié du balayage à 237.
+
+  **Deux conversions, un partage écrit.** `!r` en prose, où les guillemets
+  délimitent la valeur ; `_rendered()` là où la position délimite déjà —
+  colonne alignée, identifiant entre parenthèses, ligne destinée à un tube.
+  Les deux bornent la même classe, celle de `str.isprintable()` ;
+  `_rendered` ne cite QUE s'il y a lieu, et c'est ce qui laisse les commandes
+  de lecture lisibles. Citer inconditionnellement une colonne aurait été un
+  sur-refus — refuser une classe qui passe est un défaut au même titre que
+  laisser passer une classe qui casse.
+
+  **Ce que ce balayage ne tient pas**, dit ici parce que « la classe est
+  fermée » a déjà été affirmé à tort dans ce dépôt : les indirections qu'une
+  analyse statique ne suit pas (`%`, `.format`, `string.Template`, `.replace`,
+  `io.StringIO`) ne sont pas suivies — elles sont INTERDITES par
+  `test_no_output_is_composed_by_a_form_the_sweep_cannot_follow`, 0 occurrence
+  mesurée ; l'analyse est insensible au flot et fusionne les portées
+  imbriquées, toujours dans le sens de la sur-approximation ; `json.dumps`
+  compte comme conversion parce qu'elle échappe la classe Cc, mais elle
+  n'échappe PAS Cf sous `ensure_ascii=False` — un U+202E traverse une sortie
+  `--json`, résidu nommé et non fermé ; enfin `!r` comme `_rendered` laissent
+  passer ce qui est imprimable ET trompeur — homoglyphe, espace cadratin,
+  titre imitant mot pour mot un message du programme. Le quoting en limite la
+  portée, il ne la ferme pas.
 
 - Aucune requête SQL autre que `select` n'existe dans `bin/thingskit`, y
   compris dans les tests d'intégration à `_make_db` (qui construisent une
