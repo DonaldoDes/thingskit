@@ -608,30 +608,33 @@ redevient obligatoire.
       .venv/bin/python -m pytest -q -p no:cacheprovider -> 842 passed, 1 skipped
 
   Baseline relevée à **889** le 2026-08-26 avant l'intégration d'ADR-003 —
-  l'identité de code attendue devenue configurable au build —, **1063** après.
+  l'identité de code attendue devenue configurable au build —, **1076** après
+  la troisième passe de review.
   Les chiffres portés ici pendant le chantier (923, puis 983) valaient contre
   une base d'AVANT BUG-026 : ils ont été REMESURÉS après fusion plutôt
   qu'additionnés, parce qu'aucune des deux branches n'avait vu l'autre.
-  L'écart de 174 se décompose, et chaque terme est mesuré : +115 dans le
+  L'écart de 187 se décompose, et chaque terme est mesuré : +118 dans le
   fichier neuf `tests/test_build_identity.py` (lecture de la configuration,
   configurations hostiles, plancher de forme, accord des deux côtés,
   ordonnancement, ambiguïté d'unité d'organisation, compositions hostiles côté
-  build, destination hors forme) ; +47 dans `test_code_identity.py` (22 -> 69 :
+  build, destination hors forme, et l'aide du point d'entrée) ; +47 dans
+  `test_code_identity.py` (22 -> 69 :
   les formes dégénérées du fichier scellé, la dérivation du chemin, et les 20
   compositions hostiles qui tuent la mutation du neutraliseur) ; +9 dans
-  `test_applescript_escaping.py` (31 -> 40 : la dispense liée au motif épinglé,
-  et les six formes qui ne dispensent pas) ; +1 dans `test_bundle.py`
-  (107 -> 108) ; +1 dans `test_untrusted_rendering.py` (78 -> 79 : la
-  contre-épreuve de la septième racine) ; +1 au contrôle paramétré de
+  `test_applescript_escaping.py` (31 -> 48 : la dispense liée au motif épinglé,
+  les six formes qui ne dispensent pas, et les sept routes d'ombrage et
+  d'approbation du troisième tour) ; +1 dans `test_bundle.py`
+  (107 -> 108) ; +3 dans `test_untrusted_rendering.py` (78 -> 81 : la septième
+  racine, ses trois orthographes et sa contre-épreuve) ; +1 au contrôle paramétré de
   `test_annotations_resolve.py`, qui balaie les fichiers de test (35 -> 36).
   Les commandes :
 
-      .venv/bin/python -m pytest --collect-only -q | tail -1 -> 1063 tests collected
-      .venv/bin/python -m pytest tests/test_build_identity.py --collect-only -q | tail -1 -> 115
+      .venv/bin/python -m pytest --collect-only -q | tail -1 -> 1076 tests collected
+      .venv/bin/python -m pytest tests/test_build_identity.py --collect-only -q | tail -1 -> 118
       .venv/bin/python -m pytest tests/test_code_identity.py --collect-only -q | tail -1 -> 69
-      .venv/bin/python -m pytest tests/test_applescript_escaping.py --collect-only -q | tail -1 -> 40
-      .venv/bin/python -m pytest tests/test_untrusted_rendering.py --collect-only -q | tail -1 -> 79
-      .venv/bin/python -m pytest -q -p no:cacheprovider -> 1052 passed, 11 skipped
+      .venv/bin/python -m pytest tests/test_applescript_escaping.py --collect-only -q | tail -1 -> 48
+      .venv/bin/python -m pytest tests/test_untrusted_rendering.py --collect-only -q | tail -1 -> 81
+      .venv/bin/python -m pytest -q -p no:cacheprovider -> 1065 passed, 11 skipped
 
   **L'intégration n'a pas été un simple recollement.** Les deux chantiers se
   croisaient sur un point de fond : ADR-003 fait entrer une valeur d'origine
@@ -647,7 +650,28 @@ redevient obligatoire.
   exige désormais que le bundle installé porte son fichier d'identité : un
   bundle antérieur à ADR-003 n'en a pas, et les tests qui l'atteignent n'ont
   rien à éprouver dessus. Même mécanisme, et même motif, que pour le shim
-  d'ADR-002. Ils redeviennent actifs à la reconstruction.
+  d'ADR-002.
+
+  **« Ils redeviennent actifs à la reconstruction » a été ÉCRIT avant d'être
+  établi, et un des dix ne redevenait pas actif — il devenait rouge.**
+  `tests/test_bundle.py` atteignait le bundle par `bundle.INSTALL_PATH`, une
+  constante qu'ADR-003 retire ; le durcissement du prédicat de saut, venu de
+  la même branche, cachait la casse. La phrase est maintenant MESURÉE, sur un
+  bundle construit vers une destination temporaire et une copie du dépôt dont
+  la fixture y est repointée : **les 10 sauts d'ADR-003 s'exécutent et
+  passent**, et le seul saut restant est celui, indépendant, du doublon de
+  `LC_RPATH` que ce poste refuse — il saute aussi sur `master`. Rejeu :
+
+      cp -R <dépôt> /tmp/tk-skips && find /tmp/tk-skips -name __pycache__ -prune -exec rm -rf {} +
+      python3 -m build.bundle /tmp/tk-skips-app/thingskit.app
+      cd /tmp/tk-skips && grep -rl <chemin installé> tests/ \
+        | xargs sed -i '' "s#<chemin installé>#/tmp/tk-skips-app/thingskit.app#g"
+      python3 -m pytest -q          # -> 1 skipped (le doublon de rpath), le reste passe
+
+  **La purge des `__pycache__` fait partie de la mesure, pas de l'hygiène.**
+  Copier le dépôt en les préservant fait charger le script depuis le chemin
+  d'ORIGINE encodé dans le bytecode : une mutation posée dans la copie est
+  alors mesurée contre le dépôt réel, en silence.
 - **Une fixture ne porte jamais une identité de signature réelle, ni une
   valeur personnelle citée en clair.** Le dépôt est public. Les fixtures dites
   « mesurées » documentent la FORME d'une sortie `security find-identity` ou
@@ -975,11 +999,25 @@ irréversible pour un gestionnaire de tâches personnel utilisé au quotidien.
   prédicat.** Cinq mesures l'avaient précédée et avaient rendu cinq résultats
   — 24 sites plus 13 faibles, 237 champs sur 326, 82, 117, 37. Aucune n'était
   un comptage fautif : chacune présumait une définition de « valeur d'origine
-  non contrôlée » au lieu de l'écrire. Le prédicat à six racines (namespace
+  non contrôlée » au lieu de l'écrire. Le prédicat à **sept** racines (namespace
   argparse, `q(...)`, `osa(...)`, paramètre alimenté, retour par slot de
-  tuple, `sys.argv`), son trajet et ses conversions sont écrits en tête de
-  `tests/test_untrusted_rendering.py` ; c'est lui qu'il faut contester pour
-  contester le chiffre.
+  tuple, `sys.argv`, et le contenu d'un FICHIER lu — `read`, `read_text` ou
+  `readlines`, les trois orthographes, parce que n'en reconnaître qu'une était
+  exactement le défaut du balayage de `sleep`), son trajet et ses conversions
+  sont écrits en tête de `tests/test_untrusted_rendering.py` ; c'est lui qu'il
+  faut contester pour contester le chiffre.
+
+  **La septième est arrivée avec ADR-003**, le même jour, par un chantier mené
+  en parallèle : le fichier d'identité scellé fait entrer dans le script une
+  source externe qu'aucune des six autres n'atteignait. Il est scellé, donc il
+  devrait être digne de confiance — mais le cas où la garde d'identité REFUSE
+  est exactement celui où il ne l'est pas, et c'est là que son contenu atteint
+  un message. Une racine qui ne vaudrait que « quand tout va bien » ne vaudrait
+  rien. Ce qu'elle ne voit pas est énoncé dans le prédicat : une lecture
+  atteinte par un alias, par `os.read`, par `json.load`, ou par un module
+  tiers — aucune n'existe ici, mesuré. Le compte résiduel reste nul, et la
+  mesure des 90 valeurs ci-dessous est inchangée : l'état d'avant BUG-026 ne
+  lisait aucun fichier.
 
   **La mesure sous ce prédicat : 90 valeurs dans 34 fonctions**, sur l'état
   d'AVANT le correctif. Le chiffre porté ici jusqu'au 2026-08-26 — « 87 valeurs
@@ -1013,8 +1051,8 @@ irréversible pour un gestionnaire de tâches personnel utilisé au quotidien.
   ses propres messages avec `!r`. Le chiffre « 85 emplacements de texte » porté ici
   jusqu'au 2026-08-26 ne correspondait à aucune commande :
 
-      grep -o '_rendered(' bin/thingskit | wc -l              # -> 81
-      grep -o '!r}' bin/thingskit | wc -l                     # -> 161
+      grep -o '_rendered(' bin/thingskit | wc -l              # -> 82
+      grep -o '!r}' bin/thingskit | wc -l                     # -> 171
       git show cc4ff9d:bin/thingskit | grep -o '!r}' | wc -l  # -> 104
 
   Deux inclusions décident du chiffre, et les deux manquaient aux balayages
@@ -1586,15 +1624,33 @@ généré, le lanceur installé en `~/.local/bin/thingskit`.
     d'interpolation, donc ne tue rien.
 
   - **La dispense que ce neutraliseur ouvre dans le balayage d'échappement
-    porte sur le MOTIF, jamais sur le nom de la fonction appelée.** La
-    première écriture accordait la dispense au nom seul et n'inspectait pas le
-    second argument — celui qui fait tout le travail de refus :
-    `_requirement_value(a.name, ANY)` passait, quel que soit `ANY`. Le second
-    argument doit être un nom d'une **liste close**, lié une fois au niveau
-    module à `re.compile(<motif épinglé au littéral>)`. Rendre le motif
-    permissif, ou seulement le réécrire, fait tomber la dispense et rougir la
-    garde — même mécanisme que l'empreinte des allowlists ci-dessus : rendre
-    le changement VISIBLE en revue plutôt que possible en silence.
+    porte sur le MOTIF, jamais sur le nom de la fonction appelée — et le nom
+    de forme ne doit pas être OMBRÉ au site.** La propriété, en une phrase :
+    *un nom lié dans une portée englobante du site ne dispense pas*, qu'il
+    soit une fonction neutralisante ou un motif, qu'il vienne d'une
+    affectation locale, d'un paramètre ou de sa valeur par défaut. Les deux
+    moitiés de la dispense passent par la même remontée de portées.
+
+    **Cette ligne a énoncé deux fois une propriété que le code ne tenait
+    pas**, et c'est le motif de la réécrire ici en entier. La première
+    version accordait la dispense au seul nom de la fonction appelée et
+    n'inspectait pas le second argument : `_requirement_value(a.name, ANY)`
+    passait, quel que soit `ANY`. La deuxième a lié la dispense à un motif
+    épinglé — et n'a fermé que la moitié de la propriété : ce document a
+    alors porté « lié une fois au niveau module à `re.compile(<motif épinglé
+    au littéral>)` » devant un balayage qui ne regardait ni l'ombrage local
+    ni les paramètres. Un site AppleScript neuf dont la forme permissive
+    arrivait par la valeur par défaut d'un paramètre passait intégralement,
+    la suite restant à sa ligne de base — reproduit en revue.
+
+    Ce que le prédicat d'approbation exige aujourd'hui, condition par
+    condition : le nom est d'une **liste close** ; il est lié **une fois**, au
+    niveau module ; sa valeur est `re.compile(...)` où `re` est bien le module
+    importé — le nom d'attribut seul approuvait `fake.compile(...)` — ; l'appel
+    n'a **qu'un** argument, car un drapeau surnuméraire comme `re.I` élargit
+    la forme sans toucher au motif ; cet argument est le littéral épinglé ; et
+    le nom n'est **ombré dans aucune portée englobante** du site. Chacune est
+    gardée dans les deux sens.
   - **Le contenu du fichier est d'origine non contrôlée** — c'est précisément
     dans le cas où il n'est pas scellé que la garde refuse — donc il ne
     traverse jamais un message sans conversion `!r`.

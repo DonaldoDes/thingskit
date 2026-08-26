@@ -665,3 +665,27 @@ def test_a_subject_carrying_a_single_organisational_unit_is_still_read():
     assert bundle.subject_ou(
         "subject=UID=X,CN=Apple Development: Mallory (X),OU=NEWTEAM002,O=Autre,C=US"
     ) == "NEWTEAM002"
+
+
+# ------------------------------------------------- l'aide du point d'entree
+
+
+@pytest.mark.parametrize("flag", ["--help", "-h"])
+def test_the_build_entry_point_renders_its_usage(capsys, flag):
+    """`--help` etait traite comme une DESTINATION, donc refuse par la forme
+    du chemin d'installation. Un point d'entree qui refuse sa propre aide
+    apprend a l'operateur a ne pas la demander."""
+    assert bundle.main(["bundle.py", flag]) == 0
+    out = capsys.readouterr().out
+    assert "build.bundle" in out
+    assert "--config" in out
+    assert Path(bundle.BUILD_IDENTITY_CONFIG).name in out
+
+
+def test_the_usage_names_the_three_fields_of_the_configuration(capsys):
+    """L'aide doit suffire a construire : sans les champs, elle renvoie a une
+    lecture du code, ce que le refus de configuration evite deja."""
+    bundle.main(["bundle.py", "--help"])
+    out = capsys.readouterr().out
+    for field in bundle.BUILD_IDENTITY_FIELDS:
+        assert field in out

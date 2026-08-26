@@ -217,6 +217,23 @@ EXTERNAL_CALL_TIMEOUT_SECONDS = 60
 # partition (INV-002-3) : le shim n'en porte aucune copie ecrite a la main.
 FAST_PATH_CONSTANT = "FAST_PATH_COMMANDS"
 
+USAGE = f"""usage: python3 -m build.bundle [destination] [--config <fichier>]
+
+Construit, relocalise et signe le bundle `{BUNDLE_NAME}.app`.
+
+  destination      chemin du bundle a produire. Par defaut, `install_path` de
+                   la configuration. Meme forme que ce champ.
+  --config <f>     configuration de construction a lire, au lieu de
+                   `{BUILD_IDENTITY_CONFIG}`.
+
+Ce depot ne porte AUCUNE valeur d'identite par defaut (ADR-003) : la
+configuration est locale, jamais versionnee, et le build refuse en la nommant
+si elle manque. Elle porte trois champs, tous obligatoires :
+
+  {", ".join(BUILD_IDENTITY_FIELDS)}
+
+Format et exemple : CONTRIBUTING.md."""
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SOURCE_SCRIPT = REPO_ROOT / "bin" / "thingskit"
 SHIM_TEMPLATE = REPO_ROOT / "build" / "thingskit-launch.c.in"
@@ -1333,6 +1350,9 @@ def main(argv: list[str]) -> int:
     n'est plus une décision gravée dans la source publiée (INV-003-8).
     """
     args, config = list(argv[1:]), BUILD_IDENTITY_CONFIG
+    if "--help" in args or "-h" in args:
+        print(USAGE)
+        return 0
     if "--config" in args:
         index = args.index("--config")
         if index + 1 >= len(args):

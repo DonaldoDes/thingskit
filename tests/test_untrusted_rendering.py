@@ -31,7 +31,15 @@ Racines — une expression est d'origine non contrôlée si elle est :
       lecture directe d'argv la précède. Sans cette racine le prédicat a un
       trou en amont de lui-même — c'est par là que le chemin `unrecognized
       arguments` d'`argparse` a émis ESC et CR bruts jusqu'au 2026-08-26 ;
-  R7. le contenu d'un FICHIER lu par le CLI — toute expression `<x>.read()`.
+  R7. le contenu d'un FICHIER lu par le CLI — `<x>.read()`, `<x>.read_text()`
+      ou `<x>.readlines()`. La racine porte sur la LECTURE, pas sur une de ses
+      orthographes : n'en reconnaître qu'une était le défaut du balayage de
+      `sleep`, qui ne voyait `time.sleep` que sous une forme sur trois.
+      **Ce qu'elle ne voit pas, dit plutôt que tu** : une lecture atteinte par
+      un alias (`lire = handle.read` puis `lire()`), par `os.read`, par
+      `json.load(handle)`, ou par un module tiers. Aucune n'existe dans
+      `bin/thingskit` — mesuré — et l'ajout d'une seule impose de relire cette
+      racine.
       Ajoutée le 2026-08-26 par ADR-003, qui fait entrer une source externe
       que les six racines précédentes n'atteignaient pas : le fichier
       d'identité scellé dans le bundle. Il est scellé, donc il devrait être
@@ -189,16 +197,21 @@ def _is_sys_argv(expr) -> bool:
             and isinstance(expr.value, ast.Name) and expr.value.id == "sys")
 
 
+READING_METHODS = {"read", "read_text", "readlines"}
+
+
 def _is_file_read(expr) -> bool:
-    """R7 — `<x>.read()` : le contenu d'un fichier lu par le CLI.
+    """R7 — le contenu d'un fichier lu par le CLI.
 
     Un seul site dans `bin/thingskit` (la lecture du fichier d'identité
     scellé), et la règle porte sur la FORME plutôt que sur ce site : une
     seconde lecture de fichier serait autrement une racine de plus que rien
-    n'atteindrait.
+    n'atteindrait. Les trois orthographes sont reconnues — `read`, `read_text`
+    et `readlines` —, et ce que la racine ne voit pas est énuméré dans le
+    prédicat, en tête de module.
     """
     return (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute)
-            and expr.func.attr == "read")
+            and expr.func.attr in READING_METHODS)
 
 
 def _is_numeric_spec(spec) -> bool:
@@ -1495,3 +1508,30 @@ def test_no_prose_message_uses_the_conditional_rendering():
                 and inner.func.id == "_rendered" and node.conversion in CONVERSIONS):
             fautes.append((node.lineno, "conversion cumulée `_rendered(...)!r`"))
     assert fautes == [], fautes
+
+
+def test_the_seventh_root_covers_the_three_reading_forms():
+    """R7 ne lisait que `<x>.read()` : `read_text()` et `readlines()`
+    passaient. La racine porte sur la LECTURE, pas sur une de ses orthographes
+    — c'est la meme discipline que le balayage des formes de `sleep`, qui ne
+    voyait qu'une des trois manieres d'atteindre `time.sleep`.
+    """
+    for form in ("handle.read()", "path.read_text()", "handle.readlines()"):
+        source = (
+            "def q(sql, args=()): return []\n"
+            "def cmd_x(a):\n"
+            f"    text = {form}\n"
+            '    print(f"lu : {text}")\n'
+        )
+        assert Sweep(source).violations(), form
+
+
+def test_a_call_that_merely_looks_like_a_read_is_not_a_root():
+    """Contre-epreuve : la racine ne doit pas teindre n'importe quel appel."""
+    source = (
+        "def q(sql, args=()): return []\n"
+        "def cmd_x(a):\n"
+        "    text = handle.ready()\n"
+        '    print(f"lu : {text}")\n'
+    )
+    assert Sweep(source).violations() == []

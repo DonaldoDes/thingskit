@@ -193,24 +193,32 @@ def _approved_form_names(tree: ast.Module,
                          owner: dict[int, ast.AST | None]) -> set[str]:
     """Noms de la liste close liés UNE fois, au niveau module, au motif épinglé.
 
-    Trois conditions, et chacune ferme une route : le nom est de la liste (un
-    motif improvisé ne dispense pas), il n'est lié qu'une fois au niveau
-    module (une réaffectation ultérieure le retire), et sa valeur est
-    `re.compile(<littéral épinglé>)` — c'est cette dernière qui fait tomber la
-    dispense sur un motif PERMISSIF portant le bon nom, le cas que la garde
-    manquait entièrement.
+    Conditions, et chacune ferme une route : le nom est de la liste (un motif
+    improvisé ne dispense pas) ; il n'est lié qu'une fois au niveau module
+    (une réaffectation ultérieure le retire) ; sa valeur est `re.compile(...)`
+    — le MODULE est vérifié, pas seulement le nom d'attribut, sinon
+    `fake.compile(<motif épinglé>)` serait approuvé, et `re` lui-même doit
+    n'être lié qu'une fois, par son import ; l'appel n'a QU'UN argument, car
+    un drapeau surnuméraire (`re.I`) élargit la forme sans toucher au motif ;
+    et cet argument est le littéral épinglé — c'est cette dernière condition
+    qui fait tomber la dispense sur un motif PERMISSIF portant le bon nom.
     """
     counts = _module_level_bound_names(tree, owner)
     rebound = _globally_rebound_names(tree)
+    re_is_sound = counts.get("re", 0) == 1 and "re" not in rebound
     approved = set()
     for node in ast.walk(tree):
         if owner.get(id(node)) is not None or not isinstance(node, ast.Assign):
             continue
         value = node.value
-        if not (isinstance(value, ast.Call)
+        if not (re_is_sound
+                and isinstance(value, ast.Call)
                 and isinstance(value.func, ast.Attribute)
                 and value.func.attr == "compile"
-                and value.args and isinstance(value.args[0], ast.Constant)):
+                and isinstance(value.func.value, ast.Name)
+                and value.func.value.id == "re"
+                and len(value.args) == 1 and not value.keywords
+                and isinstance(value.args[0], ast.Constant)):
             continue
         for target in node.targets:
             if (isinstance(target, ast.Name)
@@ -222,13 +230,20 @@ def _approved_form_names(tree: ast.Module,
     return approved
 
 
-def _neutralising_call(node: ast.AST, approved_forms: set[str]) -> str | None:
+def _neutralising_call(node: ast.AST, approved_forms: set[str],
+                       site: ast.AST, owner: dict[int, ast.AST | None]) -> str | None:
     """Nom du neutraliseur appelé par `node`, ou `None`.
 
     Pour `_requirement_value`, la dispense EXIGE le motif : deux arguments
-    exactement, et le second est un nom approuvé. Un appel, un attribut, une
-    constante ou un nom hors liste ne dispensent rien — la garde ne peut pas
-    établir ce que la valeur subira.
+    exactement, et le second est un nom approuvé QUI N'EST PAS OMBRÉ au site.
+    Un appel, un attribut, une constante, un nom hors liste, ou un nom
+    approuvé mais relié dans une portée englobante — locale, paramètre,
+    fonction englobante — ne dispensent rien : la garde ne peut pas établir ce
+    que la valeur subira.
+
+    La condition d'ombrage n'est pas une seconde règle, c'est la MÊME que pour
+    les fonctions neutralisantes. Ne l'appliquer qu'à une moitié de la
+    dispense laissait l'autre grande ouverte.
     """
     if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
             and node.func.id in NEUTRALISING_FUNCTIONS):
@@ -238,7 +253,8 @@ def _neutralising_call(node: ast.AST, approved_forms: set[str]) -> str | None:
     if len(node.args) != 2 or node.keywords:
         return None
     form = node.args[1]
-    if isinstance(form, ast.Name) and form.id in approved_forms:
+    if (isinstance(form, ast.Name) and form.id in approved_forms
+            and not _name_is_shadowed_at(form.id, site, owner)):
         return node.func.id
     return None
 
@@ -279,20 +295,30 @@ def _neutraliser_definition_is_sound(tree: ast.Module,
             and name not in _globally_rebound_names(tree))
 
 
-def _escape_is_shadowed_at(site: ast.AST,
-                           owner: dict[int, ast.AST | None]) -> bool:
-    """`_esc` est-il relié dans une des portées qui contiennent le site ?
+def _name_is_shadowed_at(name: str, site: ast.AST,
+                         owner: dict[int, ast.AST | None]) -> bool:
+    """`name` est-il relié dans une des portées qui contiennent le site ?
 
-    Même remontée que pour les constantes de module — la machinerie de portée
-    existe, elle ne servait qu'à un côté de la dispense.
+    Une seule remontée de portées, employée par les DEUX moitiés de la
+    dispense : les fonctions neutralisantes et les noms de forme. Elle voit
+    tout ce que `_locally_bound_names` voit — affectation, paramètre (valeur
+    par défaut comprise, puisque c'est le NOM qui est lié), `for`, `with`,
+    `except`, marcheur, import, compréhension.
     """
     scope = owner.get(id(site))
     while scope is not None:
-        bound = _locally_bound_names(scope, owner)
-        if any(name in bound for name in NEUTRALISING_FUNCTIONS):
+        if name in _locally_bound_names(scope, owner):
             return True
         scope = owner.get(id(scope))
     return False
+
+
+def _escape_is_shadowed_at(site: ast.AST,
+                           owner: dict[int, ast.AST | None]) -> bool:
+    """Une des fonctions neutralisantes est-elle reliée dans une portée
+    englobante du site ?"""
+    return any(_name_is_shadowed_at(name, site, owner)
+               for name in NEUTRALISING_FUNCTIONS)
 
 
 # Un antislash neutralise le caractère qui suit DANS le littéral AppleScript :
@@ -421,7 +447,8 @@ def _unescaped_quoted_interpolations(path: Path | None = None) -> list[str]:
             if not inside:
                 continue
             expression = part.value
-            if _neutralising_call(expression, approved_forms) is not None:
+            if _neutralising_call(expression, approved_forms,
+                                  node, owner) is not None:
                 if _escape_is_shadowed_at(node, owner) or not escape_is_sound:
                     offenders.append(
                         f"ligne {node.lineno} : {ast.unparse(expression)} — "
@@ -1104,3 +1131,107 @@ def test_the_real_script_pins_the_two_forms_the_dispensation_rests_on():
     tree = ast.parse(SCRIPT_PATH.read_text(encoding="utf-8"))
     owner = _enclosing_functions(tree)
     assert _approved_form_names(tree, owner) == set(REQUIREMENT_FORMS)
+
+
+# ---------------------------------------------------------------------------
+# La dispense ne survit pas à l'OMBRAGE du nom de forme.
+#
+# Défaut relevé au tour suivant (2026-08-26) : la correction précédente liait
+# la dispense à un motif épinglé, et n'avait fermé que la moitié de la
+# propriété. `_approved_form_names` ne collecte que les affectations de niveau
+# MODULE, et l'ombrage n'était testé que pour les fonctions neutralisantes,
+# jamais pour les noms de forme. Un nom de forme lié LOCALEMENT — ou reçu en
+# PARAMÈTRE, y compris par sa valeur par défaut — dispensait donc
+# intégralement, et la suite restait à sa ligne de base.
+#
+# La propriété, énoncée une fois pour toutes, et c'est elle qui est fermée :
+# un nom lié dans une portée englobante du site ne dispense pas. C'est
+# exactement le traitement que le balayage applique déjà aux fonctions
+# neutralisantes ; il est désormais le même pour les deux moitiés de la
+# dispense. Fermer les deux instances relevées aurait laissé la troisième.
+
+
+def test_a_form_shadowed_by_a_local_binding_does_not_dispense(tmp_path):
+    fake = _requirement_module(tmp_path, _PINNED, '''
+        def _requirement_value(value, form):
+            if not form.match(value):
+                raise ValueError(value)
+            return value
+        def cmd(a):
+            BUNDLE_IDENTIFIER_FORM = re.compile('.*')
+            return f'error "{_requirement_value(a.name, BUNDLE_IDENTIFIER_FORM)}"'
+        ''')
+    assert _unescaped_quoted_interpolations(fake) != []
+
+
+def test_a_form_received_as_a_parameter_does_not_dispense(tmp_path):
+    """La forme relevée par la revue : elle arrive par la valeur PAR DÉFAUT
+    d'un paramètre, donc rien n'est visible au site d'appel."""
+    fake = _requirement_module(tmp_path, _PINNED, '''
+        def _requirement_value(value, form):
+            if not form.match(value):
+                raise ValueError(value)
+            return value
+        def cmd(a, BUNDLE_IDENTIFIER_FORM=re.compile('.*')):
+            return f'error "{_requirement_value(a.name, BUNDLE_IDENTIFIER_FORM)}"'
+        ''')
+    assert _unescaped_quoted_interpolations(fake) != []
+
+
+def test_a_form_bound_in_an_enclosing_function_does_not_dispense(tmp_path):
+    """Une portée de plus : la remontée doit être celle des portées, pas le
+    seul corps propre de la fonction qui porte le site."""
+    fake = _requirement_module(tmp_path, _PINNED, '''
+        def _requirement_value(value, form):
+            if not form.match(value):
+                raise ValueError(value)
+            return value
+        def outer(a):
+            BUNDLE_IDENTIFIER_FORM = re.compile('.*')
+            def inner():
+                return f'error "{_requirement_value(a.name, BUNDLE_IDENTIFIER_FORM)}"'
+            return inner()
+        ''')
+    assert _unescaped_quoted_interpolations(fake) != []
+
+
+@pytest.mark.parametrize("binding", [
+    "BUNDLE_IDENTIFIER_FORM = fake.compile(%r)",          # pas le module `re`
+    "BUNDLE_IDENTIFIER_FORM = re.compile(%r, re.I)",      # drapeau surnuméraire
+    "BUNDLE_IDENTIFIER_FORM = re.compile(%r, flags=re.I)",
+])
+def test_an_approval_predicate_that_reads_only_the_attribute_name_is_not_enough(
+        tmp_path, binding):
+    """`compile` par le seul nom d'attribut approuvait `fake.compile(...)`, et
+    les drapeaux n'étaient pas inspectés — `re.I` rend la forme insensible à
+    la casse, donc plus permissive que ce que le motif épinglé décrit."""
+    forms = binding % (REQUIREMENT_FORMS["BUNDLE_IDENTIFIER_FORM"],)
+    fake = _requirement_module(tmp_path, "import re as fake\n" + forms, '''
+        def _requirement_value(value, form):
+            if not form.match(value):
+                raise ValueError(value)
+            return value
+        def cmd(a):
+            return f'error "{_requirement_value(a.name, BUNDLE_IDENTIFIER_FORM)}"'
+        ''')
+    assert _unescaped_quoted_interpolations(fake) != []
+
+
+def test_a_module_that_rebinds_re_does_not_dispense(tmp_path):
+    """`re` lui-même réaffecté : `re.compile` ne compile plus rien de connu."""
+    fake = _requirement_module(
+        tmp_path, _PINNED + "\nre = None", '''
+        def _requirement_value(value, form):
+            if not form.match(value):
+                raise ValueError(value)
+            return value
+        def cmd(a):
+            return f'error "{_requirement_value(a.name, BUNDLE_IDENTIFIER_FORM)}"'
+        ''')
+    assert _unescaped_quoted_interpolations(fake) != []
+
+
+def test_the_real_script_still_dispenses_its_two_sites(tmp_path):
+    """Contre-épreuve du durcissement : le script réel ne doit pas se mettre à
+    rougir. Un durcissement qui refuse tout ne prouve rien."""
+    assert _unescaped_quoted_interpolations() == []

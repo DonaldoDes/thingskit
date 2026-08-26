@@ -340,23 +340,25 @@ def test_the_c4_guard_refuses_a_skipif_that_does_not_decide_on_the_bundle():
     """
     assert _installed_bundle_reaches(
         "import pytest, shutil\n"
-        "@pytest.mark.skipif(not os.path.isdir('/Applications/thingskit.app'), reason='r')\n"
+        f"@pytest.mark.skipif(not os.path.isdir({INSTALL_PATH!r}), reason='r')\n"
         "def test_x(tmp_path):\n"
-        "    shutil.copytree('/Applications/thingskit.app', tmp_path / 'c')\n"
+        f"    shutil.copytree({INSTALL_PATH!r}, tmp_path / 'c')\n"
     )
 
 
 def test_the_c4_guard_sees_a_reach_named_by_the_module_constant():
-    """Nommer la cible par `bundle.INSTALL_PATH` la rend identique, pas absente.
+    """Nommer la cible par la constante la rend identique, pas absente.
 
     Le balayage ne lisait que les litteraux : `tests/test_code_identity.py`
     atteignait le bundle installe par la constante et lui echappait entierement.
+    La constante ainsi nommee est celle des TESTS — `bundle.INSTALL_PATH` a
+    ete retiree du build par ADR-003, et la citer ici decrirait un depot qui
+    n'existe plus.
     """
     assert _installed_bundle_reaches(
         "import shutil\n"
-        "from build import bundle\n"
-        "def test_x(tmp_path):\n"
-        "    shutil.copytree(bundle.INSTALL_PATH, tmp_path / 'c')\n"
+        f"def test_x(tmp_path):\n"
+        f"    shutil.copytree({INSTALL_PATH_NAME}, tmp_path / 'c')\n"
     )
 
 
@@ -1856,14 +1858,17 @@ def test_the_installed_interpreter_loads_nothing_from_outside_the_bundle():
     précisément le motif « l'autonomie ne se déduit pas de la seule inspection
     de l'exécutable » de la constitution, appliqué une couche plus haut.
     """
-    app = Path(bundle.INSTALL_PATH)
+    # `bundle.INSTALL_PATH` n'existe plus (ADR-003 : le chemin d'installation
+    # vient de la configuration). Le bundle installé est un ÉTAT DE POSTE, et
+    # c'est `conftest` qui le nomme — comme pour le prédicat de saut.
+    app = Path(INSTALL_PATH)
     probe = (
         "import sys\n"
         "outside = [p for p in sys.path if p and not p.startswith(sys.prefix)"
         " and not p.startswith(str(sys.base_prefix))]\n"
         "foreign = sorted({m for m, v in sys.modules.items()"
         " if getattr(v, '__file__', None) and not v.__file__.startswith(sys.prefix)"
-        " and '/Applications/thingskit.app' not in v.__file__})\n"
+        f" and {INSTALL_PATH!r} not in v.__file__}})\n"
         "print(repr((outside, foreign)))\n"
     )
     out = subprocess.run(
