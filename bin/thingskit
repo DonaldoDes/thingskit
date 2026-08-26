@@ -384,14 +384,50 @@ STATUS_LABELS = {STATUS_OPEN: "open", STATUS_CANCELED: "canceled",
                  STATUS_COMPLETED: "completed"}
 
 
+# Classe REFUSÉE, nommée par catégorie Unicode et non par `str.isprintable()`.
+# `isprintable()` refuse en plus Zs — les séparateurs d'espace —, et c'était un
+# SUR-REFUS : mesuré le 2026-08-26 sur la base Things réelle (902 titres), la
+# garde citait 2 titres, et le seul caractère en cause était U+00A0, la
+# typographie française devant `?` et `!`. Zéro caractère de classe
+# dangereuse ; 100 % de faux positifs en usage réel.
+#
+# Les 17 `Zs` sont des espaces VISIBLES de largeur non nulle : ils n'exécutent
+# rien. Rien du modèle de menace n'y est — l'espace de largeur nulle U+200B et
+# l'inversion de lecture U+202E sont Cf, le séparateur de ligne U+2028 est Zl,
+# tous refusés ci-dessous. Le résidu qui s'ouvre — un espace cadratin pour
+# désaligner du texte — rejoint le résidu « imprimable et trompeur » déjà
+# déclaré : il ne s'exécute pas, il induit en erreur.
+_REFUSED_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs", "Co", "Cn"})
+
+
+def _refuses(text: str) -> bool:
+    """La valeur porte-t-elle un caractère de la classe refusée ?"""
+    return any(unicodedata.category(ch) in _REFUSED_CATEGORIES for ch in text)
+
+
+def _bounded(text: str) -> str:
+    """Échappe EN PLACE ce que la classe refuse, sans citer le reste.
+
+    Distinct de `_rendered` par sa destination : il borne un MESSAGE dont une
+    partie seulement est d'origine non contrôlée — celui qu'`argparse` compose
+    hors de ce module. Citer le message entier le rendrait illisible ; le
+    laisser tel quel laisse ESC et CR atteindre le terminal.
+    """
+    if not _refuses(text):
+        return text
+    return "".join(ch if not _refuses(ch) else repr(ch)[1:-1] for ch in text)
+
+
 def _rendered(value) -> str:
     """Rendu BORNÉ d'une valeur d'origine non contrôlée (§ Zones sensibles 1).
 
-    Même borne que `!r`, qu'`add-task` emploie depuis BUG-005 : la classe de
-    `str.isprintable()` — Cc (dont ESC/CR/LF), Cf (dont l'inversion de sens de
-    lecture U+202E), Zl/Zp, Zs hors espace, Cs/Co/Cn. Jamais un filtre de
-    caractères énumérés : une liste ne couvre que ce qu'on a pensé à y
-    inscrire.
+    Borne la classe refusée ci-dessus : Cc (dont ESC/CR/LF), Cf (dont
+    l'inversion de sens de lecture U+202E), Zl/Zp, Cs/Co/Cn — jamais un filtre
+    de caractères énumérés, une liste ne couvrant que ce qu'on a pensé à y
+    inscrire. `!r`, employé en prose depuis BUG-005, borne la même classe PLUS
+    les séparateurs d'espace : `repr` échappe U+00A0, `_rendered` non. C'est le
+    seul écart entre les deux conversions, il est dans le sens du sur-refus, et
+    il est déclaré § « ce que le lot ne ferme pas ».
 
     Ce qu'il ajoute à `!r`, et la seule raison de son existence : il ne cite
     QUE s'il y a lieu. `!r` convient au titre serti dans une phrase — les
@@ -408,7 +444,7 @@ def _rendered(value) -> str:
     `tests/test_untrusted_rendering.py` les tient pour équivalents.
     """
     text = value if isinstance(value, str) else str(value)
-    return text if text.isprintable() else repr(text)
+    return repr(text) if _refuses(text) else text
 
 
 def decode_things_date(v: int | None) -> str | None:
@@ -860,7 +896,7 @@ def cmd_tasks(a) -> int:
             print(f"{_rendered(o['uuid'])}  "
                   f"{_rendered(o['project'] or o['area'] or 'Inbox'):<34}  "
                   f"{_rendered(o['heading'] or ''):<26}  "
-                  f"{_rendered(o['title'])[:60]}{suffix}")
+                  f"{_rendered(o['title'][:60])}{suffix}")
     print(f"\n{len(rows)} tâche(s)", file=sys.stderr)
     return 0
 
@@ -879,7 +915,7 @@ def resolve_uuid(kind: str, title: str) -> str | None:
     if not rows:
         return None
     if len(rows) > 1:
-        print(f"AMBIGU : {len(rows)} objets {_rendered(kind)!r} nommés {title!r}",
+        print(f"AMBIGU : {len(rows)} objets {kind!r} nommés {title!r}",
               file=sys.stderr)
     return rows[0][0]
 
@@ -887,7 +923,7 @@ def resolve_uuid(kind: str, title: str) -> str | None:
 def cmd_uuid(a) -> int:
     u = resolve_uuid(a.type, a.title)
     if not u:
-        print(f"introuvable : {_rendered(a.type)} {a.title!r}", file=sys.stderr)
+        print(f"introuvable : {a.type!r} {a.title!r}", file=sys.stderr)
         return 1
     print(_rendered(u))
     return 0
@@ -945,8 +981,8 @@ def cmd_agenda(a) -> int:
     else:
         for o in out:
             mark = "⏰" if o["has_deadline"] else ("•" if o["today"] else " ")
-            print(f"{mark} {_rendered(o['where'])[:30]:<32} "
-                  f"{_rendered(o['title'])[:64]}")
+            print(f"{mark} {_rendered(o['where'][:30]):<32} "
+                  f"{_rendered(o['title'][:64])}")
         print(f"\n{len(out)} actionnable(s)", file=sys.stderr)
     return 0
 
@@ -1042,7 +1078,7 @@ def cmd_find_task(a) -> int:
 def cmd_deeplink(a) -> int:
     u = resolve_uuid(a.type, a.title)
     if not u:
-        print(f"introuvable : {_rendered(a.type)} {a.title!r}", file=sys.stderr)
+        print(f"introuvable : {a.type!r} {a.title!r}", file=sys.stderr)
         return 1
     print(f"things:///show?id={_rendered(u)}")
     return 0
@@ -1563,7 +1599,11 @@ def cmd_create_heading(a) -> int:
         return 0
 
     ensure_running()
-    subprocess.run([OPEN, f"things:///show?id={project_uuid}"], check=False)
+    # `project_uuid` est d'origine non contrôlée et l'argv de ce fils est
+    # émis sur NOTRE terminal (stdio hérité). Même neutralisation que
+    # `url_open`, qui encode déjà son payload.
+    subprocess.run([OPEN, "things:///show?id=" + urllib.parse.quote(project_uuid)],
+                   check=False)
 
     seen = {"probe": None}
 
@@ -2244,7 +2284,7 @@ def _parse_when(value: str) -> tuple[tuple[str, str | None] | None, str | None]:
     try:
         day = dt.date.fromisoformat(value)
     except ValueError as exc:
-        return None, f"--when {value!r} n'est pas une date valide : {exc}"
+        return None, f"--when {value!r} n'est pas une date valide : {_rendered(exc)}"
     if day == dt.date.today():
         # `schedule` pour la date du jour donne « À venir », pas « Aujourd'hui ».
         return ("today", day.isoformat()), None
@@ -2258,7 +2298,7 @@ def _parse_deadline(value: str) -> tuple[str | None, str | None]:
     try:
         return dt.date.fromisoformat(value).isoformat(), None
     except ValueError as exc:
-        return None, f"--deadline {value!r} n'est pas une date valide : {exc}"
+        return None, f"--deadline {value!r} n'est pas une date valide : {_rendered(exc)}"
 
 
 def _applescript_date_lines(var: str, iso: str) -> str:
@@ -2898,8 +2938,58 @@ def cmd_delete_task(a) -> int:
     return 0
 
 
+class _BoundedParser(argparse.ArgumentParser):
+    """`argparse` émet HORS de ce module — et le balayage est intra-module.
+
+    Le prédicat de la zone sensible n° 1 porte sur la valeur et son trajet,
+    pas sur le site d'affichage : c'est ce qui lui permet de suivre un
+    fragment composé ailleurs. Il a une frontière, et c'est celle du module.
+    `ArgumentParser.error` compose son message dans `argparse`, à partir
+    d'`sys.argv`, AVANT que la valeur n'existe comme namespace — aucune des
+    cinq racines ne l'atteint, et aucun balayage de `bin/thingskit` ne le
+    verrait.
+
+    Sur les sept gabarits de message d'`argparse` 3.12.9 qui portent une
+    valeur de la ligne de commande, un seul est brut ET atteignable :
+    `unrecognized arguments: %s`. Reproduit le 2026-08-26 — un titre
+    commençant par un tiret, forme banale d'un compte rendu importé, fait
+    basculer `parse_args` sur ce chemin, et `\x1b[2K\r` y sort intact : le
+    terminal efface la ligne d'erreur, l'utilisateur lit un faux succès, le
+    code retour est 2 et personne ne le regarde. Deux autres gabarits sont
+    bruts par construction — `ambiguous option` et `unexpected option
+    string` — mais leur valeur doit être un préfixe d'option déclarée : elle
+    ne peut porter aucun caractère de la classe refusée. Les quatre derniers
+    convertissent par `%r` ou ne portent que du texte du programme.
+
+    La borne est donc posée là où le message repasse par nous : `error` et
+    `exit`. Elle ne touche NI l'usage NI l'aide, qui sont du texte du
+    programme — vérifié par
+    `test_the_bound_leaves_the_parser_own_help_untouched`.
+
+    Ce qu'elle ne couvre pas : `print_usage` et `print_help` appelés
+    directement, qui n'émettent que du texte du programme. Et l'énumération
+    ci-dessus vaut pour 3.12.9 — une autre version pourrait rendre brut un
+    gabarit aujourd'hui converti. La borne, elle, n'en dépend pas : elle
+    s'applique au message quel qu'il soit, c'est le point de la poser au
+    passage plutôt que sur un gabarit nommé.
+    """
+
+    @staticmethod
+    def _bounded_message(message):
+        if not message:
+            return message
+        corps = message.rstrip("\n")
+        return _bounded(corps) + message[len(corps):]
+
+    def error(self, message):
+        super().error(self._bounded_message(message))
+
+    def exit(self, status=0, message=None):
+        super().exit(status, self._bounded_message(message))
+
+
 def main() -> int:
-    p = argparse.ArgumentParser(prog="thingskit", description=__doc__,
+    p = _BoundedParser(prog="thingskit", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 

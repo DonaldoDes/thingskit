@@ -821,14 +821,47 @@ irréversible pour un gestionnaire de tâches personnel utilisé au quotidien.
   lieu »), restauré par un autre vecteur — avec, cette fois, un code retour
   `0` parfaitement légitime, donc hors de portée de l'invariant central.
 
-  La conversion est `!r`, jamais un filtre de caractères énumérés : elle
-  borne la classe de `str.isprintable()` — Cc (dont ESC/CR/LF), Cf (dont
-  l'inversion de sens de lecture U+202E), Zl/Zp, Zs hors espace, Cs/Co/Cn —
-  là où une liste ne couvre que ce qu'on a pensé à y inscrire. Même motif que
-  `_untypable_chars`, qui porte déjà sur la classe et non sur les caractères
-  rencontrés. Mesuré le 2026-08-25 sur dix formes : les six hostiles sont
-  converties, et accents, tiret cadratin, `→`, `›` et emoji restent lisibles
-  — la conversion ne coûte donc pas la lisibilité qui la ferait abandonner.
+  La conversion borne une CLASSE de caractères, jamais une liste énumérée —
+  une liste ne couvre que ce qu'on a pensé à y inscrire. La classe REFUSÉE est
+  nommée par catégorie Unicode : `Cc` (dont ESC/CR/LF), `Cf` (dont l'inversion
+  de sens de lecture U+202E et l'espace de largeur nulle U+200B), `Zl`/`Zp`,
+  `Cs`, `Co`, `Cn`. Même motif que `_untypable_chars`, qui porte déjà sur la
+  classe et non sur les caractères rencontrés.
+
+  **Les séparateurs d'espace (`Zs`) en ont été SORTIS le 2026-08-26**, et ce
+  retrait est le correctif d'un sur-refus mesuré. Jusque-là la borne était
+  celle de `str.isprintable()`, qui refuse `Zs` : sur la base Things réelle,
+  902 titres, la garde en citait 2, et le seul caractère en cause était
+  U+00A0 — la typographie française devant `?` et `!`. Zéro caractère de
+  classe dangereuse : 100 % de faux positifs en usage réel. Les 17 `Zs` sont
+  des espaces VISIBLES de largeur non nulle et n'exécutent rien ; rien du
+  modèle de menace n'y est, U+200B et U+202E étant `Cf` et U+2028 `Zl`. La
+  couverture du dommage reste donc ENTIÈRE ; le résidu qui s'ouvre — un espace
+  cadratin pour désaligner du texte — rejoint le résidu « imprimable et
+  trompeur » déjà déclaré. `str.isprintable()` ne sait pas exprimer cette
+  classe : le prédicat est explicite (`_REFUSED_CATEGORIES`), et
+  `test_the_refused_class_still_holds_every_dangerous_category` l'épingle dans
+  les DEUX directions — un `Zs` redevenu refusé échoue, un `Cf` cessant de
+  l'être aussi. Mesure rejouable :
+
+      .venv/bin/python - <<'EOF'
+      import sqlite3, glob, unicodedata
+      p = glob.glob("/Users/donaldo/Library/Group Containers/*/ThingsData-*/"
+                    "Things Database.thingsdatabase/main.sqlite")[0]
+      con = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+      t  = [x for (x,) in con.execute("select title from TMTask "
+                                      "where trashed=0 and title is not null")]
+      t += [x for (x,) in con.execute("select title from TMArea "
+                                      "where title is not null")]
+      R = {"Cc","Cf","Zl","Zp","Cs","Co","Cn"}
+      print(len(t), sum(not x.isprintable() for x in t),
+            sum(any(unicodedata.category(c) in R for c in x) for x in t))
+      EOF
+      # -> 902 2 0   (titres, cités par l'ancienne borne, cités par la nouvelle)
+
+  Mesuré le 2026-08-25 sur dix formes : les six hostiles sont converties, et
+  accents, tiret cadratin, `→`, `›` et emoji restent lisibles — la conversion
+  ne coûte donc pas la lisibilité qui la ferait abandonner.
 
   **L'uniformité se vérifie par EXPRESSION, pas par ligne.** Le défaut se
   loge dans une valeur brute au milieu de trois converties : `add-task`
@@ -841,36 +874,84 @@ irréversible pour un gestionnaire de tâches personnel utilisé au quotidien.
   sur-échappement, et par
   `test_the_observed_placement_renders_all_four_values_the_same_way`.
 
-  **Portée réelle au 2026-08-26 : le script entier tient cet invariant**, et
-  la propriété est tenue par un BALAYAGE, pas par une relecture —
+  **Portée réelle au 2026-08-26, énoncée avec ce qu'elle exclut.** Toutes les
+  fonctions de premier niveau de `bin/thingskit` tiennent l'invariant, tenu par
+  un BALAYAGE et non par une relecture —
   `test_no_untrusted_value_reaches_the_output_unconverted`
-  (`tests/test_untrusted_rendering.py`), compte résiduel exigé NUL. Jusqu'au
-  2026-08-25 seul `add-task` le tenait ; c'est BUG-026 qui a fermé la classe.
+  (`tests/test_untrusted_rendering.py`), compte résiduel exigé NUL. N'en font
+  PAS partie, et sont couverts autrement : ce qu'`argparse` émet (voir
+  ci-dessous), et le code de MODULE — le bloc `if __name__ == "__main__"`,
+  dont le `print` du contrôle d'identité de code, que le balayage ne collecte
+  pas. La formulation « le script entier tient cet invariant », portée ici
+  jusqu'au 2026-08-26, était FAUSSE : une valeur sortait brute par `argparse`
+  au moment même où elle était écrite.
 
-  **Ce qui a permis de la fermer n'est pas un comptage, c'est un prédicat.**
-  Cinq mesures l'avaient précédée et avaient rendu cinq résultats — 24 sites
-  plus 13 faibles, 237 champs sur 326, 82, 117, 37. Aucune n'était un
-  comptage fautif : chacune présumait une définition de « valeur d'origine
-  non contrôlée » au lieu de l'écrire. Le prédicat à cinq racines (namespace
+  **`argparse` émet hors du module, et le balayage est intra-module.** Le
+  prédicat porte sur la valeur et son trajet ; sa frontière est celle du
+  fichier. `ArgumentParser.error` compose son message dans `argparse`, à
+  partir d'`sys.argv`, AVANT que la valeur n'existe comme namespace — aucune
+  racine ne l'atteint. Reproduit le 2026-08-26 : un titre commençant par un
+  tiret, forme banale d'un compte rendu importé, fait basculer `parse_args`
+  sur `unrecognized arguments: %s`, seul des sept gabarits d'`argparse` 3.12.9
+  à être brut ET atteignable. ESC et CR y sortaient intacts, le terminal
+  effaçait la ligne d'erreur et l'utilisateur lisait un faux succès, avec un
+  code retour 2 que personne ne regarde. Deux autres gabarits sont bruts par
+  construction (`ambiguous option`, `unexpected option string`) mais leur
+  valeur doit être un préfixe d'option déclarée, donc ne peut porter aucun
+  caractère de la classe refusée ; les quatre derniers convertissent par `%r`
+  ou ne portent que du texte du programme. La borne est posée là où le message
+  repasse par nous — `_BoundedParser.error` / `.exit` —, elle échappe EN PLACE
+  au lieu de citer le message entier, et elle ne touche ni l'usage ni l'aide.
+  `sys.argv` est devenue la sixième racine du prédicat (R6) par la même
+  occasion. Gardé par `test_an_unrecognised_argument_never_reaches_stderr_raw`
+  et `test_an_argument_error_never_smuggles_a_line_break`. L'énumération des
+  sept gabarits vaut pour 3.12.9 et pourrait changer de version en version ;
+  la borne n'en dépend pas — elle s'applique au message quel qu'il soit, et
+  c'est le motif de la poser au passage plutôt que sur un gabarit nommé.
+
+  **Ce qui a permis de fermer la classe n'est pas un comptage, c'est un
+  prédicat.** Cinq mesures l'avaient précédée et avaient rendu cinq résultats
+  — 24 sites plus 13 faibles, 237 champs sur 326, 82, 117, 37. Aucune n'était
+  un comptage fautif : chacune présumait une définition de « valeur d'origine
+  non contrôlée » au lieu de l'écrire. Le prédicat à six racines (namespace
   argparse, `q(...)`, `osa(...)`, paramètre alimenté, retour par slot de
-  tuple), son trajet et ses conversions sont écrits en tête de
+  tuple, `sys.argv`), son trajet et ses conversions sont écrits en tête de
   `tests/test_untrusted_rendering.py` ; c'est lui qu'il faut contester pour
-  contester le chiffre. **La mesure sous ce prédicat : 87 valeurs dans 32
-  fonctions.** Elle se rejoue :
+  contester le chiffre.
 
-      python3 - <<'EOF'
-      import importlib.util, sys
-      s = importlib.util.spec_from_file_location(
+  **La mesure sous ce prédicat : 90 valeurs dans 34 fonctions**, sur l'état
+  d'AVANT le correctif. Le chiffre porté ici jusqu'au 2026-08-26 — « 87 valeurs
+  dans 32 fonctions » — n'était produit par aucune lecture (ni le brut à 90/34,
+  ni le dédupliqué à 84/34, ni les 78 lignes distinctes), et la commande qui
+  l'accompagnait lisait le fichier CORRIGÉ, donc rendait 0. Elle se rejoue,
+  cette fois sur ce qu'elle mesure — et le chiffre est lui-même épinglé par
+  `test_the_figure_of_the_sweep_is_the_one_written_in_the_constitution` :
+
+      git show cc4ff9d:bin/thingskit > /tmp/avant_bug026.py
+      .venv/bin/python - <<'EOF'
+      import importlib.util, sys, pathlib
+      sp = importlib.util.spec_from_file_location(
           "m", "tests/test_untrusted_rendering.py")
-      m = importlib.util.module_from_spec(s); sys.modules["m"] = m
-      s.loader.exec_module(m)
-      v = m.Sweep(m._script_source()).violations()
-      print(len(v), "valeurs,", len({x[0] for x in v}), "fonctions")
+      m = importlib.util.module_from_spec(sp)
+      sys.modules["m"] = m; sp.loader.exec_module(m)
+      for label, path in (("AVANT", "/tmp/avant_bug026.py"),
+                          ("APRÈS", "bin/thingskit")):
+          v = m.Sweep(pathlib.Path(path).read_text(encoding="utf-8")).violations()
+          print(label, len(v), "valeurs,", len({x[0] for x in v}), "fonctions")
       EOF
+      # -> AVANT 90 valeurs, 34 fonctions
+      #    APRÈS 0 valeurs, 0 fonctions
 
   Cette unité n'est PAS un nombre de `print` : une valeur est comptée à son
   ORIGINE dans sa fonction, et un même `task_id` alimente jusqu'à six lignes.
-  Le correctif a touché 85 emplacements de texte par cette voie.
+  Le volume du correctif se mesure, lui, en sites de conversion — 81
+  occurrences de `_rendered(` dont une définition, soit 80 appels, et `!r}`
+  passé de 104 à 161. Le chiffre « 85 emplacements de texte » porté ici
+  jusqu'au 2026-08-26 ne correspondait à aucune commande :
+
+      grep -o '_rendered(' bin/thingskit | wc -l              # -> 81
+      grep -o '!r}' bin/thingskit | wc -l                     # -> 161
+      git show cc4ff9d:bin/thingskit | grep -o '!r}' | wc -l  # -> 104
 
   Deux inclusions décident du chiffre, et les deux manquaient aux balayages
   antérieurs. La sortie d'`osascript` est une valeur d'origine non contrôlée —
@@ -884,25 +965,66 @@ irréversible pour un gestionnaire de tâches personnel utilisé au quotidien.
   **Deux conversions, un partage écrit.** `!r` en prose, où les guillemets
   délimitent la valeur ; `_rendered()` là où la position délimite déjà —
   colonne alignée, identifiant entre parenthèses, ligne destinée à un tube.
-  Les deux bornent la même classe, celle de `str.isprintable()` ;
   `_rendered` ne cite QUE s'il y a lieu, et c'est ce qui laisse les commandes
   de lecture lisibles. Citer inconditionnellement une colonne aurait été un
   sur-refus — refuser une classe qui passe est un défaut au même titre que
-  laisser passer une classe qui casse.
+  laisser passer une classe qui casse. Les deux ne bornent PAS exactement la
+  même classe : `!r` est `repr`, qui échappe en plus les `Zs`. L'écart va dans
+  le sens du sur-refus, il subsiste en prose, et il est déclaré ci-dessous. La
+  **troncature s'applique à la valeur, jamais à son rendu** — `_rendered(v)[:60]`
+  amputait `\x1b` en `\x1` et coupait le guillemet fermant ; corrigé en
+  `_rendered(v[:60])`, gardé par
+  `test_no_truncation_applies_to_the_result_of_a_conversion`.
 
   **Ce que ce balayage ne tient pas**, dit ici parce que « la classe est
-  fermée » a déjà été affirmé à tort dans ce dépôt : les indirections qu'une
-  analyse statique ne suit pas (`%`, `.format`, `string.Template`, `.replace`,
-  `io.StringIO`) ne sont pas suivies — elles sont INTERDITES par
-  `test_no_output_is_composed_by_a_form_the_sweep_cannot_follow`, 0 occurrence
-  mesurée ; l'analyse est insensible au flot et fusionne les portées
-  imbriquées, toujours dans le sens de la sur-approximation ; `json.dumps`
-  compte comme conversion parce qu'elle échappe la classe Cc, mais elle
-  n'échappe PAS Cf sous `ensure_ascii=False` — un U+202E traverse une sortie
-  `--json`, résidu nommé et non fermé ; enfin `!r` comme `_rendered` laissent
-  passer ce qui est imprimable ET trompeur — homoglyphe, espace cadratin,
-  titre imitant mot pour mot un message du programme. Le quoting en limite la
-  portée, il ne la ferme pas.
+  fermée » a déjà été affirmé à tort dans ce dépôt — et parce que cette liste
+  a dû DOUBLER le 2026-08-26, deux affirmations de couverture s'étant révélées
+  plus larges que leur mesure :
+
+  - Les indirections qu'une analyse statique ne suit pas (`%`, `.format`,
+    `string.Template`, `.replace`, `io.StringIO`) ne sont pas suivies — elles
+    sont INTERDITES par
+    `test_no_output_is_composed_by_a_form_the_sweep_cannot_follow`, 0
+    occurrence mesurée.
+  - Les portées et les puits que le balayage ne modélise pas — conteneur ou
+    global de module, méthode de classe, alias de `print` ou d'un flux
+    standard, `sys.exit`/`SystemExit` à message composé, défaut de paramètre
+    calculé, paramètre variadique, walrus en argument de puits, exception
+    interpolée, `writelines`, `os.write`, `subprocess` à stdio hérité dont
+    l'argv est interpolé — sont INTERDITS de la même façon, par
+    `test_no_output_escapes_the_sweep_by_its_scope_or_by_its_sink` : quinze
+    détecteurs pour quatorze formes, 0 occurrence. Trois sites vivants
+    relevaient de ces formes et n'étaient bénins que par accident ; ils ont
+    été corrigés le 2026-08-26 (deux `{exc}` d'un `except … as`, et un
+    `subprocess` dont l'argv portait un uuid non encodé, désormais passé par
+    `urllib.parse.quote` comme dans `url_open`). Angle mort de cette garde-là :
+    un `subprocess` dont l'argv est passé par un NOM, qu'elle n'inspecte pas.
+  - L'analyse est insensible au flot et fusionne les portées imbriquées,
+    toujours dans le sens de la sur-approximation.
+  - Le code de MODULE n'est analysé par rien (voir « portée réelle »).
+  - `json.dumps` compte comme conversion, et sa portée est PLUS ÉTROITE que ce
+    qui a été écrit ici jusqu'au 2026-08-26 (« elle échappe la classe Cc »).
+    Mesuré sous `ensure_ascii=False` : elle échappe **C0** — 32 caractères sur
+    les 65 de `Cc`, U+0000..U+001F, dont ESC, CR et LF. **DEL et tout C1
+    traversent** (33 caractères), dont U+0085 NEL, que `str.splitlines()`
+    traite comme un saut de ligne : un titre peut donc couper une ligne de
+    sortie `--json`. Cf traverse également, sous la même option. Résidu nommé
+    et non fermé : **DEL, C1 et Cf traversent une sortie `--json`**.
+
+        .venv/bin/python -c 'import json, unicodedata as u; \
+        cc=[chr(c) for c in range(0x110000) if u.category(chr(c))=="Cc"]; \
+        print(len(cc), sum(c not in json.dumps("a"+c+"b", ensure_ascii=False) \
+        for c in cc))'
+        # -> 65 32
+
+  - Le partage « `!r` en prose, `_rendered` en position » n'est mécanisé que
+    pour sa forme cumulée (`_rendered(x)!r`). Distinguer la prose d'une
+    position délimitée n'est pas décidable à l'AST : les trois écarts du
+    2026-08-26 (lignes 882, 890, 1045) ont été trouvés à la relecture.
+  - Enfin `!r` comme `_rendered` laissent passer ce qui est imprimable ET
+    trompeur — homoglyphe, espace cadratin, titre imitant mot pour mot un
+    message du programme. Le quoting en limite la portée, il ne la ferme pas.
+    Sortir `Zs` de la classe refusée élargit ce résidu-là, et rien d'autre.
 
 - Aucune requête SQL autre que `select` n'existe dans `bin/thingskit`, y
   compris dans les tests d'intégration à `_make_db` (qui construisent une

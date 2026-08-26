@@ -26,7 +26,11 @@ Racines — une expression est d'origine non contrôlée si elle est :
       d'appel, une valeur d'origine non contrôlée ;
   R5. le retour — par SLOT de tuple — d'une fonction dont au moins un `return`
       l'est. Le slot n'est pas un détail : `_resolve_*` rend `(uuid, message)`,
-      et suivre la valeur sans suivre son rang confond les deux.
+      et suivre la valeur sans suivre son rang confond les deux ;
+  R6. `sys.argv`. R1 ne voit la ligne de commande qu'une fois PARSÉE ; une
+      lecture directe d'argv la précède. Sans cette racine le prédicat a un
+      trou en amont de lui-même — c'est par là que le chemin `unrecognized
+      arguments` d'`argparse` a émis ESC et CR bruts jusqu'au 2026-08-26.
 
 Trajet — la valeur reste non contrôlée à travers : attribut, indice, tranche,
 `+`, `.join`, ternaire, `or`/`and`, compréhension, cible de boucle sur un
@@ -72,11 +76,41 @@ une classe qui casse (constitution § Zones sensibles).
 CE QU'IL NE COUVRE PAS
 ----------------------
 Écrit ici plutôt que tu, parce que « la classe est fermée » a déjà été affirmé
-à tort dans ce dépôt.
+à tort dans ce dépôt. Cette liste a DOUBLÉ le 2026-08-26 : le lot initial
+affirmait « le script entier tient cet invariant » alors qu'une valeur sortait
+brute par `argparse`, et annonçait une couverture de `json.dumps` deux fois
+plus large que la mesure. Les deux défauts étaient invisibles au balayage —
+c'est ce que cette liste existe pour dire.
   - Les indirections qu'une analyse statique ne suit pas : `%`, `.format()`,
     `string.Template`, `.replace()` sur un gabarit, `io.StringIO`. Elles ne
     sont pas suivies — elles sont INTERDITES, par
     `test_no_output_is_composed_by_a_form_the_sweep_cannot_follow`.
+  - Les portées et les puits que le balayage ne modélise pas : conteneur ou
+    global de module, méthode de classe, alias de `print` ou d'un flux
+    standard, `sys.exit`/`SystemExit` à message composé, défaut de paramètre
+    calculé, paramètre variadique, walrus en argument de puits, exception
+    interpolée, `writelines`, `os.write`, `subprocess` à stdio hérité dont
+    l'argv est interpolé. Quinze détecteurs, quatorze formes, ZÉRO occurrence :
+    `test_no_output_escapes_the_sweep_by_its_scope_or_by_its_sink`. Chacune est
+    épinglée dans les deux sens — la garde la refuse
+    (`test_the_scope_and_sink_guard_refuses_each_form`) ET le balayage seul la
+    manquerait (`test_the_sweep_alone_would_have_missed_each_form`).
+    Ce que cette garde-là ne voit pas, à son tour : un `subprocess` dont l'argv
+    est passé par un NOM (`subprocess.run(argv)`, ligne 506) — elle n'inspecte
+    qu'une liste littérale.
+  - Le code de MODULE. Le balayage ne collecte que les fonctions de premier
+    niveau : le bloc `if __name__ == "__main__"` — dont le `print(_refusal)`
+    du contrôle d'identité de code — n'est analysé par rien.
+  - Ce qu'`argparse` émet. Il compose hors du module, à partir d'argv, avant
+    que la valeur n'existe comme namespace : aucune racine ne l'atteint. La
+    borne y est posée au PUITS, dans `_BoundedParser.error`/`.exit` — c'est la
+    seule frontière où le message repasse par nous.
+  - Le partage « `!r` en prose, `_rendered` en position » n'est mécanisé que
+    pour sa forme cumulée (`_rendered(x)!r`,
+    `test_no_prose_message_uses_the_conditional_rendering`). Distinguer la
+    prose d'une position délimitée n'est pas décidable à l'AST : les trois
+    écarts du 2026-08-26 (lignes 882, 890, 1045) ont été trouvés à la
+    RELECTURE, et un quatrième le serait de la même façon.
   - La sensibilité au flot : un nom est non contrôlé si UNE de ses affectations
     l'est, où qu'elle soit. Sur-approximation assumée, jamais l'inverse.
   - Un indice remonte à son conteneur sans que la clé soit modélisée :
@@ -87,14 +121,29 @@ CE QU'IL NE COUVRE PAS
     compté non contrôlé bien que `status` soit un entier de la base. Le coût de
     cette sur-approximation est nul, `_rendered` laissant inchangée toute
     valeur imprimable.
-  - `json.dumps` compte comme conversion : elle échappe la classe Cc, dont ESC,
-    CR et LF — la seule dont le dommage soit mesuré. Elle n'échappe PAS Cf sous
-    `ensure_ascii=False` : un U+202E traverse une sortie `--json`. Résidu
-    nommé, non fermé par ce lot.
-  - `!r` et `_rendered` bornent la classe de `str.isprintable()`. Ce qui est
-    imprimable ET trompeur — homoglyphe, espace cadratin, titre imitant mot
-    pour mot un message du programme — leur échappe. Le quoting en limite la
-    portée, il ne la ferme pas.
+  - `json.dumps` compte comme conversion, et sa portée est PLUS ÉTROITE que
+    ce que ce module a d'abord annoncé. Mesuré le 2026-08-26, `ensure_ascii=
+    False` : elle échappe C0 — 32 caractères sur les 65 de Cc, U+0000..U+001F,
+    dont ESC, CR et LF. DEL et TOUT C1 traversent (33 caractères), dont
+    U+0085 NEL, que `str.splitlines()` traite comme un saut de ligne : un
+    titre peut donc couper une ligne de sortie `--json`. Cf traverse aussi.
+    Résidu nommé : DEL, C1 et Cf traversent une sortie `--json`. Rejouable :
+
+        .venv/bin/python -c 'import json,unicodedata as u;
+        cc=[chr(c) for c in range(0x110000) if u.category(chr(c))=="Cc"];
+        print(len(cc), sum(c not in json.dumps("a"+c+"b",ensure_ascii=False)
+        for c in cc))'
+        -> 65 32
+
+  - `_rendered` borne la classe refusée — Cc, Cf, Zl, Zp, Cs, Co, Cn — et NON
+    celle de `str.isprintable()`, qui y ajoute les séparateurs d'espace. `!r`,
+    lui, est `repr` : il échappe U+00A0. C'est le seul écart entre les deux
+    conversions, il va dans le sens du sur-refus, et il subsiste en prose.
+  - Ce qui est imprimable ET trompeur — homoglyphe, espace cadratin, titre
+    imitant mot pour mot un message du programme — échappe aux deux. Le
+    quoting en limite la portée, il ne la ferme pas. Sortir Zs de la classe
+    refusée élargit ce résidu-là, et rien d'autre : les 17 `Zs` sont des
+    espaces visibles de largeur non nulle et n'exécutent rien.
 """
 from __future__ import annotations
 
@@ -118,6 +167,18 @@ DROPPING_CALLS = {"len", "int", "float", "bool", "abs", "round", "ord",
 MUTATORS = {"append": 0, "add": 0, "extend": 0, "update": 0,
             "insert": 1, "setdefault": 1}
 NUMERIC_PRESENTATION = set("bdoxXneEfFgG%")
+
+
+def _is_sys_argv(expr) -> bool:
+    """R6 — `sys.argv` est une racine, en amont du namespace argparse.
+
+    R1 ne voit la ligne de commande qu'une fois parsée. Une lecture directe
+    d'`sys.argv` la précède : sans cette racine, le prédicat a un trou en
+    amont de lui-même — et c'est par là que le chemin `unrecognized
+    arguments` d'`argparse` a émis ESC et CR bruts jusqu'au 2026-08-26.
+    """
+    return (isinstance(expr, ast.Attribute) and expr.attr == "argv"
+            and isinstance(expr.value, ast.Name) and expr.value.id == "sys")
 
 
 def _is_numeric_spec(spec) -> bool:
@@ -222,6 +283,8 @@ class Sweep:
         if isinstance(expr, ast.Name):
             return expr.id in T
         if isinstance(expr, (ast.Attribute, ast.Subscript, ast.Starred)):
+            if _is_sys_argv(expr):
+                return True                                          # R6
             return rec(expr.value)
         if isinstance(expr, ast.Call):
             f = expr.func
@@ -632,19 +695,21 @@ def test_rendered_keeps_a_printable_value_verbatim(thingskit, benign):
 
 
 def test_rendered_bounds_the_class_not_a_list_of_characters():
-    """La borne est celle de `str.isprintable()` — Cc, Cf, Zl, Zp, Zs hors
-    espace, Cs, Co, Cn — jamais une liste de caractères énumérés : une liste
-    ne couvre que ce qu'on a pensé à y inscrire. Balayage du plan multilingue
-    de base, pas d'un échantillon choisi."""
+    """La borne est une CLASSE — Cc, Cf, Zl, Zp, Cs, Co, Cn —, jamais une
+    liste de caractères énumérés : une liste ne couvre que ce qu'on a pensé à
+    y inscrire. Balayage du plan multilingue de base, pas d'un échantillon
+    choisi. Les séparateurs d'espace (Zs) en sont SORTIS le 2026-08-26 ; c'est
+    `test_the_refused_class_still_holds_every_dangerous_category` qui tient
+    les deux directions.
+    """
     escaped = 0
     for cp in range(0x0000, 0x10000):
         ch = chr(cp)
-        if ch.isprintable():
-            continue
-        if unicodedata.category(ch) == "Cs":     # surrogate : pas de str légal
+        cat = unicodedata.category(ch)
+        if cat not in {"Cc", "Cf", "Zl", "Zp", "Co", "Cn"}:
             continue
         rendered = thingskit_module()._rendered(f"a{ch}b")
-        assert rendered.isprintable(), f"U+{cp:04X} traverse : {rendered!r}"
+        assert ch not in rendered, f"U+{cp:04X} traverse : {rendered!r}"
         escaped += 1
     assert escaped > 1000, f"balayage trop étroit : {escaped} points de code"
 
@@ -819,3 +884,582 @@ def test_a_failure_still_names_the_problem_it_observed(
     err = capsys.readouterr().err
     assert "AppleEvent timed out" in err, err
     assert "'Cible'" in err, err
+
+
+# ===========================================================================
+# BUG-026 — rework du 2026-08-26
+#
+# Ce qui suit ferme cinq défauts que le lot initial laissait ouverts, et que
+# deux revues ont établis. Chacun porte ici son épreuve ; les chiffres qu'ils
+# corrigent portent, dans la constitution, la commande qui les produit.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# 1. Le chemin argparse — la sortie que le balayage ne peut PAS voir
+#
+# `argparse.ArgumentParser.error` compose son message HORS du module : aucun
+# balayage intra-module ne l'atteint, et la racine (`sys.argv`) n'existe même
+# pas encore comme namespace au moment où la valeur sort. Enumération des
+# gabarits de message d'argparse 3.12.9 qui portent une valeur d'argv :
+#
+#   `unrecognized arguments: %s`          BRUT et ATTEIGNABLE  <- le défaut
+#   `ambiguous option: %(option)s …`      brut, mais la valeur doit être un
+#                                          préfixe d'une option déclarée : elle
+#                                          ne peut porter aucun caractère de la
+#                                          classe refusée
+#   `unexpected option string: %s`        idem, et marqué « shouldn't ever get
+#                                          here » dans argparse
+#   `ignored explicit argument %r`        converti par `%r`
+#   `invalid %(type)s value: %(value)r`   converti par `%r`
+#   `invalid choice: %(value)r …`         converti par `%r`
+#   `the following arguments are required: %s`  noms de `dest`, texte du
+#                                          programme
+#
+# Reproduit le 2026-08-26 : `thingskit projects "- x\x1b[2K\rtâche ajoutée…"`
+# émettait ESC et CR bruts sur stderr, le terminal effaçait la ligne d'erreur
+# et l'utilisateur lisait une confirmation de succès.
+# ---------------------------------------------------------------------------
+ARGV_SPOOF = "- revoir le budget\x1b[2K\rtâche ajoutée : 'Revoir le budget'"
+
+
+def test_an_unrecognised_argument_never_reaches_stderr_raw(
+        thingskit, monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["thingskit", "projects", ARGV_SPOOF])
+
+    with pytest.raises(SystemExit) as exit_info:
+        thingskit.main()
+
+    err = capsys.readouterr().err
+    assert exit_info.value.code == 2
+    assert "\x1b" not in err and "\r" not in err, repr(err)
+    assert "\\x1b" in err, err
+    assert "unrecognized arguments" in err, err
+
+
+def test_an_argument_error_never_smuggles_a_line_break(
+        thingskit, monkeypatch, capsys):
+    """Un LF dans argv fabriquerait une ligne entière que le programme n'a pas
+    écrite — le même dommage que l'effacement, par un autre caractère."""
+    monkeypatch.setattr(sys, "argv",
+                        ["thingskit", "projects", "x\ntâche ajoutée : 'X'"])
+
+    with pytest.raises(SystemExit):
+        thingskit.main()
+
+    err = capsys.readouterr().err
+    lignes = [l for l in err.splitlines() if l.startswith("thingskit:")]
+    assert len(lignes) == 1, err
+    assert "tâche ajoutée" in lignes[0], err
+
+
+def test_the_bound_leaves_the_parser_own_help_untouched(
+        thingskit, monkeypatch, capsys):
+    """Contre-épreuve du sur-refus : l'aide et l'usage sont du texte du
+    programme, imprimables. La borne ne doit rien y échapper."""
+    monkeypatch.setattr(sys, "argv", ["thingskit", "--help"])
+
+    with pytest.raises(SystemExit):
+        thingskit.main()
+
+    out = capsys.readouterr().out
+    assert "add-task" in out and "usage: thingskit" in out
+    assert "\\x" not in out and "\\n" not in out, out
+
+
+def test_the_bound_escapes_in_place_instead_of_quoting_the_whole_message(
+        thingskit):
+    """`_bounded` n'est pas `repr` : il échappe caractère par caractère et
+    laisse le reste du message lisible — un message d'erreur intégralement
+    cité ne serait plus un message d'erreur."""
+    assert thingskit._bounded("erreur : a\x1b[2Kb") == "erreur : a\\x1b[2Kb"
+    assert thingskit._bounded("erreur : ordinaire") == "erreur : ordinaire"
+
+
+# ---------------------------------------------------------------------------
+# 2. `sys.argv` est une racine du prédicat (R6)
+#
+# Les racines R1-R5 supposent que la valeur existe déjà comme namespace
+# argparse. Une lecture directe d'`sys.argv` la précède : elle DOIT être une
+# racine, sans quoi le prédicat a un trou en amont de lui-même.
+# ---------------------------------------------------------------------------
+def test_sys_argv_is_a_root_of_the_predicate():
+    source = '''
+import sys
+def cmd_x(a):
+    print(f"reçu : {sys.argv[1]}")
+'''
+    assert Sweep(source).violations(), "`sys.argv` n'est pas une racine"
+
+
+def test_sys_argv_stays_a_root_through_a_local_name():
+    source = '''
+import sys
+def cmd_x(a):
+    argv = sys.argv[1:]
+    joint = " ".join(argv)
+    print(f"reçu : {joint}")
+'''
+    assert Sweep(source).violations(), "le trajet depuis `sys.argv` est perdu"
+
+
+def test_the_sweep_sees_sys_argv_reintroduced_into_the_real_script():
+    """Manipulation RÉELLE : on injecte une lecture d'argv brute dans le
+    script du dépôt, le balayage doit la refuser."""
+    source = _script_source()
+    needle = "def cmd_uuid(a) -> int:\n"
+    assert needle in source, "site témoin déplacé — mettre l'épreuve à jour"
+    mutated = source.replace(
+        needle, needle + '    print(f"argv : {sys.argv[1]}")\n', 1)
+    viol = Sweep(mutated).violations()
+    assert any(fn == "cmd_uuid" for fn, _, _ in viol), _report(viol)
+
+
+# ---------------------------------------------------------------------------
+# 3. La classe refusée EXCLUT les séparateurs d'espace (Zs)
+#
+# Mesuré le 2026-08-26 sur la base Things réelle : 902 titres, 2 cités par la
+# garde, et le seul caractère en cause est U+00A0 — la typographie française
+# devant `?` et `!`. Zéro caractère de classe dangereuse. Les 17 `Zs` sont des
+# espaces VISIBLES de largeur non nulle et n'exécutent rien ; U+200B (largeur
+# nulle) est Cf, U+2028 est Zl, U+202E est Cf : tous restent refusés.
+#
+#   .venv/bin/python - <<'EOF'
+#   import sqlite3, glob, unicodedata
+#   p = glob.glob("/Users/donaldo/Library/Group Containers/*/ThingsData-*/"
+#                 "Things Database.thingsdatabase/main.sqlite")[0]
+#   con = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+#   t  = [x for (x,) in con.execute("select title from TMTask "
+#                                   "where trashed=0 and title is not null")]
+#   t += [x for (x,) in con.execute("select title from TMArea "
+#                                   "where title is not null")]
+#   R = {"Cc","Cf","Zl","Zp","Cs","Co","Cn"}
+#   print(len(t), sum(not x.isprintable() for x in t),
+#         sum(any(unicodedata.category(c) in R for c in x) for x in t))
+#   EOF
+#   -> 902 2 0
+# ---------------------------------------------------------------------------
+ZS = [chr(cp) for cp in range(0x110000)
+      if unicodedata.category(chr(cp)) == "Zs"]
+
+
+def test_a_space_separator_is_no_longer_refused(thingskit):
+    """Les 17 `Zs`, un par un. L'insécable est la seule forme réellement
+    rencontrée ; les seize autres relèvent de la même classe et ne peuvent
+    pas être refusées sans que le motif écrit devienne faux."""
+    assert len(ZS) == 17, ZS
+    for ch in ZS:
+        titre = f"Revoir le budget{ch}?"
+        assert thingskit._rendered(titre) == titre, (
+            f"U+{ord(ch):04X} ({unicodedata.name(ch)}) cité à tort")
+
+
+def test_the_refused_class_still_holds_every_dangerous_category(thingskit):
+    """Contre-épreuve, dans l'autre direction : tout ce qui relève de Cc, Cf,
+    Zl, Zp, Co ou Cn reste refusé. Balayage du plan multilingue de base, pas
+    d'un échantillon choisi — une liste ne couvre que ce qu'on y inscrit."""
+    dangereux = {"Cc", "Cf", "Zl", "Zp", "Co", "Cn"}
+    refuses = 0
+    for cp in range(0x0000, 0x10000):
+        ch = chr(cp)
+        cat = unicodedata.category(ch)
+        if cat == "Cs":                      # surrogate : pas de str légal
+            continue
+        rendu = thingskit._rendered(f"a{ch}b")
+        if cat in dangereux:
+            assert rendu != f"a{ch}b", f"U+{cp:04X} ({cat}) traverse : {rendu!r}"
+            refuses += 1
+        else:
+            assert rendu == f"a{ch}b", f"U+{cp:04X} ({cat}) cité à tort : {rendu!r}"
+    assert refuses > 1000, f"balayage trop étroit : {refuses} points de code"
+
+
+def test_the_refused_class_is_named_by_category_not_by_isprintable(thingskit):
+    """`str.isprintable()` ne sait pas exprimer cette classe : il refuse Zs.
+    Le prédicat doit donc être explicite — épinglé ici pour qu'un retour à
+    `isprintable()` échoue."""
+    assert thingskit._REFUSED_CATEGORIES == frozenset(
+        {"Cc", "Cf", "Zl", "Zp", "Cs", "Co", "Cn"})
+    insecable = "a b"
+    assert not insecable.isprintable()
+    assert thingskit._rendered(insecable) == insecable
+
+
+# ---------------------------------------------------------------------------
+# 4. Le chiffre du balayage se rejoue — sur l'ÉTAT D'AVANT
+#
+# La constitution annonçait « 87 valeurs dans 32 fonctions » avec une commande
+# qui lit le fichier CORRIGÉ, laquelle rend donc 0. Le chiffre juste est celui
+# du balayage appliqué à `bin/thingskit` AVANT le correctif — et il vaut 90/34.
+# Cette épreuve rend le chiffre exécutable au lieu de le laisser attesté.
+# ---------------------------------------------------------------------------
+BEFORE_FIX = "cc4ff9d"          # parent du correctif BUG-026
+
+
+def test_the_figure_of_the_sweep_is_the_one_written_in_the_constitution():
+    import subprocess
+    got = subprocess.run(["git", "show", f"{BEFORE_FIX}:bin/thingskit"],
+                         cwd=REPO_ROOT, capture_output=True, text=True)
+    if got.returncode != 0:
+        pytest.skip(f"objet git {BEFORE_FIX} indisponible dans ce checkout")
+    viol = Sweep(got.stdout).violations()
+    assert (len(viol), len({fn for fn, _, _ in viol})) == (90, 34), (
+        f"{len(viol)} valeurs / {len({fn for fn, _, _ in viol})} fonctions")
+
+
+# ---------------------------------------------------------------------------
+# 5. La garde de PORTÉE et de PUITS
+#
+# La garde de composition (ci-dessus) interdit les formes que le balayage ne
+# suit pas quand il COMPOSE du texte. Il n'en existait aucune sur l'autre axe :
+# les portées que le balayage ne modélise pas (module, classe, variadique) et
+# les puits qu'il ne connaît pas (`sys.exit`, `writelines`, `os.write`, un
+# alias de `print`, un `subprocess` à stdio hérité). Sur cet axe, une valeur
+# non contrôlée sort sans qu'aucune épreuve ne s'en aperçoive.
+#
+# Les quinze détecteurs ci-dessous couvrent les quatorze formes établies par la
+# revue du 2026-08-26 (les deux formes « conteneur ou global de module » et
+# « alias de print ou de sys.std* » sont chacune scindées en deux détecteurs,
+# et `sys.exit` est séparé de `raise SystemExit`). Toutes sont à ZÉRO
+# occurrence : la garde est gratuite maintenant, et impossible à poser plus
+# tard.
+# ---------------------------------------------------------------------------
+MUTATING_METHODS = {"append", "add", "extend", "update", "insert", "setdefault"}
+
+
+def _module_level_names(tree) -> set[str]:
+    names = set()
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    names.add(t.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+    return names
+
+
+def _is_stream_attr(node) -> bool:
+    return (isinstance(node, ast.Attribute) and node.attr in ("stdout", "stderr")
+            and isinstance(node.value, ast.Name) and node.value.id == "sys")
+
+
+def _is_sink_call(node) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    f = node.func
+    if isinstance(f, ast.Name) and f.id == "print":
+        return True
+    return isinstance(f, ast.Attribute) and f.attr == "write" and _is_stream_attr(f.value)
+
+
+def _emits(fn) -> bool:
+    return any(_is_sink_call(n) for n in ast.walk(fn))
+
+
+def _is_literal_exit_arg(arg, module_names) -> bool:
+    """Un code de sortie, pas un message composé."""
+    if arg is None or isinstance(arg, ast.Constant):
+        return True
+    if isinstance(arg, ast.Name):
+        return arg.id in module_names
+    if isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name):
+        return arg.func.id in module_names
+    return False
+
+
+def scope_and_sink_findings(source: str) -> list[tuple[int, str]]:
+    """Formes que le balayage ne voit pas — par la PORTÉE ou par le PUITS."""
+    tree = ast.parse(source)
+    module_names = _module_level_names(tree)
+    found: list[tuple[int, str]] = []
+    top_funcs = [n for n in tree.body
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+
+    for fn in top_funcs:
+        for node in ast.walk(fn):
+            # F1 — un `global` fait sortir la valeur de la portée analysée.
+            if isinstance(node, ast.Global):
+                found.append((node.lineno, "global de module"))
+            # F2 — un conteneur de module peuplé dans une fonction est lu
+            #      dans une autre : le balayage est intra-fonction.
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in MUTATING_METHODS
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in module_names):
+                found.append((node.lineno, "conteneur de module muté"))
+        # F9/F10 — la teinte n'est propagée qu'aux paramètres NOMMÉS.
+        if _emits(fn):
+            if fn.args.vararg:
+                found.append((fn.lineno, "paramètre variadique positionnel"))
+            if fn.args.kwarg:
+                found.append((fn.lineno, "paramètre variadique nommé"))
+        # F8 — un défaut calculé n'est jamais évalué par le balayage.
+        for d in list(fn.args.defaults) + [k for k in fn.args.kw_defaults if k]:
+            if isinstance(d, (ast.Constant, ast.UnaryOp)):
+                continue
+            if isinstance(d, (ast.Tuple, ast.List, ast.Set)) and not d.elts:
+                continue
+            if isinstance(d, ast.Dict) and not d.keys:
+                continue
+            if isinstance(d, ast.Name) and d.id in module_names:
+                continue
+            found.append((fn.lineno, "défaut de paramètre calculé"))
+
+    for node in ast.walk(tree):
+        # F3 — le balayage ne collecte que les fonctions de MODULE.
+        if isinstance(node, ast.ClassDef):
+            for sub in node.body:
+                if not isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if _emits(sub) or any(isinstance(n, ast.JoinedStr)
+                                      for n in ast.walk(sub)):
+                    found.append((sub.lineno, "méthode de classe qui émet"))
+        # F4/F5 — un alias rend le puits méconnaissable.
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            value = node.value
+            if isinstance(value, ast.Name) and value.id == "print":
+                found.append((node.lineno, "alias de print"))
+            if _is_stream_attr(value) or (isinstance(value, ast.Attribute)
+                                          and value.attr == "write"
+                                          and _is_stream_attr(value.value)):
+                found.append((node.lineno, "alias de flux standard"))
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.name.split(".")[-1] == "print" and alias.asname:
+                    found.append((node.lineno, "alias de print"))
+        # F6/F7 — `sys.exit("…")` écrit sur stderr ; ce n'est pas un puits connu.
+        if isinstance(node, ast.Call):
+            f = node.func
+            exit_call = ((isinstance(f, ast.Attribute) and f.attr == "exit"
+                          and isinstance(f.value, ast.Name) and f.value.id == "sys"),
+                         (isinstance(f, ast.Name) and f.id == "SystemExit"))
+            arg = node.args[0] if node.args else None
+            if exit_call[0] and not _is_literal_exit_arg(arg, module_names):
+                found.append((node.lineno, "sys.exit à message composé"))
+            if exit_call[1] and not _is_literal_exit_arg(arg, module_names):
+                found.append((node.lineno, "SystemExit à message composé"))
+            # F13/F14 — deux puits que `_sink_args` ne connaît pas.
+            if isinstance(f, ast.Attribute) and f.attr == "writelines":
+                found.append((node.lineno, "writelines"))
+            if (isinstance(f, ast.Attribute) and f.attr == "write"
+                    and isinstance(f.value, ast.Name) and f.value.id == "os"):
+                found.append((node.lineno, "os.write"))
+            # F11 — un walrus lie un nom que le balayage n'a pas collecté.
+            if _is_sink_call(node):
+                for a in node.args:
+                    if any(isinstance(n, ast.NamedExpr) for n in ast.walk(a)):
+                        found.append((node.lineno, "walrus en argument de puits"))
+            # F15 — stdio HÉRITÉ : ce que le fils écrit sort sur notre terminal.
+            if (isinstance(f, ast.Attribute)
+                    and f.attr in ("run", "call", "check_call", "Popen")
+                    and isinstance(f.value, ast.Name) and f.value.id == "subprocess"):
+                kw = {k.arg for k in node.keywords}
+                herite = not ({"capture_output", "stdout", "stderr"} & kw)
+                argv = node.args[0] if node.args else None
+                if herite and isinstance(argv, (ast.List, ast.Tuple)) and any(
+                        isinstance(e, ast.JoinedStr) for e in argv.elts):
+                    found.append((node.lineno,
+                                  "subprocess à stdio hérité, argv interpolé"))
+        # F12 — `except … as exc` puis `{exc}` : le nom n'est lié par aucune
+        #       affectation, donc le balayage le tient pour non teinté.
+        if isinstance(node, ast.ExceptHandler) and node.name:
+            for sub in ast.walk(node):
+                if not isinstance(sub, ast.FormattedValue):
+                    continue
+                if sub.conversion in CONVERSIONS or _is_numeric_spec(sub.format_spec):
+                    continue
+                inner = sub.value
+                if isinstance(inner, ast.Name) and inner.id == node.name:
+                    found.append((sub.lineno, "exception interpolée sans conversion"))
+    return sorted(set(found))
+
+
+def test_no_output_escapes_the_sweep_by_its_scope_or_by_its_sink():
+    findings = scope_and_sink_findings(_script_source())
+    assert findings == [], (
+        "forme que le balayage ne voit pas (portée ou puits) : "
+        + "\n".join(f"  {ln:5d}  {label}" for ln, label in findings))
+
+
+SCOPE_AND_SINK_FORMS = {
+    "global_de_module": '''
+import sys
+BUF = []
+def cmd_x(a):
+    global BUF
+    BUF = [a.title]
+def cmd_y(a):
+    print(BUF[0])
+''',
+    "conteneur_de_module_mute": '''
+BUF = []
+def cmd_x(a):
+    BUF.append(a.title)
+def cmd_y(a):
+    print(BUF[0])
+''',
+    "methode_de_classe_qui_emet": '''
+class Reporter:
+    def say(self, title):
+        print(f"fait : {title}")
+def cmd_x(a):
+    Reporter().say(a.title)
+''',
+    "alias_de_print": '''
+say = print
+def cmd_x(a):
+    say(a.title)
+''',
+    "alias_de_flux_standard": '''
+import sys
+out = sys.stdout
+def cmd_x(a):
+    out.write(a.title)
+''',
+    "sys_exit_a_message_compose": '''
+import sys
+def cmd_x(a):
+    sys.exit(f"introuvable : {a.title}")
+''',
+    "SystemExit_a_message_compose": '''
+def cmd_x(a):
+    raise SystemExit(f"introuvable : {a.title}")
+''',
+    "defaut_de_parametre_calcule": '''
+import sys
+def _say(title=sys.argv[-1]):
+    print(title)
+''',
+    "parametre_variadique_positionnel": '''
+def _say(*parts):
+    print(" ".join(parts))
+def cmd_x(a):
+    _say(a.title)
+''',
+    "parametre_variadique_nomme": '''
+def _say(**fields):
+    print(fields["title"])
+def cmd_x(a):
+    _say(title=a.title)
+''',
+    "walrus_en_argument_de_puits": '''
+def q(sql, args=()): return []
+def cmd_x(a):
+    print(label := q("select title from TMTask")[0][0])
+''',
+    "exception_interpolee_sans_conversion": '''
+def cmd_x(a):
+    try:
+        int(a.title)
+    except ValueError as exc:
+        print(f"non reconnu : {exc}")
+''',
+    "writelines": '''
+import sys
+def cmd_x(a):
+    sys.stdout.writelines([a.title])
+''',
+    "os_write": '''
+import os
+def cmd_x(a):
+    os.write(1, a.title.encode())
+''',
+    "subprocess_a_stdio_herite_argv_interpole": '''
+import subprocess
+def cmd_x(a):
+    subprocess.run(["/usr/bin/open", f"things:///show?id={a.title}"], check=False)
+''',
+}
+
+
+@pytest.mark.parametrize("form", sorted(SCOPE_AND_SINK_FORMS))
+def test_the_scope_and_sink_guard_refuses_each_form(form):
+    findings = scope_and_sink_findings(SCOPE_AND_SINK_FORMS[form])
+    assert findings, f"forme `{form}` non refusée"
+
+
+@pytest.mark.parametrize("form", sorted(SCOPE_AND_SINK_FORMS))
+def test_the_sweep_alone_would_have_missed_each_form(form):
+    """Le point de la garde : ces formes passent le balayage. Sans elle, le
+    « compte résiduel nul » serait vrai ET la valeur sortirait quand même."""
+    assert Sweep(SCOPE_AND_SINK_FORMS[form]).violations() == [], (
+        f"forme `{form}` déjà vue par le balayage — la garde est inutile ici")
+
+
+def test_the_scope_and_sink_guard_does_not_cry_wolf_on_ordinary_code():
+    """Contre-épreuve du sur-refus : un code de sortie entier, un défaut
+    constant, un `subprocess` dont l'argv ne porte aucune interpolation."""
+    source = '''
+import subprocess
+import sys
+CODE = 125
+TIMEOUT = 5.0
+def db_path():
+    sys.exit("base introuvable")
+def wait(timeout=TIMEOUT, poll=0.05, args=(), opts=None):
+    return timeout
+def run():
+    subprocess.run(["/usr/bin/open", "-g", "-a", "Things3"], check=False)
+    raise SystemExit(CODE)
+'''
+    assert scope_and_sink_findings(source) == []
+
+
+# ---------------------------------------------------------------------------
+# 6. La troncature s'applique à la VALEUR, jamais à son rendu
+#
+# `_rendered(v)[:60]` coupe la séquence d'échappement que le rendu vient de
+# produire : `\\x1b` amputé en `\\x1` ou `\\`, c'est-à-dire un rendu qui ne
+# décrit plus la valeur — et, sur `!r`, un guillemet fermant perdu.
+# ---------------------------------------------------------------------------
+def test_no_truncation_applies_to_the_result_of_a_conversion():
+    tree = ast.parse(_script_source())
+    coupes = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice)):
+            continue
+        haut = node.slice.upper
+        # `repr(x)[1:-1]` retire les guillemets — il ne TRONQUE pas. Ce qui
+        # ampute un rendu, c'est une borne haute à un rang positif.
+        if not (isinstance(haut, ast.Constant) and isinstance(haut.value, int)
+                and haut.value >= 0):
+            continue
+        inner = node.value
+        if (isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name)
+                and inner.func.id in CONVERTING_CALLS):
+            coupes.append((node.lineno, ast.get_source_segment(_script_source(), node)))
+    assert coupes == [], f"troncature appliquée à un rendu : {coupes}"
+
+
+def test_a_truncated_cell_never_ends_inside_an_escape(thingskit, db, capsys):
+    """Épreuve de bout en bout sur `agenda` : un titre long portant un ESC au
+    rang de coupe doit sortir tronqué ET complet — jamais `\\x1` ni `\\`."""
+    long_hostile = "a" * 58 + "\x1b" + "b" * 40
+    rendu = thingskit._rendered(long_hostile[:60])
+    assert rendu.endswith("'"), rendu
+    assert "\\x1b" in rendu, rendu
+    tronque_apres = thingskit._rendered(long_hostile)[:60]
+    assert not tronque_apres.endswith("'"), (
+        "l'épreuve ne distingue plus les deux ordres")
+
+
+# ---------------------------------------------------------------------------
+# 7. Le partage écrit est tenu : `!r` en prose, `_rendered` en position
+# ---------------------------------------------------------------------------
+def test_no_prose_message_uses_the_conditional_rendering():
+    """`_rendered` en prose contredit le partage que le lot vient d'écrire, et
+    `_rendered(x)!r` cumule deux conversions. Sites relevés le 2026-08-26 :
+    lignes 882, 890 et 1045."""
+    source = _script_source()
+    tree = ast.parse(source)
+    fautes = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FormattedValue):
+            continue
+        inner = node.value
+        if (isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name)
+                and inner.func.id == "_rendered" and node.conversion in CONVERSIONS):
+            fautes.append((node.lineno, "conversion cumulée `_rendered(...)!r`"))
+    assert fautes == [], fautes
