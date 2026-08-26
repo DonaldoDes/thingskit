@@ -384,6 +384,69 @@ STATUS_LABELS = {STATUS_OPEN: "open", STATUS_CANCELED: "canceled",
                  STATUS_COMPLETED: "completed"}
 
 
+# Classe REFUSÉE, nommée par catégorie Unicode et non par `str.isprintable()`.
+# `isprintable()` refuse en plus Zs — les séparateurs d'espace —, et c'était un
+# SUR-REFUS : mesuré le 2026-08-26 sur la base Things réelle (902 titres), la
+# garde citait 2 titres, et le seul caractère en cause était U+00A0, la
+# typographie française devant `?` et `!`. Zéro caractère de classe
+# dangereuse ; 100 % de faux positifs en usage réel.
+#
+# Les 17 `Zs` sont des espaces VISIBLES de largeur non nulle : ils n'exécutent
+# rien. Rien du modèle de menace n'y est — l'espace de largeur nulle U+200B et
+# l'inversion de lecture U+202E sont Cf, le séparateur de ligne U+2028 est Zl,
+# tous refusés ci-dessous. Le résidu qui s'ouvre — un espace cadratin pour
+# désaligner du texte — rejoint le résidu « imprimable et trompeur » déjà
+# déclaré : il ne s'exécute pas, il induit en erreur.
+_REFUSED_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs", "Co", "Cn"})
+
+
+def _refuses(text: str) -> bool:
+    """La valeur porte-t-elle un caractère de la classe refusée ?"""
+    return any(unicodedata.category(ch) in _REFUSED_CATEGORIES for ch in text)
+
+
+def _bounded(text: str) -> str:
+    """Échappe EN PLACE ce que la classe refuse, sans citer le reste.
+
+    Distinct de `_rendered` par sa destination : il borne un MESSAGE dont une
+    partie seulement est d'origine non contrôlée — celui qu'`argparse` compose
+    hors de ce module. Citer le message entier le rendrait illisible ; le
+    laisser tel quel laisse ESC et CR atteindre le terminal.
+    """
+    if not _refuses(text):
+        return text
+    return "".join(ch if not _refuses(ch) else repr(ch)[1:-1] for ch in text)
+
+
+def _rendered(value) -> str:
+    """Rendu BORNÉ d'une valeur d'origine non contrôlée (§ Zones sensibles 1).
+
+    Borne la classe refusée ci-dessus : Cc (dont ESC/CR/LF), Cf (dont
+    l'inversion de sens de lecture U+202E), Zl/Zp, Cs/Co/Cn — jamais un filtre
+    de caractères énumérés, une liste ne couvrant que ce qu'on a pensé à y
+    inscrire. `!r`, employé en prose depuis BUG-005, borne la même classe PLUS
+    les séparateurs d'espace : `repr` échappe U+00A0, `_rendered` non. C'est le
+    seul écart entre les deux conversions, il est dans le sens du sur-refus, et
+    il est déclaré § « ce que le lot ne ferme pas ».
+
+    Ce qu'il ajoute à `!r`, et la seule raison de son existence : il ne cite
+    QUE s'il y a lieu. `!r` convient au titre serti dans une phrase — les
+    guillemets y délimitent la valeur, et cette délimitation est ce qui borne
+    un titre imitant un message du programme. Elle n'apporte rien là où la
+    position délimite déjà : une colonne alignée, un identifiant entre
+    parenthèses, une ligne destinée à un tube (`uuid`). Y citer
+    inconditionnellement coûterait la lisibilité des commandes de lecture, les
+    plus utilisées — et refuser une classe qui passe est un défaut au même
+    titre que laisser passer une classe qui casse.
+
+    Le partage est donc : `!r` en prose, `_rendered` en position délimitée.
+    Les deux bornent la même classe ; le balayage de
+    `tests/test_untrusted_rendering.py` les tient pour équivalents.
+    """
+    text = value if isinstance(value, str) else str(value)
+    return repr(text) if _refuses(text) else text
+
+
 def decode_things_date(v: int | None) -> str | None:
     """startDate / deadline : entier bit-packé, constaté sur le schéma réel.
 
@@ -693,7 +756,7 @@ def _status_gap(observed: int | None, expected: int) -> str | None:
     if observed == expected:
         return None
     label = ("(ligne absente)" if observed is None
-             else STATUS_LABELS.get(observed, observed))
+             else _rendered(STATUS_LABELS.get(observed, observed)))
     return (f"statut constaté en base = {label}, attendu "
             f"{STATUS_LABELS.get(expected, expected)!r}")
 
@@ -740,7 +803,7 @@ def cmd_areas(a) -> int:
     rows = q("select uuid, title from TMArea order by title")
     out = [{"uuid": u, "title": t} for u, t in rows]
     print(json.dumps(out, ensure_ascii=False, indent=1) if a.json
-          else "\n".join(f"{u}  {t}" for u, t in rows))
+          else "\n".join(f"{_rendered(u)}  {_rendered(t)}" for u, t in rows))
     return 0
 
 
@@ -755,7 +818,8 @@ def cmd_projects(a) -> int:
     rows = q(sql + " order by ar.title, p.title", args)
     out = [{"uuid": u, "title": t, "area": ar} for u, t, ar in rows]
     print(json.dumps(out, ensure_ascii=False, indent=1) if a.json
-          else "\n".join(f"{u}  {ar or '(sans area)':<38}  {t}" for u, t, ar in rows))
+          else "\n".join(f"{_rendered(u)}  {_rendered(ar or '(sans area)'):<38}  "
+                          f"{_rendered(t)}" for u, t, ar in rows))
     return 0
 
 
@@ -770,7 +834,8 @@ def cmd_headings(a) -> int:
     rows = q(sql + " order by p.title, h.title", args)
     out = [{"uuid": u, "title": t, "project": p} for u, t, p in rows]
     print(json.dumps(out, ensure_ascii=False, indent=1) if a.json
-          else "\n".join(f"{u}  {p:<38}  {t}" for u, t, p in rows))
+          else "\n".join(f"{_rendered(u)}  {_rendered(p):<38}  {_rendered(t)}"
+                          for u, t, p in rows))
     return 0
 
 
@@ -819,16 +884,19 @@ def cmd_tasks(a) -> int:
         for o in out:
             marks = []
             if o["when"]:
-                marks.append(o["when"] + (f"@{o['alarm']}" if o["alarm"] else ""))
+                marks.append(_rendered(o["when"])
+                             + (f"@{_rendered(o['alarm'])}" if o["alarm"] else ""))
             elif o["list"] in ("someday", "inbox"):
-                marks.append(o["list"])
+                marks.append(_rendered(o["list"]))
             if o["deadline"]:
-                marks.append(f"⏰{o['deadline']}")
+                marks.append(f"⏰{_rendered(o['deadline'])}")
             if o["status"] != "open":
-                marks.append(o["status"])
+                marks.append(_rendered(o["status"]))
             suffix = f"  [{' '.join(marks)}]" if marks else ""
-            print(f"{o['uuid']}  {(o['project'] or o['area'] or 'Inbox'):<34}  "
-                  f"{(o['heading'] or ''):<26}  {o['title'][:60]}{suffix}")
+            print(f"{_rendered(o['uuid'])}  "
+                  f"{_rendered(o['project'] or o['area'] or 'Inbox'):<34}  "
+                  f"{_rendered(o['heading'] or ''):<26}  "
+                  f"{_rendered(o['title'][:60])}{suffix}")
     print(f"\n{len(rows)} tâche(s)", file=sys.stderr)
     return 0
 
@@ -847,16 +915,17 @@ def resolve_uuid(kind: str, title: str) -> str | None:
     if not rows:
         return None
     if len(rows) > 1:
-        print(f"AMBIGU : {len(rows)} objets '{kind}' nommés {title!r}", file=sys.stderr)
+        print(f"AMBIGU : {len(rows)} objets {kind!r} nommés {title!r}",
+              file=sys.stderr)
     return rows[0][0]
 
 
 def cmd_uuid(a) -> int:
     u = resolve_uuid(a.type, a.title)
     if not u:
-        print(f"introuvable : {a.type} {a.title!r}", file=sys.stderr)
+        print(f"introuvable : {a.type!r} {a.title!r}", file=sys.stderr)
         return 1
-    print(u)
+    print(_rendered(u))
     return 0
 
 
@@ -912,7 +981,8 @@ def cmd_agenda(a) -> int:
     else:
         for o in out:
             mark = "⏰" if o["has_deadline"] else ("•" if o["today"] else " ")
-            print(f"{mark} {o['where'][:30]:<32} {o['title'][:64]}")
+            print(f"{mark} {_rendered(o['where'][:30]):<32} "
+                  f"{_rendered(o['title'][:64])}")
         print(f"\n{len(out)} actionnable(s)", file=sys.stderr)
     return 0
 
@@ -1008,9 +1078,9 @@ def cmd_find_task(a) -> int:
 def cmd_deeplink(a) -> int:
     u = resolve_uuid(a.type, a.title)
     if not u:
-        print(f"introuvable : {a.type} {a.title!r}", file=sys.stderr)
+        print(f"introuvable : {a.type!r} {a.title!r}", file=sys.stderr)
         return 1
-    print(f"things:///show?id={u}")
+    print(f"things:///show?id={_rendered(u)}")
     return 0
 
 
@@ -1019,15 +1089,15 @@ def cmd_deeplink(a) -> int:
 # ---------------------------------------------------------------------------
 def cmd_create_area(a) -> int:
     if resolve_uuid("area", a.name):
-        print(f"existe déjà : {a.name}")
+        print(f"existe déjà : {a.name!r}")
         return 0
     ensure_running()
     rc, out = osa(f'tell application "Things3" to make new area '
                   f'with properties {{name:"{_esc(a.name)}"}}')
     if not wait_for_effect(lambda: resolve_uuid("area", a.name)):
-        print(f"ÉCHEC création area {a.name!r} : {out}", file=sys.stderr)
+        print(f"ÉCHEC création area {a.name!r} : {out!r}", file=sys.stderr)
         return 1
-    print(f"area créée : {a.name}")
+    print(f"area créée : {a.name!r}")
     return 0
 
 
@@ -1047,7 +1117,7 @@ def cmd_create_project(a) -> int:
     if not wait_for_effect(lambda: resolve_uuid("project", a.title)):
         print(f"ÉCHEC création projet {a.title!r}", file=sys.stderr)
         return 1
-    print(f"projet créé : {a.title} (area {a.area}, "
+    print(f"projet créé : {a.title!r} (area {a.area!r}, "
           f"{len(a.heading or [])} heading(s))")
     return 0
 
@@ -1117,7 +1187,8 @@ def cmd_add_task(a) -> int:
         status_rows = q("select status from TMTask where uuid=? and type=?",
                         (target_id, TYPE_PROJECT))
         if status_rows and status_rows[0][0] != STATUS_OPEN:
-            label = STATUS_LABELS.get(status_rows[0][0], status_rows[0][0])
+            label = _rendered(STATUS_LABELS.get(status_rows[0][0],
+                                              status_rows[0][0]))
             target_note = f" — le projet visé est {label}"
 
     # Relevé AVANT l'écriture : ce qui portait déjà ce titre ne pourra pas
@@ -1430,26 +1501,26 @@ def _interpret_ui_outcome(rc: int, out: str) -> tuple[bool, str]:
         return False, (
             "Things3 n'est pas passé au premier plan dans le délai imparti — "
             "rien n'a été cliqué ni tapé, aucun titre n'a pu partir dans une "
-            f"autre application ({out})"
+            f"autre application ({out!r})"
         )
     if _LOST_FOCUS_MARKER in out:
         return False, (
             "Things3 a perdu le premier plan entre le clic de menu et la "
             "frappe — rien n'a été tapé, mais le clic, lui, a eu lieu : un "
             "en-tête SANS TITRE a pu être créé dans le projet visé, à "
-            f"supprimer à la main le cas échéant ({out})"
+            f"supprimer à la main le cas échéant ({out!r})"
         )
     if _NO_WINDOW_MARKER in out:
         return False, (
             "aucune fenêtre lisible dans Things3 au moment du contrôle — le "
             "nom de la liste affichée n'a pas pu être lu, donc rien ne "
-            f"garantissait la cible : rien n'a été cliqué ni tapé ({out})"
+            f"garantissait la cible : rien n'a été cliqué ni tapé ({out!r})"
         )
     if _WRONG_VIEW_MARKER in out:
         return False, (
             "la fenêtre au premier plan n'affichait pas le projet visé au "
             "moment du clic — rien n'a été cliqué ni tapé, aucun en-tête n'a "
-            f"pu atterrir dans un autre projet ({out})"
+            f"pu atterrir dans un autre projet ({out!r})"
         )
     if _NO_LABEL_MARKER in out:
         return False, (
@@ -1463,7 +1534,8 @@ def _interpret_ui_outcome(rc: int, out: str) -> tuple[bool, str]:
             "Accessibilité à osascript/Terminal dans Réglages Système > "
             "Confidentialité et sécurité > Accessibilité, puis réessayer"
         )
-    return False, f"échec automatisation d'interface non identifié : {out or '(vide)'}"
+    return False, ("échec automatisation d'interface non identifié : "
+                   f"{(out or '(vide)')!r}")
 
 
 def _resolve_project_for_heading(title: str) -> tuple[str | None, str | None]:
@@ -1527,7 +1599,11 @@ def cmd_create_heading(a) -> int:
         return 0
 
     ensure_running()
-    subprocess.run([OPEN, f"things:///show?id={project_uuid}"], check=False)
+    # `project_uuid` est d'origine non contrôlée et l'argv de ce fils est
+    # émis sur NOTRE terminal (stdio hérité). Même neutralisation que
+    # `url_open`, qui encode déjà son payload.
+    subprocess.run([OPEN, "things:///show?id=" + urllib.parse.quote(project_uuid)],
+                   check=False)
 
     seen = {"probe": None}
 
@@ -1544,7 +1620,7 @@ def cmd_create_heading(a) -> int:
               f"plan n'affiche toujours pas le projet {a.project!r} après "
               f"{HEADING_VIEW_TIMEOUT:g} s — rien n'a été cliqué ni tapé, "
               "aucun en-tête n'a pu atterrir dans un autre projet. Dernière "
-              f"observation : {seen['probe'] or '(aucune)'}", file=sys.stderr)
+              f"observation : {(seen['probe'] or '(aucune)')!r}", file=sys.stderr)
         return 1
 
     rc, out = osa(_build_heading_script(a.title, a.project))
@@ -1594,7 +1670,7 @@ def _resolve_task_for_notes(a, action_suffix: str) -> tuple[str | None, str | No
     title, trashed = rows[0]
     if trashed:
         return None, None, (
-            f"à la Corbeille Things : {title} ({task_id}) — la restaurer "
+            f"à la Corbeille Things : {title!r} ({_rendered(task_id)}) — la restaurer "
             f"('Put Back') avant d'y écrire des notes : un objet jeté n'affiche "
             f"rien dans l'application et disparaît au vidage de la corbeille. "
             f"{action_suffix}")
@@ -1641,17 +1717,17 @@ def _resolve_project_for_notes(a, action_suffix: str) -> tuple[str | None, str |
     title, kind, trashed = rows[0]
     if kind == TYPE_HEADING:
         return None, None, (
-            f"heading (initiative) : {title} ({project_id}) — un heading Things "
+            f"heading (initiative) : {title!r} ({_rendered(project_id)}) — un heading Things "
             f"n'a pas de notes exploitables. Mesuré : l'AppleScript accepte "
             f"l'ordre et retourne 0, mais la valeur n'est ni relue ni stockée. "
             f"Rien n'est envoyé à l'application. {action_suffix}")
     if kind != TYPE_PROJECT:
         return None, None, (
-            f"n'est pas un projet : {title} ({project_id}, type={kind}) — pour "
+            f"n'est pas un projet : {title!r} ({_rendered(project_id)}, type={_rendered(kind)}) — pour "
             f"une tâche, utiliser --task-id. {action_suffix}")
     if trashed:
         return None, None, (
-            f"à la Corbeille Things : {title} ({project_id}) — le restaurer "
+            f"à la Corbeille Things : {title!r} ({_rendered(project_id)}) — le restaurer "
             f"('Put Back') avant d'y écrire des notes : un objet jeté n'affiche "
             f"rien dans l'application et disparaît au vidage de la corbeille. "
             f"{action_suffix}")
@@ -1694,20 +1770,20 @@ def _write_task_notes(task_id: str, title: str, notes: str, kind: str = "tâche"
     seen: dict[str, str | None] = {"gap": None}
 
     def _notes_settled() -> bool:
-        observed = _read_task_notes(task_id)
-        seen["gap"] = None if observed == notes else (
-            f"la valeur relue en base ({len(observed)} caractères) diffère de "
+        current = _read_task_notes(task_id)
+        seen["gap"] = None if current == notes else (
+            f"la valeur relue en base ({len(current)} caractères) diffère de "
             f"celle demandée ({len(notes)} caractères)")
         return seen["gap"] is None
 
     if not wait_for_effect(_notes_settled):
         observed = seen["gap"] or _NO_OBSERVATION
-        print(f"ÉCHEC écriture des notes sur {title!r} ({task_id}) : {observed} "
-              f"— code retour = échec, pas 'commande envoyée'. {out}",
+        print(f"ÉCHEC écriture des notes sur {title!r} ({_rendered(task_id)}) : {observed} "
+              f"— code retour = échec, pas 'commande envoyée'. {out!r}",
               file=sys.stderr)
         return 1
     print(f"notes posées sur {'le' if kind == 'projet' else 'la'} {kind} : "
-          f"{title} ({task_id})")
+          f"{title!r} ({_rendered(task_id)})")
     return 0
 
 
@@ -1736,9 +1812,9 @@ def cmd_set_notes(a) -> int:
         return bool(rows) and (rows[0][0] or "") == a.notes
 
     if not wait_for_effect(_notes_landed):
-        print(f"ÉCHEC écriture des notes sur {a.project!r} : {out}", file=sys.stderr)
+        print(f"ÉCHEC écriture des notes sur {a.project!r} : {out!r}", file=sys.stderr)
         return 1
-    print(f"notes posées sur : {a.project}")
+    print(f"notes posées sur : {a.project!r}")
     return 0
 
 
@@ -1750,7 +1826,7 @@ def cmd_append_notes(a) -> int:
             return 1
         cur = _read_task_notes(pid)
         if a.line in cur:
-            print(f"déjà présent, rien à faire : {title} ({pid})")
+            print(f"déjà présent, rien à faire : {title!r} ({_rendered(pid)})")
             return 0
         # Concaténation, jamais réécriture — cf. cmd_append_notes sur --task.
         return _write_task_notes(pid, title, cur + ("\n" if cur else "") + a.line,
@@ -1763,7 +1839,7 @@ def cmd_append_notes(a) -> int:
             return 1
         cur = _read_task_notes(task_id)
         if a.line in cur:
-            print(f"déjà présent, rien à faire : {title} ({task_id})")
+            print(f"déjà présent, rien à faire : {title!r} ({_rendered(task_id)})")
             return 0
         # Concaténation, jamais réécriture : l'existant repart à l'octet près,
         # la ligne s'ajoute derrière. Un append qui écrase serait un défaut
@@ -1778,7 +1854,7 @@ def cmd_append_notes(a) -> int:
         return 1
     cur = rows[0][0] or ""
     if a.line in cur:
-        print(f"déjà présent, rien à faire : {a.project}")
+        print(f"déjà présent, rien à faire : {a.project!r}")
         return 0
     new = (cur + ("\n" if cur else "") + a.line)
     ns = argparse.Namespace(project=a.project, notes=new)
@@ -1853,17 +1929,17 @@ def cmd_complete_task(a) -> int:
     title, status, trashed = rows[0]
 
     if status == STATUS_COMPLETED:
-        print(f"déjà terminée, rien à faire : {title} ({task_id})")
+        print(f"déjà terminée, rien à faire : {title!r} ({_rendered(task_id)})")
         return 0
     if status == STATUS_CANCELED:
-        print(f"tâche annulée, non complétée : {title} ({task_id}) — 'canceled' "
+        print(f"tâche annulée, non complétée : {title!r} ({_rendered(task_id)}) — 'canceled' "
               "et 'completed' sont deux états distincts ; la basculer "
               "réécrirait une décision d'abandon prise dans l'application. "
               "Pour rouvrir une tâche fermée par erreur : reopen-task.",
               file=sys.stderr)
         return 1
     if trashed:
-        print(f"à la Corbeille Things : {title} ({task_id}) — la restaurer "
+        print(f"à la Corbeille Things : {title!r} ({_rendered(task_id)}) — la restaurer "
               "('Put Back') avant de la terminer, aucune complétion effectuée",
               file=sys.stderr)
         return 1
@@ -1879,11 +1955,11 @@ def cmd_complete_task(a) -> int:
 
     if not wait_for_effect(_completed):
         observed = seen["gap"] or _NO_OBSERVATION
-        print(f"ÉCHEC complétion tâche {title!r} ({task_id}) : {observed} — "
-              f"code retour = échec, pas 'commande envoyée'. {out}",
+        print(f"ÉCHEC complétion tâche {title!r} ({_rendered(task_id)}) : {observed} — "
+              f"code retour = échec, pas 'commande envoyée'. {out!r}",
               file=sys.stderr)
         return 1
-    print(f"tâche terminée : {title} ({task_id})")
+    print(f"tâche terminée : {title!r} ({_rendered(task_id)})")
     return 0
 
 
@@ -1939,7 +2015,7 @@ def cmd_rename_task(a) -> int:
         return 1
     title, trashed = rows[0]
     if trashed:
-        print(f"à la Corbeille Things : {title} ({task_id}) — la restaurer "
+        print(f"à la Corbeille Things : {title!r} ({_rendered(task_id)}) — la restaurer "
               "('Put Back') avant de la renommer, aucun renommage effectué",
               file=sys.stderr)
         return 1
@@ -1963,11 +2039,11 @@ def cmd_rename_task(a) -> int:
 
     if not wait_for_effect(_renamed):
         observed = seen["gap"] or _NO_OBSERVATION
-        print(f"ÉCHEC renommage tâche {title!r} ({task_id}) : {observed} — "
-              f"code retour = échec, pas 'commande envoyée'. {out}",
+        print(f"ÉCHEC renommage tâche {title!r} ({_rendered(task_id)}) : {observed} — "
+              f"code retour = échec, pas 'commande envoyée'. {out!r}",
               file=sys.stderr)
         return 1
-    print(f"tâche renommée : {title!r} -> {a.new_title!r} ({task_id})")
+    print(f"tâche renommée : {title!r} -> {a.new_title!r} ({_rendered(task_id)})")
     return 0
 
 
@@ -2020,17 +2096,17 @@ def cmd_cancel_task(a) -> int:
     title, status, trashed = rows[0]
 
     if status == STATUS_CANCELED:
-        print(f"déjà annulée, rien à faire : {title} ({task_id})")
+        print(f"déjà annulée, rien à faire : {title!r} ({_rendered(task_id)})")
         return 0
     if status == STATUS_COMPLETED:
-        print(f"tâche terminée, non annulée : {title} ({task_id}) — 'completed' "
+        print(f"tâche terminée, non annulée : {title!r} ({_rendered(task_id)}) — 'completed' "
               "et 'canceled' sont deux états distincts ; la basculer "
               "réécrirait un fait déjà acquis (le travail a été fait). "
               "Pour rouvrir une tâche fermée par erreur : reopen-task.",
               file=sys.stderr)
         return 1
     if trashed:
-        print(f"à la Corbeille Things : {title} ({task_id}) — la restaurer "
+        print(f"à la Corbeille Things : {title!r} ({_rendered(task_id)}) — la restaurer "
               "('Put Back') avant de l'annuler, aucune annulation effectuée",
               file=sys.stderr)
         return 1
@@ -2046,11 +2122,11 @@ def cmd_cancel_task(a) -> int:
 
     if not wait_for_effect(_canceled):
         observed = seen["gap"] or _NO_OBSERVATION
-        print(f"ÉCHEC annulation tâche {title!r} ({task_id}) : {observed} — "
-              f"code retour = échec, pas 'commande envoyée'. {out}",
+        print(f"ÉCHEC annulation tâche {title!r} ({_rendered(task_id)}) : {observed} — "
+              f"code retour = échec, pas 'commande envoyée'. {out!r}",
               file=sys.stderr)
         return 1
-    print(f"tâche annulée : {title} ({task_id})")
+    print(f"tâche annulée : {title!r} ({_rendered(task_id)})")
     return 0
 
 
@@ -2098,10 +2174,10 @@ def cmd_reopen_task(a) -> int:
     title, status, trashed = rows[0]
 
     if status == STATUS_OPEN:
-        print(f"déjà ouverte, rien à faire : {title} ({task_id})")
+        print(f"déjà ouverte, rien à faire : {title!r} ({_rendered(task_id)})")
         return 0
     if trashed:
-        print(f"à la Corbeille Things : {title} ({task_id}) — la restaurer "
+        print(f"à la Corbeille Things : {title!r} ({_rendered(task_id)}) — la restaurer "
               "('Put Back') avant de la rouvrir, aucune réouverture effectuée",
               file=sys.stderr)
         return 1
@@ -2123,11 +2199,11 @@ def cmd_reopen_task(a) -> int:
 
     if not wait_for_effect(_reopened):
         observed = seen["gap"] or _NO_OBSERVATION
-        print(f"ÉCHEC réouverture tâche {title!r} ({task_id}) : {observed} — "
-              f"code retour = échec, pas 'commande envoyée'. {out}",
+        print(f"ÉCHEC réouverture tâche {title!r} ({_rendered(task_id)}) : {observed} — "
+              f"code retour = échec, pas 'commande envoyée'. {out!r}",
               file=sys.stderr)
         return 1
-    print(f"tâche rouverte : {title} ({task_id})")
+    print(f"tâche rouverte : {title!r} ({_rendered(task_id)})")
     return 0
 
 
@@ -2208,7 +2284,7 @@ def _parse_when(value: str) -> tuple[tuple[str, str | None] | None, str | None]:
     try:
         day = dt.date.fromisoformat(value)
     except ValueError as exc:
-        return None, f"--when {value!r} n'est pas une date valide : {exc}"
+        return None, f"--when {value!r} n'est pas une date valide : {_rendered(exc)}"
     if day == dt.date.today():
         # `schedule` pour la date du jour donne « À venir », pas « Aujourd'hui ».
         return ("today", day.isoformat()), None
@@ -2222,7 +2298,7 @@ def _parse_deadline(value: str) -> tuple[str | None, str | None]:
     try:
         return dt.date.fromisoformat(value).isoformat(), None
     except ValueError as exc:
-        return None, f"--deadline {value!r} n'est pas une date valide : {exc}"
+        return None, f"--deadline {value!r} n'est pas une date valide : {_rendered(exc)}"
 
 
 def _applescript_date_lines(var: str, iso: str) -> str:
@@ -2302,7 +2378,7 @@ def _interpret_reschedule_outcome(rc: int, out: str) -> tuple[bool, str]:
             "aucun libellé de liste connu n'existe dans ce Things — les listes "
             "intégrées sont localisées et l'interface est peut-être dans une "
             "langue non couverte")
-    return False, f"échec AppleScript : {out or '(vide)'}"
+    return False, f"échec AppleScript : {(out or '(vide)')!r}"
 
 
 def _observed_schedule(task_id: str) -> tuple[int | None, str | None, str | None]:
@@ -2384,13 +2460,13 @@ def cmd_reschedule_task(a) -> int:
     title, status, trashed = rows[0]
 
     if trashed:
-        print(f"à la Corbeille Things : {title} ({task_id}) — la restaurer "
+        print(f"à la Corbeille Things : {title!r} ({_rendered(task_id)}) — la restaurer "
               "('Put Back') avant de la replanifier : un objet jeté n'apparaît "
               "dans aucune liste et disparaît au vidage de la corbeille. "
               "Aucune replanification effectuée.", file=sys.stderr)
         return 1
     if status in (STATUS_COMPLETED, STATUS_CANCELED):
-        print(f"tâche {STATUS_LABELS.get(status, status)} : {title} ({task_id}) "
+        print(f"tâche {_rendered(STATUS_LABELS.get(status, status))} : {title!r} ({_rendered(task_id)}) "
               "— replanifier poserait une date sur un objet qui n'apparaît dans "
               "aucune liste de planification (mesuré : l'AppleScript accepte "
               "l'ordre, pose la date et laisse le statut inchangé). La rouvrir "
@@ -2404,7 +2480,7 @@ def cmd_reschedule_task(a) -> int:
                                            bool(a.clear_deadline)))
     ok, msg = _interpret_reschedule_outcome(rc, out)
     if not ok:
-        print(f"ÉCHEC replanification {title!r} ({task_id}) : {msg}", file=sys.stderr)
+        print(f"ÉCHEC replanification {title!r} ({_rendered(task_id)}) : {msg}", file=sys.stderr)
         return 1
 
     # La vérification est INCHANGÉE — elle est seulement nommée, pour servir à
@@ -2423,14 +2499,17 @@ def cmd_reschedule_task(a) -> int:
             }[kind]
             if (obs_start, obs_when) != expected:
                 problems.append(
-                    f"when : attendu (start={expected[0]}, {expected[1] or 'sans date'}) "
-                    f"soit « {scheduling_list(*expected[:1], None) or ''} », constaté "
-                    f"(start={obs_start}, {obs_when or 'sans date'})")
+                    f"when : attendu (start={_rendered(expected[0])}, "
+                    f"{_rendered(expected[1] or 'sans date')}) soit "
+                    f"« {_rendered(scheduling_list(*expected[:1], None) or '')} », "
+                    f"constaté (start={_rendered(obs_start)}, "
+                    f"{_rendered(obs_when or 'sans date')})")
         if deadline is not None and obs_deadline != deadline:
-            problems.append(f"deadline : attendue {deadline}, constatée "
-                            f"{obs_deadline or '(aucune)'}")
+            problems.append(f"deadline : attendue {_rendered(deadline)}, constatée "
+                            f"{_rendered(obs_deadline or '(aucune)')}")
         if a.clear_deadline and obs_deadline is not None:
-            problems.append(f"deadline : attendue absente, constatée {obs_deadline}")
+            problems.append("deadline : attendue absente, constatée "
+                            f"{_rendered(obs_deadline)}")
         return problems
 
     # Même forme que `cmd_move_task`, moins visible : un second appel rendrait
@@ -2445,19 +2524,19 @@ def cmd_reschedule_task(a) -> int:
 
     if not wait_for_effect(_schedule_settled):
         problems = " ; ".join(seen["problems"]) or _NO_OBSERVATION
-        print(f"ÉCHEC replanification {title!r} ({task_id}) — code retour = "
-              f"échec, pas 'commande envoyée' : {problems}. {out}",
+        print(f"ÉCHEC replanification {title!r} ({_rendered(task_id)}) — code retour = "
+              f"échec, pas 'commande envoyée' : {problems}. {out!r}",
               file=sys.stderr)
         return 1
 
     done = []
     if when is not None:
-        done.append(f"when → {when[1] or when[0]}")
+        done.append(f"when → {_rendered(when[1] or when[0])}")
     if deadline is not None:
-        done.append(f"deadline → {deadline}")
+        done.append(f"deadline → {_rendered(deadline)}")
     if a.clear_deadline:
         done.append("deadline retirée")
-    print(f"tâche replanifiée : {title} ({task_id}) — {', '.join(done)}")
+    print(f"tâche replanifiée : {title!r} ({_rendered(task_id)}) — {', '.join(done)}")
     return 0
 
 
@@ -2568,7 +2647,7 @@ def cmd_move_task(a) -> int:
         return 1
     title, trashed = rows[0]
     if trashed:
-        print(f"à la Corbeille Things : {title} ({task_id}) — la restaurer "
+        print(f"à la Corbeille Things : {title!r} ({_rendered(task_id)}) — la restaurer "
               f"('Put Back') avant de la déplacer : un objet jeté n'apparaît "
               f"dans aucune liste et disparaît au vidage. {action_suffix}",
               file=sys.stderr)
@@ -2632,12 +2711,12 @@ def cmd_move_task(a) -> int:
 
     if not wait_for_effect(_move_settled):
         observed = seen["problem"] or _NO_OBSERVATION
-        print(f"ÉCHEC déplacement {title!r} ({task_id}) : {observed} — "
-              f"code retour = échec, pas 'commande envoyée'. {out}",
+        print(f"ÉCHEC déplacement {title!r} ({_rendered(task_id)}) : {observed} — "
+              f"code retour = échec, pas 'commande envoyée'. {out!r}",
               file=sys.stderr)
         return 1
 
-    print(f"tâche déplacée : {title} ({task_id}) → {target_kind} "
+    print(f"tâche déplacée : {title!r} ({_rendered(task_id)}) → {target_kind} "
           f"{target_label!r}")
     return 0
 
@@ -2683,10 +2762,11 @@ def _resolve_project_target(a, action_suffix: str) -> tuple[str | None, str | No
                                 f"tenté sur une cible non résolue.")
         title, kind, trashed = rows[0]
         if kind != TYPE_PROJECT:
-            kind_label = {TYPE_TASK: "une tâche", TYPE_HEADING: "un heading"}.get(
-                kind, f"type={kind}")
-            return None, None, (f"n'est pas un projet : {title} "
-                                f"({project_id}) est {kind_label} — "
+            kind_label = _rendered(
+                {TYPE_TASK: "une tâche", TYPE_HEADING: "un heading"}.get(
+                    kind, f"type={_rendered(kind)}"))
+            return None, None, (f"n'est pas un projet : {title!r} "
+                                f"({_rendered(project_id)}) est {kind_label} — "
                                 f"move-project ne déplace que des projets. "
                                 f"{action_suffix}")
     else:
@@ -2704,7 +2784,7 @@ def _resolve_project_target(a, action_suffix: str) -> tuple[str | None, str | No
         title, trashed = title2[0]
 
     if trashed:
-        return None, None, (f"à la Corbeille Things : {title} ({project_id}) — "
+        return None, None, (f"à la Corbeille Things : {title!r} ({_rendered(project_id)}) — "
                             f"le restaurer ('Put Back') avant de le déplacer : "
                             f"un objet jeté n'apparaît dans aucune liste et "
                             f"disparaît au vidage. {action_suffix}")
@@ -2757,8 +2837,8 @@ def cmd_move_project(a) -> int:
     current = q("select area from TMTask where uuid=? and type=?",
                 (project_id, TYPE_PROJECT))
     if current and current[0][0] == target_id:
-        print(f"déjà dans l'area {area_title!r}, rien à faire : {title} "
-              f"({project_id})")
+        print(f"déjà dans l'area {area_title!r}, rien à faire : {title!r} "
+              f"({_rendered(project_id)})")
         return 0
 
     script = (f'tell application "Things3" to set area of to do id '
@@ -2799,12 +2879,12 @@ def cmd_move_project(a) -> int:
 
     if not wait_for_effect(_placed):
         observed = seen["problem"] or _NO_OBSERVATION
-        print(f"ÉCHEC déplacement {title!r} ({project_id}) : {observed} — "
-              f"code retour = échec, pas 'commande envoyée'. {out}",
+        print(f"ÉCHEC déplacement {title!r} ({_rendered(project_id)}) : {observed} — "
+              f"code retour = échec, pas 'commande envoyée'. {out!r}",
               file=sys.stderr)
         return 1
 
-    print(f"projet déplacé : {title} ({project_id}) → area {area_title!r}")
+    print(f"projet déplacé : {title!r} ({_rendered(project_id)}) → area {area_title!r}")
     return 0
 
 
@@ -2840,7 +2920,7 @@ def cmd_delete_task(a) -> int:
         return 1
     title, trashed = rows[0]
     if trashed:
-        print(f"déjà à la Corbeille Things : {title} ({task_id})")
+        print(f"déjà à la Corbeille Things : {title!r} ({_rendered(task_id)})")
         return 0
 
     ensure_running()
@@ -2851,15 +2931,65 @@ def cmd_delete_task(a) -> int:
         return bool(rows) and rows[0][0] == 1
 
     if not wait_for_effect(_trashed):
-        print(f"ÉCHEC suppression tâche {title!r} ({task_id}) : {out}", file=sys.stderr)
+        print(f"ÉCHEC suppression tâche {title!r} ({_rendered(task_id)}) : {out!r}", file=sys.stderr)
         return 1
     print(f"tâche déplacée vers la Corbeille Things (récupérable, pas de destruction "
-          f"définitive) : {title} ({task_id})")
+          f"définitive) : {title!r} ({_rendered(task_id)})")
     return 0
 
 
+class _BoundedParser(argparse.ArgumentParser):
+    """`argparse` émet HORS de ce module — et le balayage est intra-module.
+
+    Le prédicat de la zone sensible n° 1 porte sur la valeur et son trajet,
+    pas sur le site d'affichage : c'est ce qui lui permet de suivre un
+    fragment composé ailleurs. Il a une frontière, et c'est celle du module.
+    `ArgumentParser.error` compose son message dans `argparse`, à partir
+    d'`sys.argv`, AVANT que la valeur n'existe comme namespace — aucune des
+    cinq racines ne l'atteint, et aucun balayage de `bin/thingskit` ne le
+    verrait.
+
+    Sur les sept gabarits de message d'`argparse` 3.12.9 qui portent une
+    valeur de la ligne de commande, un seul est brut ET atteignable :
+    `unrecognized arguments: %s`. Reproduit le 2026-08-26 — un titre
+    commençant par un tiret, forme banale d'un compte rendu importé, fait
+    basculer `parse_args` sur ce chemin, et `\x1b[2K\r` y sort intact : le
+    terminal efface la ligne d'erreur, l'utilisateur lit un faux succès, le
+    code retour est 2 et personne ne le regarde. Deux autres gabarits sont
+    bruts par construction — `ambiguous option` et `unexpected option
+    string` — mais leur valeur doit être un préfixe d'option déclarée : elle
+    ne peut porter aucun caractère de la classe refusée. Les quatre derniers
+    convertissent par `%r` ou ne portent que du texte du programme.
+
+    La borne est donc posée là où le message repasse par nous : `error` et
+    `exit`. Elle ne touche NI l'usage NI l'aide, qui sont du texte du
+    programme — vérifié par
+    `test_the_bound_leaves_the_parser_own_help_untouched`.
+
+    Ce qu'elle ne couvre pas : `print_usage` et `print_help` appelés
+    directement, qui n'émettent que du texte du programme. Et l'énumération
+    ci-dessus vaut pour 3.12.9 — une autre version pourrait rendre brut un
+    gabarit aujourd'hui converti. La borne, elle, n'en dépend pas : elle
+    s'applique au message quel qu'il soit, c'est le point de la poser au
+    passage plutôt que sur un gabarit nommé.
+    """
+
+    @staticmethod
+    def _bounded_message(message):
+        if not message:
+            return message
+        corps = message.rstrip("\n")
+        return _bounded(corps) + message[len(corps):]
+
+    def error(self, message):
+        super().error(self._bounded_message(message))
+
+    def exit(self, status=0, message=None):
+        super().exit(status, self._bounded_message(message))
+
+
 def main() -> int:
-    p = argparse.ArgumentParser(prog="thingskit", description=__doc__,
+    p = _BoundedParser(prog="thingskit", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
