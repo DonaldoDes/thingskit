@@ -684,8 +684,23 @@ def url_open(payload: list, background: bool = True,
 
     `auth_token` n'est requis que par les opérations `update` du schéma d'URL
     (mesuré le 2026-08-27 : une `update` sans jeton est un NO-OP SILENCIEUX et
-    `open` rend malgré tout 0). Il est passé en PARAMÈTRE et jamais imprimé :
-    aucune branche, de succès comme d'échec, ne cite l'URL construite ici.
+    `open` rend malgré tout 0). C'est un SECRET.
+
+    **Cette fonction a porté une affirmation fausse, et il faut la lire pour
+    savoir ce qu'elle garde vraiment.** Elle disait « aucune branche, de succès
+    comme d'échec, ne cite l'URL construite ici » — vrai des branches Python,
+    faux de l'effet observable. `subprocess.run(argv, check=False)` sans
+    capture laisse le fils hériter des descripteurs 1 et 2, et `open` imprime
+    l'URL entière, jeton compris, quand LaunchServices ne résout pas le
+    schéma. Une affirmation d'établissement qui survit à sa réfutation est
+    pire que son absence.
+
+    Ce qui est vrai APRÈS correction, et mesuré : la sortie du processus fils
+    est capturée sur TOUS les chemins, avec ou sans jeton ; sur échec, seul le
+    CODE RETOUR est cité, jamais l'URL ni la sortie brute. Gardé par
+    `tests/test_url_scheme_token.py`, qui exerce le vrai `subprocess.run`
+    contre un `open` jetable et lit les DESCRIPTEURS — un test qui remplace la
+    frontière qu'il prétend garder ne garde rien.
     """
     params = []
     if auth_token:
@@ -694,7 +709,30 @@ def url_open(payload: list, background: bool = True,
         json.dumps(payload, ensure_ascii=False)))
     url = "things:///json?" + "&".join(params)
     argv = [OPEN] + (["-g"] if background else []) + [url]
-    subprocess.run(argv, check=False)
+    # La sortie du fils est CAPTURÉE, toujours. Sans capture il hérite des
+    # descripteurs 1 et 2 du parent, et `open` imprime l'URL COMPLÈTE — jeton
+    # compris — sur son stderr quand LaunchServices ne résout pas le schéma
+    # (mesuré le 2026-08-27 avec un `open` substitué). La branche est
+    # atteignable en usage nominal : `ensure_running()` ne s'arrête pas quand
+    # l'application ne démarre pas. La capture porte sur la CLASSE — la sortie
+    # d'un fils qui s'échappe — et non sur la seule invocation qui porte le
+    # secret : une URL sans jeton porte quand même les titres de l'utilisateur.
+    r = subprocess.run(argv, check=False, capture_output=True, text=True)
+    if r.returncode != 0:
+        # Capturer sans rien dire changerait un défaut visible en défaut muet.
+        # Le code retour suffit à diagnostiquer ; la sortie brute, elle, est
+        # RETENUE parce qu'elle cite l'URL. Rien de ce que le fils a écrit ne
+        # traverse cette ligne.
+        # `_rendered` sur un entier est CÉRÉMONIEL et il reste : le balayage
+        # d'AST juge le TRAJET d'une valeur, pas son type, et c'est ce qui
+        # lui fait attraper les vrais défauts. Le dispenser ici imposerait une
+        # exception, c'est-à-dire une liste — qui ne couvre que ce qu'on a
+        # pensé à y inscrire. Le prix est nul, la garde reste entière.
+        print(f"schéma d'URL : l'ouverture a échoué (code "
+              f"{_rendered(r.returncode)}) — "
+              "sortie du processus retenue, elle citerait l'URL et donc le "
+              "jeton. L'effet reste tranché par la vérification post-action.",
+              file=sys.stderr)
 
 
 def _uri_scheme_token(action_suffix: str) -> tuple[str | None, str | None]:
@@ -714,7 +752,14 @@ def _uri_scheme_token(action_suffix: str) -> tuple[str | None, str | None]:
     sous sa forme la plus trompeuse, et le seul endroit où il est arrêtable
     est en amont.
 
-    Le jeton est un SECRET : il est rendu à l'appelant, jamais imprimé.
+    Le jeton est un SECRET. Ce que cette fonction garantit, et rien de plus :
+    elle le REND à l'appelant et ne l'imprime pas — son message de refus se
+    compose du contexte, jamais de la valeur lue. La propriété « il ne sort
+    sur aucune sortie » ne se tient PAS ici : elle se tient dans `url_open`,
+    seul endroit où le jeton quitte le processus, et elle y a été fausse
+    jusqu'au 2026-08-27 (le processus fils l'imprimait). Une propriété
+    s'affirme là où elle est tenue, sinon deux endroits se renvoient la
+    responsabilité et personne ne la porte.
     """
     try:
         rows = q("select uriSchemeAuthenticationToken from TMSettings")
@@ -2780,7 +2825,15 @@ def cmd_reschedule_task(a) -> int:
 #     reste. C'est ce qui distingue ce cas de `reschedule-task`, où la même
 #     surface avait été écartée au motif qu'elle « impose à l'utilisateur
 #     d'aller chercher et de stocker un secret » — elle ne l'impose pas.
-#     Le jeton est un secret : il ne sort jamais sur stdout ni stderr.
+#     Le jeton est un secret, et l'affirmation qui tenait cette place —
+#     « il ne sort jamais sur stdout ni stderr » — était FAUSSE : elle
+#     décrivait les branches Python, pas l'effet observable. Le processus
+#     fils lancé par `url_open` héritait des descripteurs 1 et 2 et `open`
+#     imprimait l'URL entière, jeton compris, dès que LaunchServices ne
+#     résolvait pas le schéma. Corrigé le 2026-08-27 : la sortie du fils est
+#     capturée sur tous les chemins et seul le code retour est cité. Ce qui
+#     est vrai désormais est vrai parce que `tests/test_url_scheme_token.py`
+#     l'exerce contre un vrai processus, pas parce que c'est écrit ici.
 #   - SANS jeton, `update` est un NO-OP SILENCIEUX et `open` rend malgré tout
 #     0 — mesuré par CONTRÔLE sur un attribut notoirement supporté (`title`),
 #     pour établir que la sonde atteignait bien la surface qu'elle croyait
@@ -2910,12 +2963,28 @@ def cmd_move_task(a) -> int:
         if err:
             print(err, file=sys.stderr)
             return 1
-        heading_project_id = q("select project from TMTask where uuid=? and "
-                               "type=?", (target_id, TYPE_HEADING))[0][0]
+        # `[0][0]` sur une liste vide tue la commande sur une trace Python au
+        # lieu du refus qu'elle sait composer. La fenêtre est RÉELLE, pas
+        # théorique : l'application écrit dans la base pendant qu'on la lit,
+        # et l'objet peut disparaître entre sa résolution et cette requête.
+        # Les deux fenêtres sont gardées SÉPARÉMENT — elles ne convergent pas.
+        heading_rows = q("select project from TMTask where uuid=? and type=?",
+                         (target_id, TYPE_HEADING))
+        if not heading_rows:
+            print(f"en-tête disparu entre sa résolution et la lecture de son "
+                  f"projet ({_rendered(target_id)}) — {action_suffix}",
+                  file=sys.stderr)
+            return 1
+        heading_project_id = heading_rows[0][0]
         target_kind = "heading"
         target_label = f"{a.to_project} › {to_heading}"
         obs = q("select heading, creationDate from TMTask where uuid=? and "
                 "type=?", (task_id, TYPE_TASK))
+        if not obs:
+            print(f"tâche disparue entre sa vérification et la lecture de son "
+                  f"rattachement ({_rendered(task_id)}) — {action_suffix}",
+                  file=sys.stderr)
+            return 1
         current_heading, created_before = obs[0]
         # Une tâche DÉJÀ sous l'en-tête visé satisfait la vérification
         # post-action AVANT même l'ordre : la relecture ne distingue alors pas

@@ -21,11 +21,25 @@ documentation :
     l'exclusivité d'appartenance à une seule liste. C'est donc la propriété,
     jamais `move`, qui est utilisée ici, adressée par IDENTIFIANT (jamais par
     titre littéral) pour ne dépendre d'aucune localisation de libellé.
-  - Aucune surface (ni `move`, ni propriété) n'expose de `heading` dans le
-    dictionnaire AppleScript de la classe `to do` : la classe `heading`
-    n'existe même pas dans le `sdef`. Le déplacement vers un heading n'est
-    donc PAS couvert par cette commande (US-006 § Spécifications
-    techniques : à ne pas exiger sans preuve de faisabilité).
+  - Aucune surface AppleScript (ni `move`, ni propriété) n'expose de
+    `heading` : la classe `heading` n'existe même pas dans le `sdef`.
+
+Ce fichier couvre AUSSI `--to-heading` (US-010, 2026-08-27), et cette
+phrase remplace celle qui disait le contraire — « le déplacement vers un
+heading n'est donc PAS couvert par cette commande » — restée en place alors
+que le fichier portait déjà une vingtaine de tests dédiés. Un docstring qui
+contredit son propre fichier est pire qu'un docstring absent : il est LU, et
+il envoie chercher ailleurs une couverture qui est là.
+
+Ce que la voie en-tête change, et qui explique la forme des tests ci-dessous :
+elle n'emprunte PAS l'AppleScript mais le schéma d'URL, opération `update`
+— la seule surface qui expose l'affectation d'un en-tête à une tâche
+existante, six formes AppleScript ayant été essayées et refusées (détail dans
+l'en-tête de section de `cmd_move_task`). D'où un jeton d'authentification
+lu en base, un faux `url_open` là où les autres tests posent un faux `osa`,
+et des gardes qui refusent AVANT tout envoi — un `update` sans jeton, comme
+un `heading` qui ne nomme rien, est un no-op silencieux que `open` rend
+malgré tout en 0.
 
 Ces tests ne touchent jamais l'application ni la vraie base : `db_path` est
 redirigée vers une base SQLite jetable, `osa`/`ensure_running`/`time.sleep`
@@ -677,7 +691,8 @@ def test_a_trashed_task_is_refused_before_the_heading_route(thingskit, rigged):
     import sqlite3 as _s
     con = _s.connect(calls["db"])
     con.execute("update TMTask set trashed=1 where uuid=?", (TARGET,))
-    con.commit(); con.close()
+    con.commit()
+    con.close()
     rc = thingskit.cmd_move_task(_ns(id=TARGET, to_project="Projet",
                                      to_heading="Section"))
     assert rc == 1
@@ -849,7 +864,8 @@ def test_the_heading_failure_message_uses_the_observed_problem(
         con = sqlite3.connect(calls["db"])
         con.execute("update TMTask set heading=?, project=null where uuid=?",
                     (HEADING, TARGET))
-        con.commit(); con.close()
+        con.commit()
+        con.close()
         return verdict
 
     monkeypatch.setattr(thingskit, "wait_for_effect", _wait)
@@ -892,7 +908,8 @@ def test_a_task_already_under_the_target_heading_is_a_no_op_without_any_solicita
     con = sqlite3.connect(calls["db"])
     con.execute("update TMTask set heading=?, project=null where uuid=?",
                 (HEADING, TARGET))
-    con.commit(); con.close()
+    con.commit()
+    con.close()
     rc = thingskit.cmd_move_task(_ns(id=TARGET, to_project="Projet",
                                      to_heading="Section"))
     assert rc == 0
@@ -957,3 +974,47 @@ def test_the_heading_route_is_registered_in_cli_help(thingskit, run_cli):
     assert code == 0
     assert "--to-heading" in out
     assert "move-task" in (thingskit.__doc__ or "")
+
+
+# --- fenêtres de course : la base bouge sous nos pieds --------------------
+#
+# Things écrit en continu. Entre deux requêtes, un objet peut disparaître —
+# et `q(…)[0][0]` sur une liste vide tue la commande sur une trace Python au
+# lieu du refus composé qu'elle sait produire. Les deux fenêtres de la voie
+# en-tête sont couvertes séparément : elles ne convergent pas.
+
+def _q_blanking(thingskit, monkeypatch, prefix):
+    """Fait rendre une liste VIDE à la première requête commençant par
+    `prefix`, et seulement à celle-là — la fenêtre de course est ponctuelle."""
+    real_q = thingskit.q
+    state = {"fired": False}
+
+    def _q(sql, args=()):
+        if not state["fired"] and sql.startswith(prefix):
+            state["fired"] = True
+            return []
+        return real_q(sql, args)
+
+    monkeypatch.setattr(thingskit, "q", _q)
+
+
+def test_a_heading_vanishing_before_its_project_is_read_is_a_clean_refusal(
+        thingskit, monkeypatch, rigged, capsys):
+    calls, set_rows = rigged
+    set_rows(_heading_world())
+    _q_blanking(thingskit, monkeypatch, "select project from TMTask")
+    assert thingskit.cmd_move_task(_ns(id=TARGET, to_project="Projet",
+                                       to_heading="Section")) == 1
+    assert calls["osa"] == [] and calls["url"] == []
+    assert "disparu" in capsys.readouterr().err
+
+
+def test_a_task_vanishing_before_its_placement_is_read_is_a_clean_refusal(
+        thingskit, monkeypatch, rigged, capsys):
+    calls, set_rows = rigged
+    set_rows(_heading_world())
+    _q_blanking(thingskit, monkeypatch, "select heading, creationDate")
+    assert thingskit.cmd_move_task(_ns(id=TARGET, to_project="Projet",
+                                       to_heading="Section")) == 1
+    assert calls["osa"] == [] and calls["url"] == []
+    assert "disparue" in capsys.readouterr().err

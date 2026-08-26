@@ -683,6 +683,46 @@ redevient obligatoire.
       .venv/bin/python -m pytest tests/test_move_task.py --collect-only -q | tail -1 -> 51
       .venv/bin/python -m pytest -q -p no:cacheprovider -> 1104 passed, 1 skipped
 
+  Baseline relevée à **1105** le 2026-08-27 avant le lot de review d'US-010,
+  **1120** après. L'écart de 15 se décompose, et chaque terme est mesuré :
+  +12 dans le fichier neuf `tests/test_url_scheme_token.py` (arrivée du jeton
+  dans l'URL, encodage, contre-épreuve du sur-ajout, non-fuite par le
+  PROCESSUS FILS avec et sans jeton, message d'échec qui ne cite pas l'URL,
+  contre-épreuve du sur-bruit, quatre schémas de base dégénérés et leur
+  contre-épreuve, non-citation du nom de colonne dans le refus) ; +2 dans
+  `test_move_task.py` (51 -> 53 : les deux fenêtres de course) ; +1 au
+  contrôle paramétré de `test_annotations_resolve.py`, qui balaie les
+  fichiers de test (36 -> 37, un fichier de plus). Les commandes :
+
+      .venv/bin/python -m pytest --collect-only -q | tail -1 -> 1120 tests collected
+      .venv/bin/python -m pytest tests/test_url_scheme_token.py --collect-only -q | tail -1 -> 12
+      .venv/bin/python -m pytest tests/test_move_task.py --collect-only -q | tail -1 -> 53
+      .venv/bin/python -m pytest tests/test_annotations_resolve.py --collect-only -q | tail -1 -> 37
+      .venv/bin/python -m pytest -q -p no:cacheprovider -> 1119 passed, 1 skipped
+
+  **Ce lot corrige une affirmation, pas seulement un défaut.** `url_open`
+  déclarait qu'« aucune branche, de succès comme d'échec, ne cite l'URL
+  construite ici » — vrai des branches Python, FAUX de l'effet observable :
+  `subprocess.run(argv, check=False)` sans capture laisse le fils hériter des
+  descripteurs 1 et 2, et `open` imprime l'URL entière, jeton d'authentification
+  compris, quand LaunchServices ne résout pas le schéma. Les deux tests de
+  non-fuite qui existaient ne pouvaient pas le voir : ils remplaçaient
+  `url_open` par un faux, donc n'exerçaient jamais le fils. **Un test qui
+  remplace la frontière qu'il prétend garder ne garde rien**, et c'est le seul
+  enseignement de ce lot qui vaille au-delà de lui. La sortie du fils est
+  désormais capturée sur TOUS les chemins — la classe, pas l'instance qui
+  portait le secret — et seul le code retour est cité. Rejeu de la fuite,
+  contre l'état d'avant (`8a0c699`) :
+
+      # un `open` substitué qui recrache son argv, comme le vrai le fait
+      printf '#!/bin/sh\necho "Unable to find application for URL $@" >&2\n' > /tmp/fo
+      chmod +x /tmp/fo   # puis url_open(..., auth_token="SECRET") avec OPEN=/tmp/fo
+      # -> le jeton apparaît en clair sur le stderr du processus
+
+  **13 mutants, 13 rouges, 0 survivant** sur les gardes de la voie en-tête et
+  de la surface URL — c'est l'énumération, pas la relecture, qui avait trouvé
+  les deux survivants du tour précédent.
+
   **L'intégration n'a pas été un simple recollement.** Les deux chantiers se
   croisaient sur un point de fond : ADR-003 fait entrer une valeur d'origine
   externe — le fichier d'identité scellé — dans un message de refus, et la
