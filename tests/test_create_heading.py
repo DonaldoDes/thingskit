@@ -1267,7 +1267,6 @@ def test_a_failing_restore_on_the_success_path_does_not_turn_a_write_into_a_fail
     assert msg != "ok"                          # mais pas silencieux
 
 
-@requires_osascript
 def test_the_bench_leaves_no_live_delay_behind(thingskit):
     """Contre-épreuve du banc lui-même : si le motif de délai cesse de matcher,
     les tests ci-dessus DORMENT la durée réelle au lieu d'échouer. Un banc qui
@@ -1278,6 +1277,7 @@ def test_the_bench_leaves_no_live_delay_behind(thingskit):
     assert re.findall(r"delay [^\n]*", neutralise) == ["delay 0"], neutralise
 
 
+@requires_osascript
 def test_the_nominal_paste_returns_a_plain_ok(thingskit):
     """Contre-épreuve : sans incident, aucun avertissement ne doit apparaître."""
     script = _sans_system_events(thingskit, thingskit._paste_lines("Section"))
@@ -1353,3 +1353,37 @@ def test_both_restore_paths_are_present_and_labelled(thingskit):
     assert "remise du presse-papiers (chemin : erreur)" in script
     assert script.index("remise du presse-papiers (chemin : erreur)") < \
         script.index("remise du presse-papiers (chemin : succès)")
+
+
+def test_no_osascript_call_escapes_its_decorator_guard():
+    """Classe fermée : insérer une fonction ENTRE `@requires_osascript` et la
+    fonction qu'il décorait fait glisser le décorateur d'un cran sans changer
+    aucun total — c'est exactement le défaut qui a laissé
+    `test_the_nominal_paste_returns_a_plain_ok` sans garde pendant que
+    `test_the_bench_leaves_no_live_delay_behind` en portait un qui ne protège
+    rien. Un comptage de `@requires_osascript` ne le voit jamais ; un balayage
+    d'AST sur la correspondance décorateur↔corps le voit toujours.
+    """
+    tree = ast.parse(Path(__file__).read_text())
+    EXECUTES_OSASCRIPT = {"_joue", "_run_comparison", "_run_frontmost_check"}
+
+    missing_guard = []
+    guard_without_exec = []
+    for node in tree.body:
+        if not (isinstance(node, ast.FunctionDef) and node.name.startswith("test_")):
+            continue
+        has_guard = any(
+            isinstance(d, ast.Name) and d.id == "requires_osascript"
+            for d in node.decorator_list)
+        calls = {n.func.id for n in ast.walk(node)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        executes_osascript = bool(calls & EXECUTES_OSASCRIPT)
+        if executes_osascript and not has_guard:
+            missing_guard.append(node.name)
+        if has_guard and not executes_osascript:
+            guard_without_exec.append(node.name)
+
+    assert missing_guard == [], (
+        f"appelle osascript sans @requires_osascript : {missing_guard}")
+    assert guard_without_exec == [], (
+        f"@requires_osascript sans exécuter osascript : {guard_without_exec}")
