@@ -649,7 +649,7 @@ def test_nothing_bounds_the_ui_script_on_the_python_side(thingskit):
 
 def test_the_foreground_is_reasserted_between_the_click_and_the_keystroke(thingskit):
     """Le contrôle en tête du script ne couvre PAS l'instant dangereux : entre
-    lui et la frappe il y a le clic de menu et son `delay 0.4`."""
+    lui et la frappe il y a le clic de menu et son délai fixe."""
     script = thingskit._build_heading_script("Section", "Projet A")
     click = script.index("click menu item")
     key = script.index("keystroke")
@@ -1240,9 +1240,10 @@ def test_the_refusal_precedes_the_click_but_the_title_is_written_after_it(things
 
 def test_both_restore_paths_are_present_and_labelled(thingskit):
     """Les deux chemins se distinguent par un LIBELLÉ, pas par un compte
-    d'occurrences d'`end try` — le script en porte 7, dont 3 non indentées, et
-    les deux chiffres que ce test a d'abord affirmés (5, puis 6) étaient faux.
-    Une propriété qu'on nomme ne se périme pas comme un nombre qu'on recopie.
+    d'occurrences d'`end try`. Ce test a affirmé ce compte trois fois et les
+    trois étaient fausses : deux à l'écriture, la troisième périmée par un
+    ajout de bloc ultérieur. Le compte n'est plus nommé — un nombre recopié se
+    périme, une propriété qu'on nomme, non.
     """
     script = thingskit._build_heading_script("Section", "Projet A")
 

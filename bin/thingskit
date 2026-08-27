@@ -940,7 +940,8 @@ HEADING_FRONTMOST_POLL_INTERVAL = 0.05
 
 # HEADING_PASTE_COMMIT_DELAY — délai entre le collage (Cmd-V) et la validation
 # (`key code 36`). C'est une durée DEVINÉE, et elle est déclarée comme telle,
-# au même titre que le `delay 0.4` qui la précède : la condition à observer
+# au même titre que le `delay` fixe du clic de menu qui la précède (sa valeur
+# n'est pas recopiée ici : elle se périmerait) : la condition à observer
 # serait « le champ porte le texte collé », qui n'est lisible que par l'arbre
 # d'accessibilité et dont l'établissement sur pièce impose de créer réellement
 # un en-tête dans une base réelle. Son échec n'est pas silencieux : un collage
@@ -1813,9 +1814,10 @@ def _clipboard_restore_lines(chemin: str, indent: str = "") -> str:
 
     `chemin` est un LIBELLÉ littéral, émis en commentaire AppleScript. Il n'est
     pas décoratif : c'est par lui que les tests distinguent les deux
-    emplacements. Ils le faisaient d'abord par un compte d'`end try`, chiffre
-    affirmé deux fois (5, puis 6) et faux les deux fois — le script en porte 7,
-    dont 3 non indentées. Un libellé ne se périme pas comme un nombre recopié.
+    emplacements. Ils le faisaient d'abord par un compte d'`end try` — chiffre
+    affirmé deux fois, faux les deux fois, puis une troisième valeur périmée à
+    son tour dès que le script a grossi. Le compte n'est plus nommé : il n'a
+    aucune raison d'être stable, alors qu'un libellé, lui, ne se périme pas.
 
     La remise est GARDÉE. Sans garde, son échec REMPLAÇAIT l'erreur en cours
     sur le chemin d'erreur : `error errMsg number errNum` n'était jamais
