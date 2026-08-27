@@ -237,11 +237,22 @@ redevient obligatoire.
   (`test_a_project_already_in_the_target_area_is_a_no_op_without_any_solicitation`),
   avec sa contre-épreuve contre le sur-court-circuit
   (`test_the_no_op_message_is_not_reused_for_a_real_move`). `move-task`
-  n'a **aucun** pré-check de ce type — `cmd_move_task` appelle `osa`
-  directement, sans jamais comparer l'appartenance actuelle à la cible, et
-  `tests/test_move_task.py` ne couvre pas ce cas. L'extension du pré-check
-  à `move-task` fait l'objet d'un ticket de suivi séparé, pas de ce
-  changement-ci.
+  n'avait **aucun** pré-check de ce type au 2026-08-26 — `cmd_move_task`
+  appelait `osa` directement, sans jamais comparer l'appartenance actuelle à
+  la cible.
+
+  **Depuis US-010 (2026-08-27), sa voie `--to-heading` en a un**, et
+  l'asymétrie interne est délibérée plutôt que subie : la voie en-tête est
+  du code NEUF, et y laisser un défaut connu au motif qu'il existe ailleurs
+  serait l'adopter. Le pré-check est celui de `move-project`, à l'identique —
+  message DISTINCT (« tâche déjà sous l'en-tête »), aucune sollicitation, et
+  c'est cette absence d'appel qui est testée
+  (`test_a_task_already_under_the_target_heading_is_a_no_op_without_any_solicitation`),
+  avec sa contre-épreuve contre le sur-court-circuit
+  (`test_the_no_op_message_is_not_reused_for_a_real_move`). Les voies
+  `--to-project` et `--to-area` restent SANS pré-check : leur extension est
+  le ticket de suivi séparé déjà ouvert, et l'élargir ici l'aurait fait
+  passer pour traité.
 - **Une garde d'état se décide par opération, jamais par recopie.** `set-notes`
   et `append-notes` sur une tâche refusent la **Corbeille** et **acceptent** une
   tâche `completed` comme `canceled` — ce n'est pas l'ensemble de gardes de
@@ -377,6 +388,26 @@ redevient obligatoire.
   AppleScript qui n'en demande aucun, c'est la seconde — comme pour
   `delete-task` et `complete-task`. Une surface ne « fonctionne » qu'à
   configuration constante.
+
+  **Amendement du 2026-08-27 (US-010) : le critère tient, sa prémisse était
+  fausse.** Le jeton n'impose rien à l'utilisateur — il se LIT en base,
+  colonne `TMSettings.uriSchemeAuthenticationToken`, en `mode=ro` comme tout
+  le reste (`_uri_scheme_token`). La mesure de 2026-08-17 avait établi qu'un
+  `update` sans jeton ne mute rien ; elle n'avait pas établi que le jeton
+  était hors de portée, et c'est cette moitié non mesurée qui avait été
+  écrite comme un fait. `move-task --to-heading` emploie donc la surface URL
+  `update` sans demander la moindre configuration, et le critère la classe
+  désormais AU-DESSUS de l'AppleScript, pas en dessous. La règle n'est pas
+  affaiblie : elle est appliquée à la bonne prémisse. Rejeu :
+
+      sqlite3 "file:<base Things>?mode=ro" \
+        "select length(uriSchemeAuthenticationToken) from TMSettings"
+
+  Ce que l'amendement ne change PAS : un jeton ABSENT ou VIDE reste un refus
+  AVANT tout envoi, parce qu'un `update` sans jeton est un no-op silencieux
+  que `open` rend malgré tout en 0. La surface reste écartée là où elle
+  n'apporte rien (`reschedule-task` a un AppleScript qui marche) ; elle est
+  retenue là où elle est la SEULE (l'en-tête).
 - **Une chaîne de date n'est jamais interprétée par AppleScript.** Mesuré le
   2026-08-17 : `date "2026-09-05"` a produit **2011-03-19**, la session
   appliquant sa propre locale à la chaîne. Toute date passée à `schedule` ou à
@@ -635,6 +666,166 @@ redevient obligatoire.
       .venv/bin/python -m pytest tests/test_applescript_escaping.py --collect-only -q | tail -1 -> 48
       .venv/bin/python -m pytest tests/test_untrusted_rendering.py --collect-only -q | tail -1 -> 81
       .venv/bin/python -m pytest -q -p no:cacheprovider -> 1065 passed, 11 skipped
+
+  Baseline relevée à **1076** le 2026-08-27 avant `move-task --to-heading`
+  (US-010), **1105** après. L'écart de 29 tient entièrement dans
+  `tests/test_move_task.py` (22 -> 51 collectés) : refus avant sollicitation
+  (portée du résolveur, homonyme d'un autre projet, en-tête à la Corbeille,
+  couplage `--to-heading`/`--to-project`), jeton du schéma d'URL absent ou
+  vide, non-fuite du jeton sur les DEUX sorties, invariants d'uuid et de date
+  de création, effet non constaté, course sur le message d'échec, base
+  illisible pendant toute l'attente, no-op et sa contre-épreuve, rendu borné
+  des titres hostiles sur les deux branches, câblage CLI. Aucun autre fichier
+  ne bouge : le fichier de test existait déjà, donc le contrôle paramétré de
+  `test_annotations_resolve.py` ne gagne rien. Les commandes :
+
+      .venv/bin/python -m pytest --collect-only -q | tail -1 -> 1105 tests collected
+      .venv/bin/python -m pytest tests/test_move_task.py --collect-only -q | tail -1 -> 51
+      .venv/bin/python -m pytest -q -p no:cacheprovider -> 1104 passed, 1 skipped
+
+  Baseline relevée à **1105** le 2026-08-27 avant le lot de review d'US-010,
+  **1120** après. L'écart de 15 se décompose, et chaque terme est mesuré :
+  +12 dans le fichier neuf `tests/test_url_scheme_token.py` (arrivée du jeton
+  dans l'URL, encodage, contre-épreuve du sur-ajout, non-fuite par le
+  PROCESSUS FILS avec et sans jeton, message d'échec qui ne cite pas l'URL,
+  contre-épreuve du sur-bruit, quatre schémas de base dégénérés et leur
+  contre-épreuve, non-citation du nom de colonne dans le refus) ; +2 dans
+  `test_move_task.py` (51 -> 53 : les deux fenêtres de course) ; +1 au
+  contrôle paramétré de `test_annotations_resolve.py`, qui balaie les
+  fichiers de test (36 -> 37, un fichier de plus). Les commandes :
+
+      .venv/bin/python -m pytest --collect-only -q | tail -1 -> 1120 tests collected
+      .venv/bin/python -m pytest tests/test_url_scheme_token.py --collect-only -q | tail -1 -> 12
+      .venv/bin/python -m pytest tests/test_move_task.py --collect-only -q | tail -1 -> 53
+      .venv/bin/python -m pytest tests/test_annotations_resolve.py --collect-only -q | tail -1 -> 37
+      .venv/bin/python -m pytest -q -p no:cacheprovider -> 1119 passed, 1 skipped
+
+  **Chronique des affirmations réfutées d'US-010 — elle vit ICI, plus dans le
+  script.** Les six blocs de `bin/thingskit` qui la racontaient sont ramenés à
+  leur invariant plus un renvoi vers ce paragraphe (2026-08-27, troisième tour
+  de review). Motif : pour savoir ce que fait une fonction, il fallait
+  traverser l'historique de ce qu'on avait cru à tort. **Aucun fait n'est
+  perdu — les deux qui ne vivaient QUE dans le script sont reportés ici avant
+  d'y être retirés**, et les constats MESURÉS (35 lignes, « mesuré le … sur la
+  vraie base ») restent dans le script : le § « Ce que le projet fait » les y
+  exige, les déplacer serait la suppression sèche qu'on veut éviter.
+
+  1. **`url_open` : « aucune branche, de succès comme d'échec, ne cite l'URL
+     construite ici ».** Vrai des branches Python, faux de l'effet observable —
+     `subprocess.run(argv, check=False)` sans capture laisse le fils hériter
+     des descripteurs 1 et 2, et `open` imprime l'URL entière, jeton compris.
+  2. **En-tête de `move-task` : « le jeton ne sort jamais sur stdout ni
+     stderr ».** Même défaut, même endroit, écrit deux fois.
+  3. **`url_open` : « la capture porte sur la CLASSE ».** Écrite au moment où
+     deux des cinq lancements du script ne capturaient pas.
+  4. **`cmd_create_heading` : « même neutralisation que `url_open` ».** Vraie
+     AVANT le correctif de la fuite, **rompue par lui** — `url_open` a acquis
+     une capture que ce site n'avait pas, et le commentaire a continué
+     d'affirmer une parité qui n'existait plus. Ce fait ne vivait que dans le
+     script.
+  5. **`_spawn` : « `_rendered` sur le code retour est cérémoniel ».** Réfuté
+     par mutation — le retirer fait rougir
+     `test_no_untrusted_value_reaches_the_output_unconverted` : le balayage
+     juge le TRAJET d'une valeur, pas son type, et `r` est lié par
+     `subprocess.run`, donc racine. Le mot invitait le prochain lecteur à
+     supprimer une garde en croyant nettoyer. Ce fait ne vivait que dans le
+     script.
+  6. **La garde de classe elle-même n'était pas sous test sur sa branche
+     discriminante.** `nus == []` était satisfait À VIDE sur le code sain :
+     un double mutant — lancement nu remis dans `ensure_running` **plus**
+     prédicat du recenseur forcé — laissait `1134 passed`. Deux causes
+     distinctes, et la seconde est la plus instructive : le recensement
+     ÉNUMÉRAIT des noms d'appel (`subprocess.{run, call, check_call, Popen}`)
+     alors qu'`_is_inert_argv_element`, écrit dans le MÊME commit, appliquait
+     la doctrine inverse — borner ce qui est sûr. **La règle et sa violation
+     dans le même diff.** La première : le prédicat de capture était une
+     DISJONCTION, si bien que `stdout=` seul déclarait sûr un site dont
+     `stderr` — le canal de la fuite — restait hérité.
+
+  **Ce que le recensement des lancements ne tient PAS**, nommément, après
+  l'élargissement du 2026-08-27 (`conftest.child_spawn_sites`, site de
+  définition unique partagé par les deux gardes) :
+
+  - la surface de lancement d'`os` est **énumérée** (`OS_SPAWN_MEMBERS`), là où
+    celle de `subprocess` est bornée sur le module. L'écart est assumé : c'est
+    une surface de bibliothèque standard, close et hors de notre code, alors
+    que les formes d'appel sont les nôtres ;
+  - un lancement par un appelable reçu d'**ailleurs que d'une liaison visible
+    dans le fichier** (attribut d'objet, entrée de dictionnaire, `getattr`)
+    n'est pas suivi. L'indirection par un NOM re-lié, elle, l'est désormais —
+    `runner = runner or subprocess.run` dans `code_identity_refusal` est
+    recensé, ce qui porte le compte du script de 3 à **4** ;
+  - `capture_output=<valeur calculée>` est traité comme NON bornant, faute de
+    pouvoir décider au point d'appel. Sur-approximation assumée, dans le sens
+    qui compte un site de trop plutôt qu'un de moins.
+
+  La garde couvre les **deux** artefacts exécutables du dépôt — `bin/thingskit`
+  (4 lancements) et `build/bundle.py` (8), tous bornés. `build/bundle.py` y a
+  été ajouté après mesure, et pas par symétrie : il manipule la sortie de
+  `codesign`, qui porte l'identité de signature — la valeur personnelle que
+  `test_bundle.py` interdit déjà de publier.
+
+  Baseline relevée à **1120** le 2026-08-27 avant le second lot de review
+  d'US-010, **1135** après. L'écart de 15 se décompose, et chaque terme est
+  mesuré : +7 dans `tests/test_url_scheme_token.py` (12 -> 19 : le compte des
+  lancements de fils NUS, les trois épreuves du helper `_spawn`, et les trois
+  instances du libellé borné) ; +8 dans `tests/test_untrusted_rendering.py`
+  (81 -> 89 : quatre formes d'argv composé de plus, chacune parcourue par les
+  DEUX contrôles paramétrés — celui qui exige le refus et sa contre-épreuve
+  qui exige que le balayage seul ne l'ait pas déjà vue). Aucun fichier de test
+  neuf, donc le contrôle paramétré de `test_annotations_resolve.py` ne bouge
+  pas (37). Les commandes :
+
+      .venv/bin/python -m pytest --collect-only -q | tail -1 -> 1135 tests collected
+      .venv/bin/python -m pytest tests/test_url_scheme_token.py --collect-only -q | tail -1 -> 19
+      .venv/bin/python -m pytest tests/test_untrusted_rendering.py --collect-only -q | tail -1 -> 89
+      .venv/bin/python -m pytest tests/test_annotations_resolve.py --collect-only -q | tail -1 -> 37
+      .venv/bin/python -m pytest -q -p no:cacheprovider -> 1134 passed, 1 skipped
+
+  Baseline relevée à **1135** le 2026-08-27 avant le troisième lot de review
+  d'US-010, **1161** après. L'écart de 26 se décompose, et chaque terme est
+  mesuré : +18 dans `tests/test_url_scheme_token.py` (19 -> 37 : le corpus de
+  douze formes NUES et de quatre formes bornées passé au recenseur, la
+  contre-épreuve des fantômes, et la garde de classe désormais paramétrée sur
+  les deux artefacts) ; +8 dans `tests/test_untrusted_rendering.py`
+  (89 -> 97 : quatre formes d'argv de plus — mot-clé `args=`, `check_output`,
+  `stdout` seul, alias de module — chacune parcourue par les DEUX contrôles
+  paramétrés. Les commandes :
+
+      .venv/bin/python -m pytest --collect-only -q | tail -1 -> 1161 tests collected
+      .venv/bin/python -m pytest tests/test_url_scheme_token.py --collect-only -q | tail -1 -> 37
+      .venv/bin/python -m pytest tests/test_untrusted_rendering.py --collect-only -q | tail -1 -> 97
+      .venv/bin/python -m pytest -q -p no:cacheprovider -> 1160 passed, 1 skipped
+
+  **7 mutants, 7 rouges, 0 survivant** sur la garde élargie et sur `_spawn`.
+  Le seul qui a d'abord survécu — `_rendered` retiré du libellé de `_spawn` —
+  était équivalent SUR LE DOMAINE DU JOUR : les trois appelants passent une
+  chaîne littérale. Il a été TUÉ plutôt que déclaré équivalent, parce que le
+  déclarer aurait fait dépendre une propriété de sortie de l'inventaire des
+  appelants — la forme d'affirmation exacte que ce lot corrige.
+
+  **Ce lot corrige une affirmation, pas seulement un défaut.** `url_open`
+  déclarait qu'« aucune branche, de succès comme d'échec, ne cite l'URL
+  construite ici » — vrai des branches Python, FAUX de l'effet observable :
+  `subprocess.run(argv, check=False)` sans capture laisse le fils hériter des
+  descripteurs 1 et 2, et `open` imprime l'URL entière, jeton d'authentification
+  compris, quand LaunchServices ne résout pas le schéma. Les deux tests de
+  non-fuite qui existaient ne pouvaient pas le voir : ils remplaçaient
+  `url_open` par un faux, donc n'exerçaient jamais le fils. **Un test qui
+  remplace la frontière qu'il prétend garder ne garde rien**, et c'est le seul
+  enseignement de ce lot qui vaille au-delà de lui. La sortie du fils est
+  désormais capturée sur TOUS les chemins — la classe, pas l'instance qui
+  portait le secret — et seul le code retour est cité. Rejeu de la fuite,
+  contre l'état d'avant (`8a0c699`) :
+
+      # un `open` substitué qui recrache son argv, comme le vrai le fait
+      printf '#!/bin/sh\necho "Unable to find application for URL $@" >&2\n' > /tmp/fo
+      chmod +x /tmp/fo   # puis url_open(..., auth_token="SECRET") avec OPEN=/tmp/fo
+      # -> le jeton apparaît en clair sur le stderr du processus
+
+  **13 mutants, 13 rouges, 0 survivant** sur les gardes de la voie en-tête et
+  de la surface URL — c'est l'énumération, pas la relecture, qui avait trouvé
+  les deux survivants du tour précédent.
 
   **L'intégration n'a pas été un simple recollement.** Les deux chantiers se
   croisaient sur un point de fond : ADR-003 fait entrer une valeur d'origine
@@ -1099,8 +1290,46 @@ irréversible pour un gestionnaire de tâches personnel utilisé au quotidien.
     relevaient de ces formes et n'étaient bénins que par accident ; ils ont
     été corrigés le 2026-08-26 (deux `{exc}` d'un `except … as`, et un
     `subprocess` dont l'argv portait un uuid non encodé, désormais passé par
-    `urllib.parse.quote` comme dans `url_open`). Angle mort de cette garde-là :
-    un `subprocess` dont l'argv est passé par un NOM, qu'elle n'inspecte pas.
+    `urllib.parse.quote` comme dans `url_open`).
+
+    **La liste d'angles morts qui tenait cette place était elle-même plus
+    étroite que la mesure, et c'est le défaut le plus coûteux de cette
+    garde.** Elle ne déclarait qu'un angle mort — « un `subprocess` dont
+    l'argv est passé par un NOM ». Mesuré le 2026-08-27 en substituant les
+    formes, le détecteur F15 ne déclenchait en réalité que sur un
+    `ast.JoinedStr` : **quatre formes sur cinq lui échappaient** —
+    concaténation (`"a" + x`), `%`-format, `.format()`, et l'argv par un nom.
+    La forme qui vivait RÉELLEMENT dans le script était la **concaténation**,
+    ligne 1838 (`cmd_create_heading`), et le balayage rendait `0 finding`
+    dessus alors qu'elle relève littéralement du libellé du détecteur.
+
+    Corrigé le 2026-08-27 en retournant la borne : F15 ne reconnaît plus des
+    formes de composition, il exige que chaque élément d'argv soit INERTE —
+    un littéral, ou une constante de module (`_is_inert_argv_element`). Une
+    garde qui énumère les formes ne couvre que l'exemple qui l'a fait naître ;
+    une garde qui borne ce qui est sûr couvre celles qu'on n'a pas écrites.
+    L'argv passé par un nom cesse d'être un angle mort par la même occasion :
+    ce qu'un nom porte est invisible au point d'appel, donc il vaut composé.
+    Rejeu, contre le blob d'avant la correction du site :
+
+        git show 777c4fc:bin/thingskit > /tmp/pre
+        # puis scope_and_sink_findings(open("/tmp/pre").read())
+        # -> [(1838, 'subprocess à stdio hérité, argv composé')]
+
+    **Ce que F15 ne tient toujours pas, nommément** : un lancement par
+    INDIRECTION, c'est-à-dire un appelable reçu en paramètre (`runner` de
+    `code_identity_refusal`, l. 435) — il n'est pas syntaxiquement
+    `subprocess.*` au point d'appel, aucune des deux gardes ne le voit. Il est
+    bénin aujourd'hui (argv entièrement littéral, sortie capturée), et il est
+    écrit ici plutôt que tu.
+
+    **La propriété de fond ne se tient plus par une phrase mais par un
+    compte.** `test_every_child_spawn_of_the_script_captures_its_output`
+    énumère les lancements de fils du script et exige ZÉRO site à stdio
+    hérité. C'est ce compte qui rend vraie l'affirmation « la capture porte
+    sur la classe », écrite dans `url_open` le 2026-08-27 **avant** de l'être
+    : deux sites sur cinq ne capturaient pas au moment où elle était écrite.
+    Tous passent désormais par `_spawn`.
   - L'analyse est insensible au flot et fusionne les portées imbriquées,
     toujours dans le sens de la sur-approximation.
   - Le code de MODULE n'est analysé par rien (voir « portée réelle »).

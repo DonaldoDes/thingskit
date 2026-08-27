@@ -218,6 +218,9 @@ Usage
     thingskit rename-task [--id UUID] [--title TITRE] --new-title TITRE
     thingskit reschedule-task [--id UUID] [--title TITRE] [--when VAL]
                               [--deadline AAAA-MM-JJ] [--clear-deadline]
+    thingskit move-task [--id UUID] [--title TITRE]
+                        --to-project TITRE [--to-heading H] | --to-area NOM
+    thingskit move-project --project TITRE|--project-id UUID --area NOM
     thingskit deeplink --type project|area|task --title TITRE
 
 Toutes les sous-commandes de lecture acceptent `--json`. Les sous-commandes
@@ -669,7 +672,50 @@ def osa(script: str) -> tuple[int, str]:
     return r.returncode, (r.stdout or r.stderr).strip()
 
 
-def url_open(payload: list, background: bool = True) -> None:
+def _spawn(argv: list[str], what: str = "lancement") -> subprocess.CompletedProcess:
+    """Lance un processus fils SANS lui prêter nos descripteurs, et dit son
+    échec sans citer son argv.
+
+    **Point de passage UNIQUE de tout lancement dont la sortie ne nous
+    appartient pas.** C'est ce qui rend la propriété tenable par un compte
+    plutôt que par une phrase : `tests/test_url_scheme_token.py` recense les
+    lancements des deux artefacts exécutables et exige zéro site nu. Pourquoi
+    un helper plutôt que la même correction posée à chaque site : constitution.md § Tests, « Chronique des affirmations réfutées d'US-010 ».
+
+    Encoder n'est pas capturer, et les deux ne se remplacent pas :
+    `urllib.parse.quote` borne les OCTETS qui partent, la capture borne le
+    CANAL par lequel ils reviennent. Un argv encodé reste un argv que `open`
+    recrache en clair quand LaunchServices ne résout pas le schéma.
+
+    `what` est un libellé LITTÉRAL fourni par l'appelant : il rend l'échec
+    diagnosticable sans que rien de l'argv n'ait à sortir. Le code retour est
+    la seule autre chose citée — et il coûte la classe d'erreur que `open`
+    distinguait dans son texte (`kLSApplicationNotFoundErr`, `-10814`, tous
+    rendus par un code retour de 1). Compromis assumé : la vérification
+    post-action tranche l'effet dans tous les cas, elle ne dépend d'aucun
+    diagnostic du lanceur.
+
+    Ce que ce helper ne ferme PAS, et qui est nommé plutôt que tu : l'argv
+    reste visible dans la table des processus (`ps`) pour tout processus du
+    même utilisateur, le temps du lancement. C'est vrai du jeton du schéma
+    d'URL comme de tout le reste — cf. `SECURITY.md` § « Ce que le CLI
+    n'isole pas ».
+    """
+    r = subprocess.run(argv, check=False, capture_output=True, text=True)
+    if r.returncode != 0:
+        # `_rendered` sur le code retour est EXIGÉ, pas décoratif : le
+        # balayage juge le trajet d'une valeur, pas son type, et `r` est lié
+        # par `subprocess.run`, donc racine. Le retirer fait rougir
+        # `test_no_untrusted_value_reaches_the_output_unconverted`.
+        print(f"{_rendered(what)} : échec (code {_rendered(r.returncode)}) — "
+              "sortie du processus RETENUE, elle citerait l'argv et donc ce "
+              "qu'il porte. L'effet reste tranché par la vérification "
+              "post-action.", file=sys.stderr)
+    return r
+
+
+def url_open(payload: list, background: bool = True,
+             auth_token: str | None = None) -> None:
     """Envoie un payload au schéma d'URL de Things.
 
     `background=True` (défaut) passe `-g` à `open` : « Do not bring the
@@ -677,11 +723,73 @@ def url_open(payload: list, background: bool = True) -> None:
     fait passer Things au premier plan et vole le focus de l'utilisateur.
     Les commandes qui pilotent l'INTERFACE (menus, frappe clavier) doivent
     passer `background=False` — elles ont besoin du premier plan.
+
+    `auth_token` n'est requis que par les opérations `update` du schéma d'URL
+    (mesuré le 2026-08-27 : une `update` sans jeton est un NO-OP SILENCIEUX et
+    `open` rend malgré tout 0). C'est un SECRET.
+
+    L'URL ne sort par AUCUNE sortie, y compris par le processus fils : elle
+    part par `_spawn`, qui capture. Sur échec, seul le code retour est cité —
+    jamais l'URL ni la sortie brute. Gardé par
+    `tests/test_url_scheme_token.py`, qui exerce le vrai `subprocess.run`
+    contre un `open` jetable et lit les DESCRIPTEURS : un test qui remplace la
+    frontière qu'il prétend garder ne garde rien. Ce que cette fonction a
+    affirmé à tort avant de le tenir : constitution.md § Tests, « Chronique des affirmations réfutées d'US-010 ».
     """
-    url = "things:///json?data=" + urllib.parse.quote(
-        json.dumps(payload, ensure_ascii=False))
+    params = []
+    if auth_token:
+        params.append("auth-token=" + urllib.parse.quote(auth_token))
+    params.append("data=" + urllib.parse.quote(
+        json.dumps(payload, ensure_ascii=False)))
+    url = "things:///json?" + "&".join(params)
     argv = [OPEN] + (["-g"] if background else []) + [url]
-    subprocess.run(argv, check=False)
+    # Sans capture, le fils hérite des descripteurs 1 et 2 du parent et `open`
+    # imprime l'URL COMPLÈTE — jeton compris — sur son stderr quand
+    # LaunchServices ne résout pas le schéma (mesuré le 2026-08-27 avec un
+    # `open` substitué, corroboré contre le vrai `/usr/bin/open`). La branche
+    # est atteignable en usage nominal : `ensure_running()` ne s'arrête pas
+    # quand l'application ne démarre pas. D'où `_spawn`, seul point de passage.
+    _spawn(argv, "schéma d'URL")
+
+
+def _uri_scheme_token(action_suffix: str) -> tuple[str | None, str | None]:
+    """Le jeton du schéma d'URL, LU EN BASE (`mode=ro`), (jeton, erreur).
+
+    Mesuré le 2026-08-27 : Things le stocke dans
+    `TMSettings.uriSchemeAuthenticationToken`. Il n'impose donc AUCUNE
+    configuration à l'utilisateur, et n'a pas à vivre dans une variable
+    d'environnement ni dans un fichier de configuration — c'est ce qui
+    distingue ce cas de `reschedule-task`, où la même surface avait été
+    écartée faute de jeton accessible (§ Conventions réelles, « la surface
+    préférée est celle qui marche SANS configuration de l'utilisateur »).
+
+    Un jeton ABSENT ou VIDE est refusé AVANT tout envoi : mesuré, une
+    opération `update` sans jeton est un NO-OP SILENCIEUX et `open` rend
+    malgré tout 0 — le mode d'échec « commande envoyée ≠ effet constaté »
+    sous sa forme la plus trompeuse, et le seul endroit où il est arrêtable
+    est en amont.
+
+    Le jeton est un SECRET. Ce que cette fonction garantit, et rien de plus :
+    elle le REND à l'appelant et ne l'imprime pas — son message de refus se
+    compose du contexte, jamais de la valeur lue. La propriété « il ne sort
+    sur aucune sortie » ne se tient PAS ici : elle se tient dans `url_open`,
+    seul endroit où le jeton quitte le processus, et elle y a été fausse
+    jusqu'au 2026-08-27 (le processus fils l'imprimait). Une propriété
+    s'affirme là où elle est tenue, sinon deux endroits se renvoient la
+    responsabilité et personne ne la porte.
+    """
+    try:
+        rows = q("select uriSchemeAuthenticationToken from TMSettings")
+    except sqlite3.Error:
+        rows = []
+    token = rows[0][0] if rows and rows[0][0] else None
+    if not token:
+        return None, ("jeton du schéma d'URL Things introuvable — l'activer "
+                      "dans Things > Réglages > Général > « Activer les URL "
+                      f"Things », {action_suffix}. Sans lui l'ordre serait "
+                      "ignoré en silence et la commande annoncerait un "
+                      "déplacement qui n'a pas eu lieu.")
+    return token, None
 
 
 # ---------------------------------------------------------------------------
@@ -912,7 +1020,7 @@ def ensure_running() -> None:
     """
     if _things3_is_running():
         return
-    subprocess.run([OPEN, "-g", "-a", "Things3"], check=False)
+    _spawn([OPEN, "-g", "-a", "Things3"], "lancement de Things")
     # La lambda n'est pas un ornement : passer `_things3_is_running` par son NOM
     # en ferait une fonction de module employée comme valeur, forme que le
     # balayage de `tests/test_fast_path_partition.py` ne sait pas résoudre. Le
@@ -1741,11 +1849,13 @@ def cmd_create_heading(a) -> int:
         return 0
 
     ensure_running()
-    # `project_uuid` est d'origine non contrôlée et l'argv de ce fils est
-    # émis sur NOTRE terminal (stdio hérité). Même neutralisation que
-    # `url_open`, qui encode déjà son payload.
-    subprocess.run([OPEN, "things:///show?id=" + urllib.parse.quote(project_uuid)],
-                   check=False)
+    # `project_uuid` est d'origine non contrôlée, et il repart DEUX fois
+    # borné : `quote` borne les octets qui partent, `_spawn` borne le canal
+    # par lequel ils reviennent. La parité avec `url_open` est STRUCTURELLE —
+    # même helper, pas deux copies qui affirment leur ressemblance. Pourquoi
+    # cette précision : constitution.md § Tests, « Chronique des affirmations réfutées d'US-010 ».
+    _spawn([OPEN, "things:///show?id=" + urllib.parse.quote(project_uuid)],
+           "affichage du projet")
 
     seen = {"probe": None}
 
@@ -2706,10 +2816,50 @@ def cmd_reschedule_task(a) -> int:
 #   - Aucune surface (`move`, propriété) n'expose de `heading` : la classe
 #     `heading` n'existe même pas dans le `sdef` de Things3, et aucune
 #     propriété `heading` ne figure dans le dictionnaire de la classe
-#     `to do`. Le déplacement vers un heading n'est donc PAS couvert par
-#     cette commande — mesuré non faisable, pas simplement non tenté
-#     (US-006 § Spécifications techniques : à ne pas exiger sans preuve de
-#     faisabilité).
+#     `to do`. Mesuré, pas déduit (US-006 § Spécifications techniques : à ne
+#     pas exiger sans preuve de faisabilité).
+#
+# `--to-heading` (US-010, mesuré le 2026-08-27 sur projet/en-tête/tâches
+# JETABLES réels, jamais sur des données de l'utilisateur) :
+#
+#   - L'AppleScript est ÉPUISÉ, pas seulement « non exposé ». Six formes
+#     essayées, six échecs, chacun avec son code : `move to do id T to list
+#     id H` (-1728), `move … to to do id H` (301, « Impossible de déplacer la
+#     tâche »), `set project of to do id T to project id H` (-10006),
+#     `set area of to do id T to area id H` (-10006), `move … to list
+#     "<titre de l'en-tête>"` (-1728), et la commande cachée
+#     `_private_experimental_ reorder to dos in`, qu'un en-tête « ne comprend
+#     pas » (-1708). `sdef /Applications/Things3.app | grep -i heading` rend
+#     ZÉRO occurrence.
+#   - Le SCHÉMA D'URL, opération `update`, fonctionne — et c'est la seule
+#     surface qui fonctionne. `heading-id=<uuid>` déplace une tâche EXISTANTE
+#     sous l'en-tête en ~150 ms ; `uuid` et `creationDate` sont relus
+#     INCHANGÉS, la colonne `project` passe à NULL (cohérent avec le constat
+#     du docstring module : une tâche sous en-tête a son `project` vide).
+#     La forme JSON (`operation: "update"`) et la forme requête donnent le
+#     même résultat.
+#   - Le jeton exigé par `update` n'impose AUCUNE configuration à
+#     l'utilisateur : il se LIT en base, colonne
+#     `TMSettings.uriSchemeAuthenticationToken`, en `mode=ro` comme tout le
+#     reste. C'est ce qui distingue ce cas de `reschedule-task`, où la même
+#     surface avait été écartée au motif qu'elle « impose à l'utilisateur
+#     d'aller chercher et de stocker un secret » — elle ne l'impose pas.
+#     Le jeton est un SECRET : il ne quitte le processus que dans l'argv
+#     remis à `_spawn`, qui capture la sortie du fils — la propriété est
+#     tenue LÀ, et éprouvée contre un vrai processus par
+#     `tests/test_url_scheme_token.py`, jamais par ce commentaire. Résidu
+#     nommé : l'argv reste lisible par `ps` (SECURITY.md). Ce que cette
+#     place a affirmé à tort : constitution.md § Tests, « Chronique des affirmations réfutées d'US-010 ».
+#   - SANS jeton, `update` est un NO-OP SILENCIEUX et `open` rend malgré tout
+#     0 — mesuré par CONTRÔLE sur un attribut notoirement supporté (`title`),
+#     pour établir que la sonde atteignait bien la surface qu'elle croyait
+#     mesurer et non un attribut non reconnu. Même chose pour un `heading`
+#     qui ne nomme aucun en-tête. D'où les deux refus AVANT tout envoi.
+#   - La documentation de Things annonce que `heading-id` est « ignoré si la
+#     tâche n'est pas dans un projet portant cet en-tête ». La MESURE la
+#     contredit : une tâche d'Inbox est bien rangée sous l'en-tête par
+#     `heading-id` seul. `list-id` est envoyé quand même — il ne coûte rien
+#     et ne fait dépendre la commande d'aucune des deux versions du fait.
 # ---------------------------------------------------------------------------
 
 def _resolve_project_by_title(title: str, action_suffix: str) -> tuple[str | None, str | None]:
@@ -2772,6 +2922,18 @@ def cmd_move_task(a) -> int:
         print(f"uuid malformé : {task_id!r}, {action_suffix}", file=sys.stderr)
         return 1
 
+    # Un titre d'en-tête n'est unique QUE dans son projet — deux projets qui
+    # portent une « Section » chacun est le cas NORMAL, pas une ambiguïté.
+    # Résoudre `--to-heading` sans projet reviendrait donc à « prendre le
+    # premier », que ce projet refuse partout ailleurs. D'où le couplage
+    # exigé, le même que `add-task --list … --heading …` et `find-task`.
+    to_heading = getattr(a, "to_heading", None)
+    if to_heading and not getattr(a, "to_project", None):
+        print(f"erreur : --to-heading exige --to-project (un titre d'en-tête "
+              f"n'est unique que dans son projet), {action_suffix}",
+              file=sys.stderr)
+        return 1
+
     if not getattr(a, "to_project", None) and not getattr(a, "to_area", None):
         print(f"erreur : --to-project ou --to-area requis, {action_suffix}",
               file=sys.stderr)
@@ -2795,7 +2957,63 @@ def cmd_move_task(a) -> int:
               file=sys.stderr)
         return 1
 
-    if a.to_project:
+    # `created_before` n'est relevé que sur la voie heading : c'est LÀ que
+    # l'invariant « l'uuid et la date de création ne bougent pas » est en jeu,
+    # puisque le contournement rejeté par US-010 (recréer puis supprimer)
+    # cassait exactement ces deux propriétés.
+    created_before = None
+    token = None
+    heading_project_id = None
+    if to_heading:
+        # Résolveur PARTAGÉ avec `find-task`/`add-task` (`_resolve_find_target`),
+        # jamais un deuxième : il borne déjà la recherche au projet et refuse
+        # sur 0 comme sur 2+ correspondances.
+        _, _, target_id, err = _resolve_find_target(a.to_project, to_heading)
+        if err:
+            print(f"{err} — {action_suffix}. La tâche n'est jamais envoyée "
+                  "vers une cible non résolue : mesuré le 2026-08-27, un "
+                  "`heading` qui ne nomme aucun en-tête est ignoré en silence "
+                  "et l'ordre rend malgré tout 0.", file=sys.stderr)
+            return 1
+        token, err = _uri_scheme_token(action_suffix)
+        if err:
+            print(err, file=sys.stderr)
+            return 1
+        # `[0][0]` sur une liste vide tue la commande sur une trace Python au
+        # lieu du refus qu'elle sait composer. La fenêtre est RÉELLE, pas
+        # théorique : l'application écrit dans la base pendant qu'on la lit,
+        # et l'objet peut disparaître entre sa résolution et cette requête.
+        # Les deux fenêtres sont gardées SÉPARÉMENT — elles ne convergent pas.
+        heading_rows = q("select project from TMTask where uuid=? and type=?",
+                         (target_id, TYPE_HEADING))
+        if not heading_rows:
+            print(f"en-tête disparu entre sa résolution et la lecture de son "
+                  f"projet ({_rendered(target_id)}) — {action_suffix}",
+                  file=sys.stderr)
+            return 1
+        heading_project_id = heading_rows[0][0]
+        target_kind = "heading"
+        target_label = f"{a.to_project} › {to_heading}"
+        obs = q("select heading, creationDate from TMTask where uuid=? and "
+                "type=?", (task_id, TYPE_TASK))
+        if not obs:
+            print(f"tâche disparue entre sa vérification et la lecture de son "
+                  f"rattachement ({_rendered(task_id)}) — {action_suffix}",
+                  file=sys.stderr)
+            return 1
+        current_heading, created_before = obs[0]
+        # Une tâche DÉJÀ sous l'en-tête visé satisfait la vérification
+        # post-action AVANT même l'ordre : la relecture ne distingue alors pas
+        # « fait » de « rien fait », et le code retour 0 serait légitime tout
+        # en étant hors de portée de l'invariant central. Même raisonnement
+        # que `move-project`, et même remède — un message DISTINCT, et aucune
+        # sollicitation de l'application.
+        if current_heading == target_id:
+            print(f"tâche déjà sous l'en-tête : {title!r} "
+                  f"({_rendered(task_id)}) → {target_label!r}")
+            return 0
+        script = None
+    elif a.to_project:
         target_id, err = _resolve_project_by_title(a.to_project, action_suffix)
         if err:
             print(err, file=sys.stderr)
@@ -2813,7 +3031,23 @@ def cmd_move_task(a) -> int:
         target_kind, target_label = "area", a.to_area
 
     ensure_running()
-    rc, out = osa(script)
+    if to_heading:
+        # SEULE surface qui expose l'affectation d'un en-tête à une tâche
+        # EXISTANTE (mesuré le 2026-08-27, cf. en-tête de section). `list-id`
+        # accompagne `heading-id` : la documentation de Things annonce que
+        # `heading-id` est ignoré si la tâche n'est pas déjà dans le projet —
+        # la mesure la CONTREDIT (une tâche d'Inbox est bien rangée), mais
+        # envoyer les deux ne coûte rien et ne dépend pas de cette
+        # contradiction, qui peut se refermer d'une version à l'autre.
+        url_open([{"type": "to-do", "operation": "update", "id": task_id,
+                   "attributes": {"list-id": heading_project_id,
+                                  "heading-id": target_id}}],
+                 auth_token=token)
+        # Ce que la surface a rendu — l'URL n'est JAMAIS citée : elle porte le
+        # jeton, qui est un secret.
+        out = "schéma d'URL, opération update (aucune sortie)"
+    else:
+        rc, out = osa(script)
 
     # La vérification est INCHANGÉE — elle est seulement nommée, pour servir à
     # la fois de sonde d'attente et de source du message d'échec, comme dans
@@ -2821,15 +3055,25 @@ def cmd_move_task(a) -> int:
     # cesserait de décrire celle qui juge. La cascade distingue toujours ses
     # trois causes, qui ne se diagnostiquent pas de la même façon.
     def _move_problem() -> str | None:
-        rows = q("select uuid, project, area, heading from TMTask where uuid=? "
-                 "and type=?", (task_id, TYPE_TASK))
+        rows = q("select uuid, project, area, heading, creationDate from "
+                 "TMTask where uuid=? and type=?", (task_id, TYPE_TASK))
         if not rows:
             return "tâche introuvable après l'opération"
-        obs_uuid, obs_project, obs_area, obs_heading = rows[0]
+        obs_uuid, obs_project, obs_area, obs_heading, obs_created = rows[0]
         if obs_uuid != task_id:
             return (f"l'UUID relu ({obs_uuid!r}) diffère de celui déplacé — "
                     "invariant violé")
-        if target_kind == "project":
+        if created_before is not None and obs_created != created_before:
+            return (f"la date de création relue ({obs_created!r}) diffère de "
+                    f"celle d'avant le déplacement ({created_before!r}) — "
+                    "invariant violé")
+        if target_kind == "heading":
+            # Constat du docstring module, remesuré le 2026-08-27 : une tâche
+            # sous en-tête a sa colonne `project` VIDE. Exiger le projet ici
+            # rendrait un faux négatif sur une écriture réussie — et
+            # l'appelant qui réessaie duplique dans les données (BUG-016).
+            ok = obs_heading == target_id
+        elif target_kind == "project":
             ok = obs_project == target_id and obs_area is None
         else:
             ok = obs_area == target_id and obs_project is None
@@ -3296,15 +3540,22 @@ def main() -> int:
                         "Refuse toute résolution par titre ambiguë ou nulle, "
                         "pour la tâche comme pour la cible, et la Corbeille. "
                         "Ne sort en succès que si l'appartenance à la cible "
-                        "exacte est constatée en base après coup. Ne couvre "
-                        "PAS le déplacement vers un heading : aucune surface "
-                        "AppleScript ne l'expose (mesuré, cf. docstring "
-                        "module).")
+                        "exacte est constatée en base après coup. Couvre "
+                        "aussi le déplacement sous un EN-TÊTE "
+                        "(--to-project P --to-heading H), qui emprunte la "
+                        "seule surface qui l'expose : le schéma d'URL, "
+                        "opération `update` — aucune surface AppleScript ne "
+                        "le permet (mesuré, cf. docstring module). L'UUID et "
+                        "la date de création de la tâche sont vérifiés "
+                        "inchangés après coup.")
     s.add_argument("--id", help="identifiant Things de la tâche (recommandé)")
     s.add_argument("--title", help="titre exact ; refuse si 0 ou 2+ correspondances")
     g = s.add_mutually_exclusive_group(required=True)
     g.add_argument("--to-project", help="titre exact du projet cible")
     g.add_argument("--to-area", help="titre exact de l'area cible")
+    s.add_argument("--to-heading",
+                   help="titre exact d'un en-tête DANS --to-project ; refuse "
+                        "si 0 ou 2+ correspondances dans ce projet")
 
     s = add("move-project", cmd_move_project,
             description="Déplace un projet DÉJÀ créé vers une autre area, "

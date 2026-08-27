@@ -18,7 +18,9 @@ import sqlite3
 import subprocess
 from pathlib import Path
 
+from conftest import InertResult, inert_run
 import pytest
+
 
 
 SCRIPT_SOURCE = Path(__file__).resolve().parent.parent / "bin" / "thingskit"
@@ -111,7 +113,7 @@ def rigged(thingskit, monkeypatch, tmp_path):
     monkeypatch.setattr(thingskit, "ensure_running", lambda: None)
     monkeypatch.setattr(
         thingskit.subprocess, "run",
-        lambda args, **kw: calls["open"].append(args),
+        lambda args, **kw: (calls["open"].append(args), InertResult())[1],
     )
     monkeypatch.setattr(thingskit, "time",
                          type("T", (), {"sleep": staticmethod(lambda s: None)}))
@@ -183,7 +185,8 @@ def test_heading_existing_in_other_project_is_created_in_target(
     monkeypatch.setattr(thingskit, "ensure_running", lambda: None)
     opened = []
     monkeypatch.setattr(thingskit.subprocess, "run",
-                         lambda args, **kw: opened.append(args))
+                         lambda args, **kw: (opened.append(args),
+                                            InertResult())[1])
     monkeypatch.setattr(thingskit, "time",
                          type("T", (), {"sleep": staticmethod(lambda s: None)}))
 
@@ -216,7 +219,7 @@ def test_ui_succeeds_but_heading_not_observed_fails(thingskit, monkeypatch, tmp_
     db_file = _make_db(tmp_path, [{"uuid": "P1", "title": "Projet A", "type": 1}])
     monkeypatch.setattr(thingskit, "db_path", lambda: db_file)
     monkeypatch.setattr(thingskit, "ensure_running", lambda: None)
-    monkeypatch.setattr(thingskit.subprocess, "run", lambda *a, **kw: None)
+    monkeypatch.setattr(thingskit.subprocess, "run", inert_run)
     monkeypatch.setattr(thingskit, "time",
                          type("T", (), {"sleep": staticmethod(lambda s: None)}))
     # osa "réussit" (rc=0, "OK") mais ne modifie rien en base : commande envoyée
@@ -231,7 +234,7 @@ def test_nominal_path_creates_and_verifies(thingskit, monkeypatch, tmp_path):
     db_file = _make_db(tmp_path, [{"uuid": "P1", "title": "Projet A", "type": 1}])
     monkeypatch.setattr(thingskit, "db_path", lambda: db_file)
     monkeypatch.setattr(thingskit, "ensure_running", lambda: None)
-    monkeypatch.setattr(thingskit.subprocess, "run", lambda *a, **kw: None)
+    monkeypatch.setattr(thingskit.subprocess, "run", inert_run)
     monkeypatch.setattr(thingskit, "time",
                          type("T", (), {"sleep": staticmethod(lambda s: None)}))
 
@@ -255,7 +258,7 @@ def test_ui_reports_accessibility_denied_fails_explicitly(thingskit, monkeypatch
     db_file = _make_db(tmp_path, [{"uuid": "P1", "title": "Projet A", "type": 1}])
     monkeypatch.setattr(thingskit, "db_path", lambda: db_file)
     monkeypatch.setattr(thingskit, "ensure_running", lambda: None)
-    monkeypatch.setattr(thingskit.subprocess, "run", lambda *a, **kw: None)
+    monkeypatch.setattr(thingskit.subprocess, "run", inert_run)
     monkeypatch.setattr(thingskit, "time",
                          type("T", (), {"sleep": staticmethod(lambda s: None)}))
     monkeypatch.setattr(
@@ -329,7 +332,7 @@ def test_the_displayed_project_is_refused_before_any_keystroke(
     db_file = _make_db(tmp_path, [{"uuid": "P1", "title": "Projet A", "type": 1}])
     monkeypatch.setattr(thingskit, "db_path", lambda: db_file)
     monkeypatch.setattr(thingskit, "ensure_running", lambda: None)
-    monkeypatch.setattr(thingskit.subprocess, "run", lambda *a, **kw: None)
+    monkeypatch.setattr(thingskit.subprocess, "run", inert_run)
     monkeypatch.setattr(thingskit, "time",
                         type("T", (), {"sleep": staticmethod(lambda s: None)}))
     sent = []
@@ -652,7 +655,7 @@ def test_ui_reports_not_frontmost_fails_explicitly(thingskit, monkeypatch, tmp_p
     db_file = _make_db(tmp_path, [{"uuid": "P1", "title": "Projet A", "type": 1}])
     monkeypatch.setattr(thingskit, "db_path", lambda: db_file)
     monkeypatch.setattr(thingskit, "ensure_running", lambda: None)
-    monkeypatch.setattr(thingskit.subprocess, "run", lambda *a, **kw: None)
+    monkeypatch.setattr(thingskit.subprocess, "run", inert_run)
     monkeypatch.setattr(thingskit, "time",
                         type("T", (), {"sleep": staticmethod(lambda s: None)}))
     monkeypatch.setattr(

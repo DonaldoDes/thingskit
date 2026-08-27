@@ -40,6 +40,34 @@ Sensitive zones). The most useful reports concern:
 - any leak or privilege escalation tied to the signed bundle or the build
   script (`build/bundle.py`).
 
+## What the CLI does not isolate — named residuals
+
+These are **known and accepted**, written down so that they stay findable.
+A risk left unsaid is a risk that comes back as a surprise.
+
+- **The Things URL-scheme authentication token travels in an `argv`.**
+  `move-task --to-heading` reads the token from the Things database
+  (`TMSettings.uriSchemeAuthenticationToken`, read-only) and hands it to
+  `/usr/bin/open` as part of the URL. While that child process lives, the
+  full command line — token included — is readable through the process
+  table (`ps`) by **any process running as the same user**. This follows
+  from how `open` is invoked; the exposure window has **not** been
+  measured, and no claim is made about how long it lasts. It is not
+  mitigated by the output capture added on 2026-08-27: capture bounds what
+  comes *back* on our file descriptors, not what the kernel exposes about a
+  running process. Closing it would require a different surface than the
+  URL scheme — none exists today for assigning a heading to an existing
+  to-do (measured, see `constitution.md` § Sensitive zones).
+- **Child-process error text is dropped.** Since 2026-08-27 every child is
+  spawned with its output captured, and a failure is reported by **return
+  code only**, never by quoting the argv. `open` distinguishes its causes
+  in that text (`kLSApplicationNotFoundErr`, `-10814`) while returning `1`
+  for all of them, so that distinction is lost. This is an accepted
+  trade-off: the post-action verification decides the effect in every case
+  and depends on no diagnostic from the launcher. Extracting the error
+  class from the captured text without quoting the argv is a possible
+  refinement, not a fix for a defect.
+
 ## Out of scope
 
 Bypassing the launcher's code-identity check by an **attacker who already

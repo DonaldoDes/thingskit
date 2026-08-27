@@ -26,6 +26,7 @@ import ast
 import sqlite3
 from pathlib import Path
 
+from conftest import InertResult, inert_run
 import pytest
 
 
@@ -58,6 +59,7 @@ CREATE TABLE TMTask (
 """
 
 TARGET = "AAAAAAAAAAAAAAAAAAAAAA"
+
 
 
 def _make_db(tmp_path, rows):
@@ -529,7 +531,7 @@ def _heading_rig(thingskit, monkeypatch, tmp_path, shown, land_heading=True):
         {"uuid": HEADING_PROJECT, "title": "Projet A", "type": 1}])
     monkeypatch.setattr(thingskit, "db_path", lambda: db_file)
     monkeypatch.setattr(thingskit, "ensure_running", lambda: None)
-    monkeypatch.setattr(thingskit.subprocess, "run", lambda *a, **kw: None)
+    monkeypatch.setattr(thingskit.subprocess, "run", inert_run)
     clock = Clock()
     monkeypatch.setattr(thingskit, "time", clock)
     ui = {"clicked_at": None, "scripts": [], "probes": 0}

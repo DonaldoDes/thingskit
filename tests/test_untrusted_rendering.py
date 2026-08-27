@@ -170,6 +170,8 @@ import sys
 import unicodedata
 from pathlib import Path
 
+from conftest import (is_child_spawn, spawn_argv, spawn_bindings,
+                      spawn_bounds_both_streams)
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -1214,10 +1216,30 @@ def _is_literal_exit_arg(arg, module_names) -> bool:
     return False
 
 
+def _is_inert_argv_element(node, module_names) -> bool:
+    """Un élément d'argv qui ne peut porter AUCUNE valeur composée.
+
+    La borne est posée sur ce qui est SÛR — un littéral, une constante de
+    module — jamais sur une liste des formes de composition connues. C'est
+    tout le correctif du 2026-08-27 : F15 ne déclenchait que sur un
+    `ast.JoinedStr`, alors que `f"{x}"`, `"a" + x`, `"a%s" % x`,
+    `"a{}".format(x)`, `str(x)` et `"".join(…)` écrivent la même chose. La
+    forme qui vivait RÉELLEMENT dans le script était la concaténation, et la
+    garde ne la voyait pas — elle couvrait l'exemple qui l'avait fait naître,
+    pas la classe qu'elle prétendait fermer.
+    """
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.Name):
+        return node.id in module_names
+    return False
+
+
 def scope_and_sink_findings(source: str) -> list[tuple[int, str]]:
     """Formes que le balayage ne voit pas — par la PORTÉE ou par le PUITS."""
     tree = ast.parse(source)
     module_names = _module_level_names(tree)
+    spawn_roots = spawn_bindings(tree)
     found: list[tuple[int, str]] = []
     top_funcs = [n for n in tree.body
                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
@@ -1297,16 +1319,30 @@ def scope_and_sink_findings(source: str) -> list[tuple[int, str]]:
                     if any(isinstance(n, ast.NamedExpr) for n in ast.walk(a)):
                         found.append((node.lineno, "walrus en argument de puits"))
             # F15 — stdio HÉRITÉ : ce que le fils écrit sort sur notre terminal.
-            if (isinstance(f, ast.Attribute)
-                    and f.attr in ("run", "call", "check_call", "Popen")
-                    and isinstance(f.value, ast.Name) and f.value.id == "subprocess"):
-                kw = {k.arg for k in node.keywords}
-                herite = not ({"capture_output", "stdout", "stderr"} & kw)
-                argv = node.args[0] if node.args else None
+            #
+            # Le RECENSEMENT (quels appels lancent un fils) et le PRÉDICAT DE
+            # CAPTURE (lesquels bornent leurs deux flux) sont partagés avec la
+            # garde de classe de `tests/test_url_scheme_token.py`, site de
+            # définition unique dans `conftest.py`. Ils y vivaient en deux
+            # copies jusqu'au 2026-08-27, et les deux portaient le même défaut :
+            # une DISJONCTION qui déclarait sûr un site bornant `stdout` seul,
+            # alors que `stderr` — le canal de la fuite — restait hérité.
+            if is_child_spawn(node, spawn_roots):
+                herite = not spawn_bounds_both_streams(node)
+                argv = spawn_argv(node)
                 if herite and isinstance(argv, (ast.List, ast.Tuple)) and any(
-                        isinstance(e, ast.JoinedStr) for e in argv.elts):
+                        not _is_inert_argv_element(e, module_names)
+                        for e in argv.elts):
                     found.append((node.lineno,
-                                  "subprocess à stdio hérité, argv interpolé"))
+                                  "subprocess à stdio hérité, argv composé"))
+                # L'argv passé par un NOM était un angle mort DÉCLARÉ de cette
+                # garde. Il n'a plus à l'être : ce que le nom porte est
+                # invisible ici, donc il vaut composé jusqu'à preuve du
+                # contraire — la sur-approximation est le bon sens d'erreur.
+                if (herite and isinstance(argv, ast.Name)
+                        and argv.id not in module_names):
+                    found.append((node.lineno,
+                                  "subprocess à stdio hérité, argv construit ailleurs"))
         # F12 — `except … as exc` puis `{exc}` : le nom n'est lié par aucune
         #       affectation, donc le balayage le tient pour non teinté.
         if isinstance(node, ast.ExceptHandler) and node.name:
@@ -1415,6 +1451,62 @@ def cmd_x(a):
 import subprocess
 def cmd_x(a):
     subprocess.run(["/usr/bin/open", f"things:///show?id={a.title}"], check=False)
+''',
+    # --- les QUATRE formes que F15 ne voyait pas (relevé du 2026-08-27) ------
+    #
+    # Le détecteur ne déclenchait que sur un `ast.JoinedStr` — la f-string.
+    # Or la composition d'un argv a autant de formes que Python en offre, et
+    # celle qui vivait RÉELLEMENT dans le script (`cmd_create_heading`) était
+    # la concaténation. Une garde qui nomme une forme au lieu de borner la
+    # classe ne couvre que l'exemple qui l'a fait naître.
+    "subprocess_a_stdio_herite_argv_concatene": '''
+import subprocess
+def cmd_x(a):
+    subprocess.run(["/usr/bin/open", "things:///show?id=" + a.title], check=False)
+''',
+    "subprocess_a_stdio_herite_argv_pourcent": '''
+import subprocess
+def cmd_x(a):
+    subprocess.run(["/usr/bin/open", "things:///show?id=%s" % a.title], check=False)
+''',
+    "subprocess_a_stdio_herite_argv_format": '''
+import subprocess
+def cmd_x(a):
+    subprocess.run(["/usr/bin/open", "things:///show?id={}".format(a.title)],
+                   check=False)
+''',
+    "subprocess_a_stdio_herite_argv_par_un_nom": '''
+import subprocess
+def cmd_x(a):
+    argv = ["/usr/bin/open", "things:///show?id=" + a.title]
+    subprocess.run(argv, check=False)
+''',
+    # --- relevé du 2026-08-27 : l'argv passé par MOT-CLÉ, et les formes que
+    # le recensement lui-même ne voyait pas. F15 ne lisait que `node.args[0]`,
+    # donc `args=` lui échappait ; et le recensement énumérait quatre noms
+    # d'appel, donc `check_output`, l'import direct, l'alias de module et
+    # l'indirection lui échappaient — avec leur argv composé au passage.
+    "subprocess_a_stdio_herite_argv_en_mot_cle": '''
+import subprocess
+def cmd_x(a):
+    subprocess.run(args=["/usr/bin/open", "things:///show?id=" + a.title],
+                   check=False)
+''',
+    "check_output_a_stderr_herite_argv_compose": '''
+import subprocess
+def cmd_x(a):
+    subprocess.check_output(["/usr/bin/open", "things:///show?id=" + a.title])
+''',
+    "stdout_borne_seul_laisse_stderr_herite": '''
+import subprocess
+def cmd_x(a):
+    subprocess.run(["/usr/bin/open", "things:///show?id=" + a.title],
+                   check=False, stdout=subprocess.DEVNULL)
+''',
+    "lancement_par_un_alias_de_module": '''
+import subprocess as sp
+def cmd_x(a):
+    sp.run(["/usr/bin/open", "things:///show?id=" + a.title], check=False)
 ''',
 }
 
