@@ -976,6 +976,19 @@ def test_the_heading_route_is_registered_in_cli_help(thingskit, run_cli):
     assert "move-task" in (thingskit.__doc__ or "")
 
 
+def test_the_help_text_does_not_carry_an_orphaned_negation(thingskit, run_cli):
+    """« Ne couvre AUSSI » est le résidu d'une inversion de phrase (« Ne
+    couvre PAS » devenu « Couvre aussi ») où le « Ne » d'origine n'a pas
+    été retiré. Le texte d'aide doit dire que la commande couvre AUSSI le
+    déplacement sous un en-tête, pas nier puis affirmer dans la même
+    phrase."""
+    code, out, _ = run_cli(["move-task", "--help"])
+    assert code == 0
+    flat = " ".join(out.split())
+    assert "Ne couvre AUSSI" not in flat
+    assert "Couvre aussi le déplacement sous un EN-TÊTE" in flat
+
+
 # --- fenêtres de course : la base bouge sous nos pieds --------------------
 #
 # Things écrit en continu. Entre deux requêtes, un objet peut disparaître —
