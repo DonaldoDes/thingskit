@@ -367,8 +367,8 @@ def test_no_character_class_is_refused_upfront(thingskit, live):
     pas déduite : la sonde de bout en bout du 2026-08-12 (tâche jetable réelle)
     a relu en base exactement la chaîne envoyée pour chacune des classes
     ci-dessus, CR et CRLF compris. Refuser une classe qui passe serait un
-    sur-refus. Le garde de `create-heading` (`_untypable_chars`) ne s'applique
-    pas ici : son risque venait de `keystroke`, pas de `_esc`."""
+    sur-refus. Le garde de `create-heading` (`_refused_title_chars`) ne s'applique
+    pas ici : son motif est propre à cette commande, pas au transport `_esc`."""
     calls, setup = live
     db = setup([{"uuid": TARGET, "title": "Cible"}])
     hostile = "a\rb\r\nc\td\x1be"

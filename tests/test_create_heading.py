@@ -407,9 +407,9 @@ def test_typable_titles_are_accepted(thingskit, rigged, title):
     assert len(calls["osa"]) == 1  # le garde ne doit pas sur-refuser
 
 
-def test_untypable_chars_lists_offenders(thingskit):
-    assert thingskit._untypable_chars("propre") == []
-    assert thingskit._untypable_chars("a\nb\tc") == ["U+000A", "U+0009"]
+def test_refused_title_chars_lists_offenders(thingskit):
+    assert thingskit._refused_title_chars("propre") == []
+    assert thingskit._refused_title_chars("a\nb\tc") == ["U+000A", "U+0009"]
 
 
 # ---------------------------------------------------------------------------
@@ -704,3 +704,295 @@ def test_the_foreground_check_refuses_when_things_is_not_frontmost(thingskit):
 
     assert rc != 0, "la garde a laissé passer une frappe hors de Things"
     assert "ZZ_MARKER" in out
+
+
+# ---------------------------------------------------------------------------
+# Saisie par COLLAGE, jamais par frappe caractère par caractère
+#
+# `keystroke "<titre>"` demande à System Events de retrouver, pour CHAQUE
+# caractère, une combinaison de touches qui le produise sur la disposition
+# courante. Quand il n'y en a pas, il ne renonce pas : il frappe le code de
+# touche virtuel 0, qui est `a` sur cette disposition. Mesuré le 2026-08-27 sur
+# la vraie base, par la commande elle-même :
+#
+#     thingskit create-heading --project "…" "Éprouvé — formalités é à ù ç"
+#     -> en base : 'aprouva — formalitas a a a ç'
+#
+# É, é, à, ù -> `a` ; `ç` et `—` intacts (`ç` est une touche unique sur cette
+# disposition, les autres exigent une touche morte). Ce n'est donc PAS un
+# défaut d'Unicode : c'est la COMPOSITION qui échoue, et elle échoue en
+# silence, avec rc=0 côté AppleScript.
+#
+# Le collage est une opération unique, indépendante de la disposition. Mesuré
+# le même jour, même projet jetable : titre demandé `PROBE-é-à-ù-ç`, titre relu
+# `PROBE-é-à-ù-ç`, caractère pour caractère.
+# ---------------------------------------------------------------------------
+
+PASTE_CHORD = 'keystroke "v" using {command down}'
+
+
+def test_the_title_never_reaches_a_literal_keystroke(thingskit):
+    """Le titre ne doit apparaître QUE dans l'écriture du presse-papiers.
+
+    Une frappe littérale du titre est le défaut mesuré : elle ne transporte
+    pas les caractères composés.
+    """
+    title = "Éprouvé — formalités é à ù ç"
+    script = thingskit._build_heading_script(title, "Projet A")
+
+    assert f'keystroke "{title}"' not in script
+    assert PASTE_CHORD in script
+    assert f'set the clipboard to "{title}"' in script
+
+
+def test_the_only_keystroke_left_is_the_paste_chord(thingskit):
+    """Balayage, pas échantillon : toute autre frappe rouvrirait la classe."""
+    script = thingskit._build_heading_script("Éprouvé é", "Projet A")
+    frappes = re.findall(r'keystroke [^\n]*', script)
+
+    assert frappes == [PASTE_CHORD], frappes
+
+
+def test_the_pasted_title_still_goes_through_the_escape_function(thingskit):
+    """Le titre part toujours dans un littéral AppleScript : `_esc` reste
+    obligatoire — le presse-papiers ne change rien à l'évasion de littéral."""
+    script = thingskit._build_heading_script('Il a dit "non" \\ ici', "Projet A")
+
+    assert 'set the clipboard to "Il a dit \\"non\\" \\\\ ici"' in script
+
+
+def test_the_clipboard_is_taken_before_any_click(thingskit):
+    """Le presse-papiers est pris AVANT le clic de menu : son refus (contenu
+    non restituable) doit pouvoir tomber sans qu'aucun en-tête n'ait été créé.
+    """
+    script = thingskit._build_heading_script("Section", "Projet A")
+
+    assert script.index('set the clipboard to "Section"') < script.index("click menu item")
+
+
+def test_the_clipboard_is_saved_before_being_overwritten(thingskit):
+    script = thingskit._build_heading_script("Section", "Projet A")
+
+    assert script.index("the clipboard as record") < \
+        script.index('set the clipboard to "Section"')
+
+
+def test_an_unrestorable_clipboard_is_refused_before_it_is_overwritten(thingskit):
+    """Ce qu'on ne sait pas rendre, on ne l'écrase pas : le refus précède
+    l'écriture du presse-papiers ET le clic."""
+    script = thingskit._build_heading_script("Section", "Projet A")
+    refus = script.index(thingskit._CLIPBOARD_UNSAVEABLE_MARKER)
+
+    assert refus < script.index('set the clipboard to "Section"')
+    assert refus < script.index("click menu item")
+
+
+def test_the_clipboard_is_restored_on_the_success_path(thingskit):
+    """La remise doit être HORS du `try`, sur le chemin que le succès emprunte.
+
+    Une assertion sur la première occurrence du texte de remise ne le dit pas :
+    celle de la branche d'erreur suit elle aussi le collage, et la retirer du
+    chemin de succès laissait la suite verte (mutation mesurée le 2026-08-27).
+    """
+    script = thingskit._build_heading_script("Section", "Projet A")
+    # DERNIER `end try` : le script en compte cinq autres, tous antérieurs
+    # (sonde d'affichage, premier plan, prise du presse-papiers). Ancrer sur le
+    # premier laissait `apres_try` couvrir tout le script, donc la remise de la
+    # branche d'erreur — et la mutation survivait.
+    apres_try = script[script.rindex("\nend try\n"):]
+
+    assert "set the clipboard to savedClip" in apres_try, script
+    assert apres_try.index("set the clipboard to savedClip") < \
+        apres_try.index('return "OK"')
+
+
+def test_the_clipboard_is_restored_on_the_error_path_which_then_reraises(thingskit):
+    """Un échec entre la prise et la remise laisserait le titre de l'utilisateur
+    dans SON presse-papiers. La remise est donc dans la branche d'erreur, et
+    l'erreur est relancée telle quelle — sans quoi les marqueurs de refus
+    seraient avalés et un échec passerait pour un succès."""
+    script = thingskit._build_heading_script("Section", "Projet A")
+    branche = script[script.index("on error errMsg number errNum"):]
+
+    assert "set the clipboard to savedClip" in branche
+    assert "error errMsg number errNum" in branche
+    assert branche.index("set the clipboard to savedClip") < \
+        branche.index("\n  error errMsg number errNum")
+
+
+def test_an_empty_clipboard_is_left_empty_not_carrying_our_title(thingskit):
+    """Rien à rendre ne veut pas dire « garder le nôtre » : le titre ne doit
+    pas survivre à la commande dans le presse-papiers de l'utilisateur."""
+    script = thingskit._build_heading_script("Section", "Projet A")
+
+    assert 'set the clipboard to ""' in script
+
+
+def test_interpret_ui_outcome_names_the_unrestorable_clipboard(thingskit):
+    ok, msg = thingskit._interpret_ui_outcome(
+        1, f'error "{thingskit._CLIPBOARD_UNSAVEABLE_MARKER}" number -2700')
+
+    assert not ok
+    assert "presse-papiers" in msg
+    assert "rien n'a été cliqué ni tapé" in msg
+
+
+# ---------------------------------------------------------------------------
+# La vérification post-action refuse un titre qui DIFFÈRE de celui demandé
+#
+# Elle le refusait déjà (`_find_heading` compare le titre exact), mais son
+# message taisait ce qui avait été créé : l'utilisateur restait avec un objet
+# parasite dans sa base et aucun nom pour le retrouver. Deux en-têtes
+# `…formalitas` en double dans la vraie base disent exactement cela — un appel
+# en échec, réessayé.
+# ---------------------------------------------------------------------------
+
+def _rigged_ui_creating(thingskit, monkeypatch, tmp_path, created_title):
+    db_file = _make_db(tmp_path, [{"uuid": "P1", "title": "Projet A", "type": 1}])
+    monkeypatch.setattr(thingskit, "db_path", lambda: db_file)
+    monkeypatch.setattr(thingskit, "ensure_running", lambda: None)
+    monkeypatch.setattr(thingskit.subprocess, "run", inert_run)
+    monkeypatch.setattr(thingskit, "time",
+                        type("T", (), {"sleep": staticmethod(lambda s: None)}))
+
+    def _ui(script):
+        if created_title is not None:
+            con = sqlite3.connect(db_file)
+            con.execute(
+                "insert into TMTask (uuid,title,type,trashed,project) "
+                "values (?,?,2,0,'P1')", ("H-PARASITE", created_title))
+            con.commit()
+            con.close()
+        return 0, "OK"
+
+    monkeypatch.setattr(thingskit, "osa", _osa_answering_the_view_probe(_ui))
+    return db_file
+
+
+def test_a_heading_created_under_another_title_fails_and_names_it(
+        thingskit, monkeypatch, tmp_path, capsys):
+    """La corruption mesurée, rejouée : l'automatisation rend « OK » et crée un
+    en-tête d'un AUTRE nom. Code retour non nul, et le message NOMME l'objet
+    parasite — sinon l'utilisateur ne peut pas le retrouver pour l'effacer."""
+    _rigged_ui_creating(thingskit, monkeypatch, tmp_path,
+                        "aprouva — formalitas a a a ç")
+
+    rc = thingskit.cmd_create_heading(
+        _ns(title="Éprouvé — formalités é à ù ç", project="Projet A"))
+    err = capsys.readouterr().err
+
+    assert rc != 0
+    assert "aprouva — formalitas a a a ç" in err
+    assert "H-PARASITE" in err
+
+
+def test_no_stray_is_reported_when_the_ui_created_nothing(
+        thingskit, monkeypatch, tmp_path, capsys):
+    """Contre-épreuve du sur-signalement : sans objet parasite, le message ne
+    doit pas en inventer un."""
+    _rigged_ui_creating(thingskit, monkeypatch, tmp_path, None)
+
+    rc = thingskit.cmd_create_heading(_ns(title="Section", project="Projet A"))
+    err = capsys.readouterr().err
+
+    assert rc != 0
+    assert "H-PARASITE" not in err
+    assert "autre titre" not in err
+
+
+def test_a_preexisting_heading_of_another_title_is_never_taken_for_a_stray(
+        thingskit, monkeypatch, tmp_path, capsys):
+    """L'objet parasite se relève par DIFFÉRENCE avec l'état d'avant l'appel.
+    Un en-tête qui était déjà là ne prouve rien sur ce que l'appel a fait."""
+    db_file = _make_db(tmp_path, [
+        {"uuid": "P1", "title": "Projet A", "type": 1},
+        {"uuid": "H-VIEUX", "title": "Déjà là", "type": 2, "project": "P1"},
+    ])
+    monkeypatch.setattr(thingskit, "db_path", lambda: db_file)
+    monkeypatch.setattr(thingskit, "ensure_running", lambda: None)
+    monkeypatch.setattr(thingskit.subprocess, "run", inert_run)
+    monkeypatch.setattr(thingskit, "time",
+                        type("T", (), {"sleep": staticmethod(lambda s: None)}))
+    monkeypatch.setattr(thingskit, "osa", lambda script: (0, "OK"))
+
+    rc = thingskit.cmd_create_heading(_ns(title="Section", project="Projet A"))
+    err = capsys.readouterr().err
+
+    assert rc != 0
+    assert "H-VIEUX" not in err
+
+
+def test_an_unreadable_database_is_not_reported_as_nothing_created(
+        thingskit, monkeypatch, tmp_path, capsys):
+    """« Jamais observé » n'est pas « rien de créé ». Base illisible pendant
+    toute l'attente : le message doit le DIRE, pas affirmer un vide."""
+    db_file = _make_db(tmp_path, [{"uuid": "P1", "title": "Projet A", "type": 1}])
+    monkeypatch.setattr(thingskit, "db_path", lambda: db_file)
+    monkeypatch.setattr(thingskit, "ensure_running", lambda: None)
+    monkeypatch.setattr(thingskit.subprocess, "run", inert_run)
+    monkeypatch.setattr(thingskit, "time",
+                        type("T", (), {"sleep": staticmethod(lambda s: None)}))
+    monkeypatch.setattr(thingskit, "osa", lambda script: (0, "OK"))
+
+    reel = thingskit.q
+    etat = {"muet": False}
+
+    def _q(sql, args=()):
+        if etat["muet"]:
+            raise sqlite3.OperationalError("database is locked")
+        return reel(sql, args)
+
+    # Le relevé d'AVANT passe ; toute lecture ultérieure est muette.
+    def _osa(script):
+        etat["muet"] = True
+        return 0, "OK"
+
+    monkeypatch.setattr(thingskit, "osa", _osa)
+    monkeypatch.setattr(thingskit, "q", _q)
+
+    rc = thingskit.cmd_create_heading(_ns(title="Section", project="Projet A"))
+    err = capsys.readouterr().err
+
+    assert rc != 0
+    assert "illisible" in err
+    assert "aucun en-tête nouveau" not in err
+
+
+def test_the_failure_message_uses_the_observed_state_not_a_fresh_query(
+        thingskit, monkeypatch, tmp_path, capsys):
+    """Course : l'en-tête atterrit APRÈS le dernier sondage. Une relecture dans
+    la branche d'échec citerait le BON titre en annonçant qu'il est mauvais.
+    Le relevé vient de la sonde, donc le message reste juste."""
+    db_file = _make_db(tmp_path, [{"uuid": "P1", "title": "Projet A", "type": 1}])
+    monkeypatch.setattr(thingskit, "db_path", lambda: db_file)
+    monkeypatch.setattr(thingskit, "ensure_running", lambda: None)
+    monkeypatch.setattr(thingskit.subprocess, "run", inert_run)
+    monkeypatch.setattr(thingskit, "time",
+                        type("T", (), {"sleep": staticmethod(lambda s: None)}))
+    monkeypatch.setattr(thingskit, "osa", lambda script: (0, "OK"))
+
+    reel = thingskit.wait_for_effect
+
+    # `cmd_create_heading` attend DEUX fois : la vue affichée, puis l'en-tête.
+    # C'est la seconde qui nous intéresse.
+    pose = {"appels": 0}
+
+    def _wait(sonde, **kw):
+        verdict = reel(sonde, **kw)
+        pose["appels"] += 1
+        if pose["appels"] == 2:                 # l'effet atterrit APRÈS
+            con = sqlite3.connect(db_file)
+            con.execute("insert into TMTask (uuid,title,type,trashed,project) "
+                        "values ('H-TARDIF','Section',2,0,'P1')")
+            con.commit()
+            con.close()
+        return verdict
+
+    monkeypatch.setattr(thingskit, "wait_for_effect", _wait)
+
+    rc = thingskit.cmd_create_heading(_ns(title="Section", project="Projet A"))
+    err = capsys.readouterr().err
+
+    assert rc != 0
+    assert "H-TARDIF" not in err
+    assert "AUTRE titre" not in err

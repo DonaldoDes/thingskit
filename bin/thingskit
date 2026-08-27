@@ -28,10 +28,29 @@ Constaté par test le 2026-08-11, pas déduit de la documentation :
   Heading         créer (projet   -> JSON, dans `items` à la création du projet
                   neuf)              (`create-project --heading`)
                   créer (projet   -> AUCUNE surface API (URL scheme, JSON,
-                  existant)          AppleScript) ne l'expose. Seule
+                  existant)          AppleScript) ne l'expose. Re-mesuré le
+                                    2026-08-27, jeton en main (le jeton se lit
+                                    en base depuis US-010, l'ancien constat
+                                    avait pu être fait sans) : `{"type":
+                                    "project", "operation": "update",
+                                    "attributes": {"items": [{"type":
+                                    "heading", …}]}}` -> `open` rend 0 et
+                                    AUCUN en-tête n'est créé. Seule
                                     l'automatisation d'interface fonctionne
                                     (menu Fichier > "Nouvel en-tête" ou
                                     équivalent localisé) : `create-heading`
+                  saisie du titre -> par COLLAGE (Cmd-V), jamais par frappe
+                                    caractère par caractère. `keystroke` ne
+                                    sait pas produire une lettre accentuée
+                                    COMPOSÉE : il frappe le code de touche
+                                    virtuel 0, soit `a`. Mesuré le 2026-08-27
+                                    sur la vraie base — "Éprouvé — formalités
+                                    é à ù ç" est arrivé en base sous la forme
+                                    'aprouva — formalitas a a a ç', rc=0 côté
+                                    AppleScript. `ç` et `—` passaient : le
+                                    défaut est de COMPOSITION, pas d'Unicode.
+                                    Le presse-papiers est sauvegardé avant et
+                                    rendu après (§ Zones sensibles 2)
                   notes          -> NON. `to do id "<uuid de heading>"` RÉSOUT
                                     et `set notes` y retourne 0, mais la valeur
                                     n'est ni relue par AppleScript ni présente
@@ -919,6 +938,16 @@ HEADING_VIEW_PROBE_TIMEOUT = 5
 HEADING_FRONTMOST_ATTEMPTS = 100
 HEADING_FRONTMOST_POLL_INTERVAL = 0.05
 
+# HEADING_PASTE_COMMIT_DELAY — délai entre le collage (Cmd-V) et la validation
+# (`key code 36`). C'est une durée DEVINÉE, et elle est déclarée comme telle,
+# au même titre que le `delay 0.4` qui la précède : la condition à observer
+# serait « le champ porte le texte collé », qui n'est lisible que par l'arbre
+# d'accessibilité et dont l'établissement sur pièce impose de créer réellement
+# un en-tête dans une base réelle. Son échec n'est pas silencieux : un collage
+# non abouti produit un en-tête au titre VIDE, que la vérification post-action
+# constate et NOMME (cf. `cmd_create_heading`).
+HEADING_PASTE_COMMIT_DELAY = 0.4
+
 
 def wait_for_effect(probe, timeout: float = WRITE_TIMEOUT,
                     interval: float = POLL_INTERVAL):
@@ -1570,6 +1599,12 @@ _NOT_FRONTMOST_MARKER = "THINGSKIT_NOT_FRONTMOST"
 # menu a déjà été cliqué et un en-tête SANS TITRE a pu être créé. Le message
 # doit le dire — un refus qui tait un effet déjà produit est un faux refus.
 _LOST_FOCUS_MARKER = "THINGSKIT_LOST_FOCUS"
+# Le presse-papiers porte quelque chose que nous ne saurions pas rendre à
+# l'identique. Il appartient à l'utilisateur : on refuse AVANT de l'écraser,
+# donc avant le clic de menu — rien n'est créé, rien n'est perdu. Distinct des
+# précédents : là c'est l'application qui n'est pas dans l'état attendu, ici
+# c'est une ressource de l'utilisateur qu'on renonce à emprunter.
+_CLIPBOARD_UNSAVEABLE_MARKER = "THINGSKIT_CLIPBOARD_UNSAVEABLE"
 
 _ACCESSIBILITY_ERROR_MARKERS = (
     "not allowed assistive access",
@@ -1580,25 +1615,41 @@ _ACCESSIBILITY_ERROR_MARKERS = (
 )
 
 
-# Caractères que `keystroke` ne peut pas taper comme un caractère littéral :
-# `_esc` les transmet FIDÈLEMENT (mesuré : un saut de ligne source arrive avec
-# l'identifiant AppleScript 10), et c'est exactement le problème — dans le champ
-# de saisie d'un heading, un retour à la ligne vaut validation. Le heading est
-# alors créé tronqué, et le reste de la frappe part hors du champ visé : un
-# effet de bord irréversible que la vérification post-action constate sans
-# pouvoir le défaire. D'où un refus AVANT toute activation de l'application.
-# Classe = catégories Unicode Cc (contrôles, dont \n \r \t \x1b \x7f),
-# Zl / Zp (séparateurs de ligne/paragraphe U+2028/U+2029).
-_UNTYPABLE_CATEGORIES = ("Cc", "Zl", "Zp")
+# Classe de caractères REFUSÉE dans un titre d'en-tête. Catégories Unicode Cc
+# (contrôles, dont \n \r \t \x1b \x7f), Zl / Zp (séparateurs de ligne et de
+# paragraphe U+2028/U+2029).
+#
+# **Le motif d'origine est RÉFUTÉ, et il faut le dire avant tout le reste.**
+# Il était : « `keystroke` les tape, et dans le champ de saisie un retour à la
+# ligne vaut validation — en-tête tronqué, frappe orpheline hors du champ ».
+# Cela valait de la frappe caractère par caractère. Depuis que le titre est
+# COLLÉ (cf. `_build_heading_script`), c'est faux : mesuré le 2026-08-27 sur la
+# vraie base, dans un projet jetable, un titre "AVANT-é\nAPRES-ù\tTAB\x1bESC"
+# collé puis validé arrive en base OCTET POUR OCTET — pas de troncature, pas de
+# frappe orpheline, un seul en-tête créé.
+#
+# Ce qui reste est une DÉCISION, plus une nécessité physique : le CLI ne
+# fabrique pas d'objet dont le NOM porte une classe qu'il refuse d'émettre
+# brute sur sa propre sortie (`_REFUSED_CATEGORIES`, § Zones sensibles 1, dont
+# Cc/Zl/Zp sont un sous-ensemble). Un léger sur-refus, assumé, du côté qui ne
+# casse rien — même posture que le refus de l'homonyme projet/area dans cette
+# même commande.
+#
+# Ce qui le lèverait, et qui n'a PAS été fait : mesurer la classe ENTIÈRE par
+# le chemin du collage. Trois caractères sur les neuf du banc de test l'ont été
+# (\n, \t, \x1b) ; trois qui passent n'établissent pas neuf, et U+0000 en
+# particulier traverse `_esc` sans conversion et n'a jamais été mesuré à
+# travers `osascript`.
+_REFUSED_TITLE_CATEGORIES = ("Cc", "Zl", "Zp")
 
 
-def _untypable_chars(s: str) -> list[str]:
+def _refused_title_chars(s: str) -> list[str]:
     """Liste, en ordre d'apparition et sans doublon, les caractères de `s` qui
-    ne peuvent pas être saisis littéralement par une frappe clavier. Pure.
+    sont refusés dans un titre d'en-tête. Pure.
     """
     found: list[str] = []
     for c in s:
-        if unicodedata.category(c) in _UNTYPABLE_CATEGORIES:
+        if unicodedata.category(c) in _REFUSED_TITLE_CATEGORIES:
             code = f"U+{ord(c):04X}"
             if code not in found:
                 found.append(code)
@@ -1689,12 +1740,75 @@ def _build_view_probe_script(project_title: str) -> str:
               'return "OK"\n')
 
 
+def _clipboard_capture_lines() -> str:
+    """Lignes AppleScript qui EMPRUNTENT le presse-papiers de l'utilisateur.
+
+    Il ne nous appartient pas. Trois cas, et le refus est le cas par défaut :
+
+      - vide : rien à rendre, `savedClip` reste `missing value` et la remise
+        le remettra vide (jamais notre titre) ;
+      - restituable : sauvegardé en `record`, tous ses parfums avec lui ;
+      - non restituable : REFUS (`_CLIPBOARD_UNSAVEABLE_MARKER`), AVANT toute
+        écriture. Ce qu'on ne sait pas rendre, on ne l'écrase pas — et comme
+        ces lignes précèdent le clic de menu, le refus ne laisse aucun objet
+        derrière lui.
+
+    `clipboard info` distingue « vide » de « non restituable » : sans lui, les
+    deux se confondraient en un `try` muet, et un presse-papiers non
+    restituable serait écrasé puis rendu vide.
+    """
+    return (
+        'set savedClip to missing value\n'
+        'set hadClip to false\n'
+        'try\n'
+        '  if (count of (clipboard info)) > 0 then set hadClip to true\n'
+        'end try\n'
+        'if hadClip then\n'
+        '  try\n'
+        '    set savedClip to (the clipboard as record)\n'
+        '  end try\n'
+        '  if savedClip is missing value then error '
+        f'"{_esc(_CLIPBOARD_UNSAVEABLE_MARKER)}"\n'
+        'end if\n'
+    )
+
+
+def _clipboard_restore_lines(indent: str = "") -> str:
+    """Lignes AppleScript qui RENDENT le presse-papiers.
+
+    UN seul site de définition, employé sur les DEUX chemins (succès et
+    erreur) : deux copies divergeraient, et celle qui rend cesserait de
+    décrire celle qui emprunte.
+
+    `set the clipboard to ""` quand il n'y avait rien : le titre de
+    l'utilisateur ne doit pas SURVIVRE à la commande dans son presse-papiers.
+    """
+    return (
+        f'{indent}if savedClip is not missing value then\n'
+        f'{indent}  set the clipboard to savedClip\n'
+        f'{indent}else\n'
+        f'{indent}  set the clipboard to ""\n'
+        f'{indent}end if\n'
+    )
+
+
 def _build_heading_script(title: str, project_title: str,
                           labels: tuple[str, ...] = HEADING_MENU_LABELS) -> str:
     """Compose l'AppleScript : vérifie que la fenêtre au premier plan affiche
-    bien le projet visé, cherche le premier libellé de menu connu qui existe
-    réellement, clique dessus, saisit le titre, valide. Pure — testable sans
-    System Events (on vérifie le texte produit).
+    bien le projet visé, emprunte le presse-papiers, cherche le premier
+    libellé de menu connu qui existe réellement, clique dessus, COLLE le
+    titre, valide, rend le presse-papiers. Pure — testable sans System Events
+    (on vérifie le texte produit).
+
+    Le titre est COLLÉ et non frappé : `keystroke` ne sait pas produire une
+    lettre accentuée composée et frappe alors le code de touche virtuel 0
+    (`a`), en silence. Mesuré le 2026-08-27, cf. docstring module.
+
+    Le presse-papiers est pris AVANT le clic, pour que son refus (contenu non
+    restituable) tombe sans qu'aucun en-tête n'ait été créé, et rendu sur les
+    DEUX chemins — la branche d'erreur relance l'erreur telle quelle, sinon
+    les marqueurs de refus seraient avalés et un échec passerait pour un
+    succès.
 
     Le contrôle d'affichage est REFAIT ici alors que la sonde vient de le
     passer : la fenêtre peut changer entre les deux, et surtout le trou
@@ -1712,30 +1826,42 @@ def _build_heading_script(title: str, project_title: str,
     return (
         'tell application "Things3" to activate\n'
         + _frontmost_check(_NOT_FRONTMOST_MARKER, HEADING_FRONTMOST_ATTEMPTS)
-        + _shown_list_comparison(project_title) +
-        'tell application "System Events"\n'
-        '  tell process "Things3"\n'
-        '    set targetLabel to missing value\n'
-        f'    repeat with candidate in {{{candidates}}}\n'
-        '      try\n'
-        '        if exists menu item candidate of menu "Fichier" of menu bar '
+        + _shown_list_comparison(project_title)
+        + _clipboard_capture_lines()
+        + f'set the clipboard to "{_esc(title)}"\n'
+        'try\n'
+        '  tell application "System Events"\n'
+        '    tell process "Things3"\n'
+        '      set targetLabel to missing value\n'
+        f'      repeat with candidate in {{{candidates}}}\n'
+        '        try\n'
+        '          if exists menu item candidate of menu "Fichier" of menu bar '
         'item "Fichier" of menu bar 1 then\n'
-        '          set targetLabel to candidate\n'
-        '          exit repeat\n'
-        '        end if\n'
-        '      end try\n'
-        '    end repeat\n'
-        f'    if targetLabel is missing value then error "{_NO_LABEL_MARKER}"\n'
-        '    click menu item targetLabel of menu "Fichier" of menu bar item '
+        '            set targetLabel to candidate\n'
+        '            exit repeat\n'
+        '          end if\n'
+        '        end try\n'
+        '      end repeat\n'
+        f'      if targetLabel is missing value then error "{_NO_LABEL_MARKER}"\n'
+        '      click menu item targetLabel of menu "Fichier" of menu bar item '
         '"Fichier" of menu bar 1\n'
+        '    end tell\n'
         '  end tell\n'
-        'end tell\n'
-        'delay 0.4\n'
+        '  delay 0.4\n'
+        # Indentation cosmétique non tenue ici : AppleScript n'en fait
+        # rien, et un helper de mise en forme serait du code à garder
+        # pour un effet nul.
         + _frontmost_check(_LOST_FOCUS_MARKER, 1) +
-        'tell application "System Events"\n'
-        f'  keystroke "{_esc(title)}"\n'
-        '  key code 36\n'
-        'end tell\n'
+        '  tell application "System Events"\n'
+        '    keystroke "v" using {command down}\n'
+        f'    delay {HEADING_PASTE_COMMIT_DELAY}\n'
+        '    key code 36\n'
+        '  end tell\n'
+        'on error errMsg number errNum\n'
+        + _clipboard_restore_lines("  ") +
+        '  error errMsg number errNum\n'
+        'end try\n'
+        + _clipboard_restore_lines() +
         'return "OK"\n'
     )
 
@@ -1759,6 +1885,14 @@ def _interpret_ui_outcome(rc: int, out: str) -> tuple[bool, str]:
             "frappe — rien n'a été tapé, mais le clic, lui, a eu lieu : un "
             "en-tête SANS TITRE a pu être créé dans le projet visé, à "
             f"supprimer à la main le cas échéant ({out!r})"
+        )
+    if _CLIPBOARD_UNSAVEABLE_MARKER in out:
+        return False, (
+            "le presse-papiers porte un contenu que le CLI ne saurait pas "
+            "restituer à l'identique — le titre y transite le temps du "
+            "collage, et l'écraser sans pouvoir le rendre n'est pas à nous de "
+            "le décider : rien n'a été cliqué ni tapé, le presse-papiers est "
+            f"intact. Le vider ou le simplifier, puis réessayer ({out!r})"
         )
     if _NO_WINDOW_MARKER in out:
         return False, (
@@ -1823,6 +1957,19 @@ def _resolve_project_for_heading(title: str) -> tuple[str | None, str | None]:
     return rows[0][0], None
 
 
+def _heading_titles(project_uuid: str) -> dict[str, str]:
+    """uuid -> titre des en-têtes ACTIFS du projet. Relevé AVANT l'écriture,
+    pour que l'échec puisse NOMMER ce qui a été créé au lieu du titre demandé.
+
+    Sans ce relevé, un en-tête déjà présent passerait pour l'objet parasite —
+    « il en existe un d'un autre titre » ne prouve rien sur ce que l'appel
+    vient de faire. Même second temps que la garde de placement d'`add-task`.
+    """
+    return {u: t for u, t in q(
+        "select uuid, title from TMTask where project=? and type=? and "
+        "trashed=0", (project_uuid, TYPE_HEADING))}
+
+
 def _find_heading(project_uuid: str, title: str) -> str | None:
     rows = q("select uuid from TMTask where project=? and type=? and title=? "
              "and trashed=0", (project_uuid, TYPE_HEADING, title))
@@ -1830,7 +1977,7 @@ def _find_heading(project_uuid: str, title: str) -> str | None:
 
 
 def cmd_create_heading(a) -> int:
-    offenders = _untypable_chars(a.title)
+    offenders = _refused_title_chars(a.title)
     if offenders:
         print(f"titre refusé : {a.title!r} contient des caractères non "
               f"saisissables au clavier ({', '.join(offenders)}) — ils "
@@ -1847,6 +1994,8 @@ def cmd_create_heading(a) -> int:
     if _find_heading(project_uuid, a.title):
         print(f"déjà présent, rien à faire : {a.title!r} (projet {a.project!r})")
         return 0
+
+    before = _heading_titles(project_uuid)
 
     ensure_running()
     # `project_uuid` est d'origine non contrôlée, et il repart DEUX fois
@@ -1881,10 +2030,40 @@ def cmd_create_heading(a) -> int:
         print(f"ÉCHEC création heading {a.title!r} : {msg}", file=sys.stderr)
         return 1
 
-    if not wait_for_effect(lambda: _find_heading(project_uuid, a.title)):
+    # Un en-tête a-t-il été créé sous un AUTRE titre ? C'est le cas mesuré le
+    # 2026-08-27 sur la vraie base : l'automatisation rend « OK », l'objet
+    # existe, son nom diffère. Le taire laissait l'utilisateur avec un objet
+    # parasite et aucun nom pour le retrouver — et l'appelant qui réessaie en
+    # fabriquait un second (deux `…formalitas` en double, constatés).
+    #
+    # Le relevé se fait DANS la sonde, jamais par une seconde lecture dans la
+    # branche d'échec : l'en-tête peut atterrir entre le dernier sondage et la
+    # composition du message, et la relecture citerait alors le BON titre en
+    # annonçant qu'il est mauvais. `None` = jamais observé (base restée
+    # illisible pendant toute l'attente), et ce n'est pas la même chose que
+    # « rien de créé ».
+    observed: dict[str, list[tuple[str, str]] | None] = {"strays": None}
+
+    def _heading_observed() -> bool:
+        current = _heading_titles(project_uuid)
+        observed["strays"] = [(u, t) for u, t in current.items()
+                              if u not in before]
+        return a.title in current.values()
+
+    if not wait_for_effect(_heading_observed):
+        strays = observed["strays"]
+        if strays is None:
+            detail = (" — la base est restée illisible pendant toute "
+                      "l'attente : ce qui a pu être créé n'a pas pu être relevé")
+        elif strays:
+            detail = (" — un en-tête a pourtant été créé sous un AUTRE titre, "
+                      "à supprimer à la main : " +
+                      ", ".join(f"{t!r} ({_rendered(u)})" for u, t in strays))
+        else:
+            detail = " — aucun en-tête nouveau observé dans le projet"
         print(f"ÉCHEC création heading {a.title!r} : automatisation exécutée "
               "mais heading non constaté en base — code retour = échec, pas "
-              "'commande envoyée'", file=sys.stderr)
+              f"'commande envoyée'{detail}", file=sys.stderr)
         return 1
 
     print(f"heading créé : {a.title!r} (projet {a.project!r})")
@@ -2006,8 +2185,9 @@ def _write_task_notes(task_id: str, title: str, notes: str, kind: str = "tâche"
     CRLF, tabulation, URI percent-encodée, guillemets et antislashs, emoji
     hors BMP, U+2028) — la valeur relue en base est à chaque fois **exactement**
     la chaîne source. Aucune classe n'étant altérée, aucune n'est refusée : le
-    garde de saisie de `create-heading` (`_untypable_chars`) ne s'applique pas
-    ici, son risque venait de `keystroke`, pas de `_esc`.
+    garde de titre de `create-heading` (`_refused_title_chars`) ne s'applique
+    pas ici : son motif est propre à cette commande (§ Zones sensibles 2), il
+    n'a jamais tenu au transport `_esc`.
     """
     ensure_running()
     rc, out = osa(f'tell application "Things3" to set notes of to do id '
@@ -2227,8 +2407,8 @@ def cmd_rename_task(a) -> int:
     `to do` sans attribut `access` explicite (comme `notes`), donc rw par
     défaut ; confirmé de bout en bout par écriture réelle sur une tâche
     jetable, relue en base à l'identique. Aucune automatisation d'interface,
-    donc pas de garde `_untypable_chars` (son risque vient de `keystroke`,
-    absent ici).
+    donc pas de garde `_refused_title_chars` — elle est propre à
+    `create-heading` (§ Zones sensibles 2).
 
     Garde d'état — décidée pour CETTE opération, pas recopiée de
     `complete-task`/`cancel-task` : une tâche `completed` ou `canceled`

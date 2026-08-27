@@ -496,7 +496,8 @@ redevient obligatoire.
   comme attribut de ce module (pas de classe, pas d'encapsulation).
 - Convention de nommage : `tests/test_<sous-commande-ou-domaine>.py`.
 - Baseline au 2026-08-12 : 27 tests avant `create-heading`, 40 après, 56
-  après le garde de saisie (`_untypable_chars`), 71 après `complete-task`, 74 après la
+  après le garde de saisie (`_untypable_chars`, renommé `_refused_title_chars`
+  le 2026-08-27), 71 après `complete-task`, 74 après la
   couverture du refus sur tâche à la Corbeille, 110 après les notes de tâche
   (`tests/test_task_notes.py`), 122 après l'adressage par identifiant de projet
   (`tests/test_project_id_notes.py`), 133 avant `find-task`, 148 après
@@ -699,6 +700,28 @@ redevient obligatoire.
       .venv/bin/python -m pytest tests/test_move_task.py --collect-only -q | tail -1 -> 53
       .venv/bin/python -m pytest tests/test_annotations_resolve.py --collect-only -q | tail -1 -> 37
       .venv/bin/python -m pytest -q -p no:cacheprovider -> 1119 passed, 1 skipped
+
+  Baseline relevée à **1162** le 2026-08-27 avant le correctif du collage de
+  `create-heading`, **1177** après. L'écart de 15 tient ENTIÈREMENT dans
+  `tests/test_create_heading.py` (51 -> 66 collectés) : le titre qui n'atteint
+  plus de frappe littérale et le balayage des frappes restantes, l'évasion de
+  littéral maintenue, l'ordre prise/écriture/clic du presse-papiers, sa remise
+  sur les deux chemins, le refus d'un presse-papiers non restituable et son
+  message, le presse-papiers vide laissé vide, l'objet parasite nommé et ses
+  trois contre-épreuves (rien de créé, en-tête préexistant, course sur le
+  message), la base illisible distinguée du vide. Aucun autre fichier ne
+  bouge : le fichier de test existait déjà, donc le contrôle paramétré de
+  `test_annotations_resolve.py` ne gagne rien. Les commandes :
+
+      .venv/bin/python -m pytest --collect-only -q -p no:cacheprovider | tail -1 -> 1177 tests collected
+      .venv/bin/python -m pytest tests/test_create_heading.py --collect-only -q -p no:cacheprovider | tail -1 -> 66
+      .venv/bin/python -m pytest -q -p no:cacheprovider -> 1176 passed, 1 skipped
+
+  Le compte d'AVANT est mesuré sur l'arbre `master` lui-même, pas rappelé de
+  mémoire :
+
+      git stash && .venv/bin/python -m pytest --collect-only -q -p no:cacheprovider | tail -1
+      # -> 1162 tests collected     (puis `git stash pop`)
 
   **Chronique des affirmations réfutées d'US-010 — elle vit ICI, plus dans le
   script.** Les six blocs de `bin/thingskit` qui la racontaient sont ramenés à
@@ -1102,8 +1125,9 @@ irréversible pour un gestionnaire de tâches personnel utilisé au quotidien.
   une liste ne couvre que ce qu'on a pensé à y inscrire. La classe REFUSÉE est
   nommée par catégorie Unicode : `Cc` (dont ESC/CR/LF), `Cf` (dont l'inversion
   de sens de lecture U+202E et l'espace de largeur nulle U+200B), `Zl`/`Zp`,
-  `Cs`, `Co`, `Cn`. Même motif que `_untypable_chars`, qui porte déjà sur la
-  classe et non sur les caractères rencontrés.
+  `Cs`, `Co`, `Cn`. Même motif que `_refused_title_chars` (renommé le
+  2026-08-27, cf. § Zones sensibles 2), qui porte déjà sur la classe et non
+  sur les caractères rencontrés.
 
   **Les séparateurs d'espace (`Zs`) en ont été SORTIS le 2026-08-26**, et ce
   retrait est le correctif d'un sur-refus mesuré. Jusque-là la borne était
@@ -1374,17 +1398,30 @@ l'ajout d'un heading à un projet existant — constaté sur pièce, pas déduit
 de la documentation Things (cf. docstring module).
 
 **Fichiers concernés** : `bin/thingskit` — `_build_heading_script`,
-`_interpret_ui_outcome`, `HEADING_MENU_LABELS`, `cmd_create_heading`.
+`_interpret_ui_outcome`, `HEADING_MENU_LABELS`, `cmd_create_heading`,
+`_clipboard_capture_lines`, `_clipboard_restore_lines`,
+`_refused_title_chars`, `_heading_titles`.
 
 **Risques propres à cette surface** :
 - **Dépendance au libellé de menu**, qui varie selon la langue de
   l'interface. Un libellé codé en dur et absent silencieusement produirait
   soit un plantage AppleScript opaque, soit — pire — un clic sur le mauvais
   item de menu.
-- **Frappe clavier « à l'aveugle »** : contrairement à un appel API, rien ne
+- **Saisie « à l'aveugle »** : contrairement à un appel API, rien ne
   garantit que le focus clavier est effectivement sur le bon champ au
   moment de la saisie. Une automatisation qui « réussit » (rc=0) peut avoir
-  tapé le titre dans le mauvais endroit.
+  déposé le titre au mauvais endroit.
+- **La frappe caractère par caractère ne transporte pas le texte fidèlement.**
+  `keystroke` cherche une combinaison de touches par caractère et, faute de
+  correspondance, frappe le code de touche virtuel 0. Toute lettre accentuée
+  composée ressortait en `a`, en silence, avec rc=0 — mesuré le 2026-08-27
+  sur la vraie base. C'est le risque le plus insidieux de cette surface :
+  l'automatisation réussit, la commande échoue à la vérification, et un objet
+  d'un AUTRE nom reste dans les données de l'utilisateur. D'où le collage.
+- **Le collage emprunte une ressource qui n'est pas la nôtre.** Le
+  presse-papiers appartient à l'utilisateur : l'écraser sans le rendre est un
+  effet de bord inacceptable, et l'écraser sans SAVOIR le rendre l'est encore
+  plus.
 - **Permission d'accessibilité macOS** : sans elle, `System Events` échoue.
   L'échec doit être détecté et signalé, pas confondu avec un autre type
   d'erreur.
@@ -1555,21 +1592,94 @@ de la documentation Things (cf. docstring module).
   désormais gardée par un constat de premier plan, donc son échec ne peut plus
   faire partir le titre hors de Things — au pire dans une vue de Things qui
   n'a pas encore ouvert son champ.
-- **Aucun caractère non saisissable n'atteint jamais une frappe clavier.**
-  `keystroke` tape ce qu'on lui donne : dans le champ de saisie d'un
-  heading, un retour à la ligne vaut validation — heading créé tronqué,
-  reste du titre et `key code 36` partis hors du champ visé. La
-  vérification post-action (§ 1) rattrape le *code retour*, jamais cet
-  effet de bord déjà produit dans les données réelles de l'utilisateur.
-  `cmd_create_heading` refuse donc tout titre contenant un caractère de
-  catégorie Unicode `Cc`, `Zl` ou `Zp` (`_untypable_chars`), **avant** la
-  résolution du projet et **avant** toute activation de l'application —
-  rien n'est ouvert, rien n'est cliqué, rien n'est tapé
+- **Le titre est COLLÉ, jamais tapé caractère par caractère** (amendement du
+  2026-08-27). `keystroke "<titre>"` demande à System Events de retrouver,
+  pour CHAQUE caractère, une combinaison de touches qui le produise sur la
+  disposition courante. Quand il n'y en a pas, il ne renonce pas : il frappe
+  le code de touche virtuel 0 — `a` sur cette disposition. **Toute lettre
+  accentuée composée était donc corrompue, en silence, avec rc=0 côté
+  AppleScript.** Mesuré par la commande elle-même, sur la vraie base :
+
+      thingskit create-heading --project "…" "Éprouvé — formalités é à ù ç"
+      # -> en base : 'aprouva — formalitas a a a ç'
+
+  `É`, `é`, `à`, `ù` -> `a` ; `ç` et `—` intacts — `ç` est une touche unique
+  sur cette disposition, les autres exigent une touche morte. Ce n'est donc
+  pas un défaut d'Unicode mais de COMPOSITION. Le défaut a vécu des mois :
+  deux en-têtes `…formalitas` en double dans la base de l'utilisateur, trace
+  d'un appel en échec puis réessayé.
+
+  Le collage est une opération unique, indépendante de la disposition et de
+  la composition. Mesuré le même jour dans un projet jetable : titre demandé
+  `Éprouvé — formalités é à ù ç`, titre relu **identique**, caractère pour
+  caractère, par égalité stricte de chaîne. Gardé par
+  `test_the_title_never_reaches_a_literal_keystroke` et par
+  `test_the_only_keystroke_left_is_the_paste_chord`, qui BALAIE les frappes
+  au lieu d'en échantillonner une.
+
+  `_esc` reste obligatoire : le titre part toujours dans un littéral
+  AppleScript, le presse-papiers ne change rien à l'évasion de littéral.
+- **Le presse-papiers appartient à l'utilisateur : il est emprunté, jamais
+  pris.** Il est sauvegardé (`the clipboard as record`, tous parfums), puis
+  rendu — sur le chemin de succès ET dans la branche d'erreur, qui relance
+  ensuite l'erreur telle quelle pour ne pas avaler les marqueurs de refus.
+  Trois cas, et le refus est le cas par défaut : vide -> rien à rendre, mais
+  on le laisse **vide** plutôt que de laisser notre titre y survivre ;
+  restituable -> sauvegardé ; **non restituable -> REFUS avant tout
+  écrasement** (`_CLIPBOARD_UNSAVEABLE_MARKER`), et comme la prise précède le
+  clic de menu, ce refus ne laisse aucun objet derrière lui. `clipboard info`
+  distingue « vide » de « non restituable » : sans lui les deux se
+  confondraient dans un `try` muet, et un presse-papiers non restituable
+  serait écrasé puis rendu vide. Vérifié de bout en bout le 2026-08-27 :
+  valeur posée avant l'appel, relue identique après. Ces propriétés sont
+  gardées par MUTATION, pas par relecture — retirer la remise du chemin de
+  succès laissait la suite VERTE tant que le test s'ancrait sur la première
+  occurrence du texte de remise au lieu de la dernière (le script compte six
+  `end try`).
+
+  Ce que cela n'isole pas, et qui est nommé plutôt que tu : le titre transite
+  par le presse-papiers du système le temps du collage, donc lisible par tout
+  processus qui sait le lire, et enregistré par les gestionnaires
+  d'historique ; et un `osascript` tué entre la copie et la remise laisse le
+  titre dedans (`SECURITY.md` § « What the CLI does not isolate »).
+- **Une classe de caractères reste refusée dans un titre — et son motif
+  d'origine est RÉFUTÉ.** `cmd_create_heading` refuse tout titre portant un
+  caractère de catégorie Unicode `Cc`, `Zl` ou `Zp` (`_refused_title_chars`,
+  nommé `_untypable_chars` jusqu'au 2026-08-27), **avant** la résolution du
+  projet et **avant** toute activation de l'application
   (`test_untypable_title_refused_before_any_activation`, paramétré sur la
   classe ; `test_typable_titles_are_accepted` garde contre le sur-refus).
-  Le garde porte sur la **classe**, pas sur les seuls caractères
-  rencontrés : toute nouvelle commande pilotant l'interface au clavier
-  doit le réutiliser plutôt que d'énumérer des caractères.
+
+  Le motif écrit ici jusqu'au 2026-08-27 était : « `keystroke` les tape, un
+  retour à la ligne vaut validation dans le champ, en-tête tronqué et frappe
+  orpheline hors du champ visé ». Il valait de la frappe. Il est **faux du
+  collage**, mesuré le 2026-08-27 sur la vraie base, dans un projet jetable :
+  un titre `"AVANT-é\nAPRES-ù\tTAB\x1bESC"` collé puis validé arrive en base
+  **octet pour octet** — pas de troncature, pas de frappe orpheline, un seul
+  en-tête créé.
+
+  Ce qui reste est une DÉCISION, plus une nécessité physique : le CLI ne
+  fabrique pas d'objet dont le NOM porte une classe qu'il refuse d'émettre
+  brute sur sa propre sortie (`_REFUSED_CATEGORIES`, § 1, dont `Cc`/`Zl`/`Zp`
+  sont un sous-ensemble). C'est un léger **sur-refus, assumé**, du côté qui ne
+  casse rien — même posture que le refus de l'homonyme projet/area dans cette
+  même commande. Ce qui le lèverait, et qui n'a PAS été fait : mesurer la
+  classe ENTIÈRE par le chemin du collage. Trois des neuf caractères du banc
+  l'ont été (`\n`, `\t`, `\x1b`) ; trois qui passent n'établissent pas neuf,
+  et U+0000 en particulier traverse `_esc` sans conversion et n'a jamais été
+  mesuré à travers `osascript`.
+- **La vérification post-action NOMME l'objet créé sous un autre titre.**
+  Elle refusait déjà un titre différent — `_find_heading` compare le titre
+  exact, et `test_ui_succeeds_but_heading_not_observed_fails` l'épinglait déjà
+  — mais son message le TAISAIT : l'utilisateur restait avec un objet parasite
+  dans sa base et aucun nom pour le retrouver, et l'appelant qui réessayait en
+  fabriquait un second. Le relevé se fait **dans la sonde**, jamais par une
+  seconde lecture dans la branche d'échec — c'est le corollaire du
+  § Conventions, et le balayage d'AST de `tests/test_write_wait.py` l'a
+  attrapé sur la première rédaction de ce correctif, qui le violait. Trois
+  issues distinctes et distinguées : objet parasite nommé, aucun objet nouveau
+  observé, base restée illisible pendant toute l'attente — « jamais observé »
+  n'est pas « rien de créé ».
 - La vérification post-action (§ 1) s'applique intégralement ici : succès
   de l'automatisation d'interface (rc=0, "OK") et présence du heading en
   base sont deux conditions **distinctes**, toutes deux nécessaires
