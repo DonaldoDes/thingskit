@@ -1599,12 +1599,30 @@ _NOT_FRONTMOST_MARKER = "THINGSKIT_NOT_FRONTMOST"
 # menu a déjà été cliqué et un en-tête SANS TITRE a pu être créé. Le message
 # doit le dire — un refus qui tait un effet déjà produit est un faux refus.
 _LOST_FOCUS_MARKER = "THINGSKIT_LOST_FOCUS"
-# Le presse-papiers porte quelque chose que nous ne saurions pas rendre à
-# l'identique. Il appartient à l'utilisateur : on refuse AVANT de l'écraser,
+# Le presse-papiers appartient à l'utilisateur : on refuse AVANT de l'écraser,
 # donc avant le clic de menu — rien n'est créé, rien n'est perdu. Distinct des
-# précédents : là c'est l'application qui n'est pas dans l'état attendu, ici
-# c'est une ressource de l'utilisateur qu'on renonce à emprunter.
+# marqueurs précédents : là c'est l'application qui n'est pas dans l'état
+# attendu, ici c'est une ressource de l'utilisateur qu'on renonce à emprunter.
+#
+# DEUX causes, DEUX marqueurs, parce qu'elles ne se diagnostiquent pas pareil.
+# `_CLIPBOARD_UNKNOWN` : on n'a pas pu LIRE l'état du pasteboard (détenu par un
+# autre processus, contenu qu'il ne sait pas décrire). C'est le cas qui doit
+# valoir refus et qui, écrit comme un `try` muet, valait silencieusement
+# « vide » — donc sautait la sauvegarde ET le refus, et écrasait. Le `try`
+# n'avait pas été fermé, il avait été déplacé d'un cran.
+# `_CLIPBOARD_UNSAVEABLE` : on a LU l'état, il y a du contenu, on ne sait pas
+# le sauvegarder.
+_CLIPBOARD_UNKNOWN_MARKER = "THINGSKIT_CLIPBOARD_UNKNOWN"
 _CLIPBOARD_UNSAVEABLE_MARKER = "THINGSKIT_CLIPBOARD_UNSAVEABLE"
+# La remise a ÉCHOUÉ. Ce n'est ni un refus ni un échec de l'opération : le
+# collage, lui, a pu réussir. Rendre un échec sur une écriture réussie ferait
+# réessayer l'appelant, donc un doublon en base — le mode d'échec que ce
+# chantier corrige. C'est donc un AVERTISSEMENT, porté sur les deux chemins.
+_CLIPBOARD_NOT_RESTORED_MARKER = "THINGSKIT_CLIPBOARD_NOT_RESTORED"
+_CLIPBOARD_NOT_RESTORED_NOTE = (
+    "le presse-papiers n'a PAS pu être rendu : son contenu d'origine est perdu "
+    "et le titre de l'en-tête peut y demeurer"
+)
 
 _ACCESSIBILITY_ERROR_MARKERS = (
     "not allowed assistive access",
@@ -1615,9 +1633,9 @@ _ACCESSIBILITY_ERROR_MARKERS = (
 )
 
 
-# Classe de caractères REFUSÉE dans un titre d'en-tête. Catégories Unicode Cc
-# (contrôles, dont \n \r \t \x1b \x7f), Zl / Zp (séparateurs de ligne et de
-# paragraphe U+2028/U+2029).
+# Classe de caractères REFUSÉE dans un titre d'en-tête. C'est `_REFUSED_CATEGORIES`,
+# la MÊME que celle refusée en sortie brute (§ Zones sensibles 1) — pas une
+# seconde liste.
 #
 # **Le motif d'origine est RÉFUTÉ, et il faut le dire avant tout le reste.**
 # Il était : « `keystroke` les tape, et dans le champ de saisie un retour à la
@@ -1630,17 +1648,17 @@ _ACCESSIBILITY_ERROR_MARKERS = (
 #
 # Ce qui reste est une DÉCISION, plus une nécessité physique : le CLI ne
 # fabrique pas d'objet dont le NOM porte une classe qu'il refuse d'émettre
-# brute sur sa propre sortie (`_REFUSED_CATEGORIES`, § Zones sensibles 1, dont
-# Cc/Zl/Zp sont un sous-ensemble). Un léger sur-refus, assumé, du côté qui ne
-# casse rien — même posture que le refus de l'homonyme projet/area dans cette
-# même commande.
+# brute sur sa propre sortie.
 #
-# Ce qui le lèverait, et qui n'a PAS été fait : mesurer la classe ENTIÈRE par
-# le chemin du collage. Trois caractères sur les neuf du banc de test l'ont été
-# (\n, \t, \x1b) ; trois qui passent n'établissent pas neuf, et U+0000 en
-# particulier traverse `_esc` sans conversion et n'a jamais été mesuré à
-# travers `osascript`.
-_REFUSED_TITLE_CATEGORIES = ("Cc", "Zl", "Zp")
+# Cette classe valait `("Cc", "Zl", "Zp")` jusqu'au 2026-08-27, et le principe
+# ci-dessus la décrivait comme un « léger sur-refus assumé ». C'était un
+# SOUS-refus : `_refused_title_chars("a\u202eb")` rendait `[]` — U+202E,
+# inversion de sens de lecture, était accepté dans un titre alors que le CLI le
+# refuse en sortie. Décrire l'écart sans le trancher étant la voie interdite,
+# la classe est ALIGNÉE plutôt que la phrase affaiblie. Le coût est nul en
+# usage réel : sur les 902 titres de la base mesurés le 2026-08-26, la classe
+# à sept catégories en cite ZÉRO (mesure rejouable dans constitution.md
+# § Zones sensibles 1).
 
 
 def _refused_title_chars(s: str) -> list[str]:
@@ -1649,7 +1667,7 @@ def _refused_title_chars(s: str) -> list[str]:
     """
     found: list[str] = []
     for c in s:
-        if unicodedata.category(c) in _REFUSED_TITLE_CATEGORIES:
+        if unicodedata.category(c) in _REFUSED_CATEGORIES:
             code = f"U+{ord(c):04X}"
             if code not in found:
                 found.append(code)
@@ -1741,29 +1759,45 @@ def _build_view_probe_script(project_title: str) -> str:
 
 
 def _clipboard_capture_lines() -> str:
-    """Lignes AppleScript qui EMPRUNTENT le presse-papiers de l'utilisateur.
+    """Lignes AppleScript qui PRENNENT le presse-papiers de l'utilisateur.
 
-    Il ne nous appartient pas. Trois cas, et le refus est le cas par défaut :
+    Elles ne l'écrivent pas : la prise sert à pouvoir REFUSER avant le clic de
+    menu, l'écriture du titre vient bien plus tard (`_paste_lines`), au dernier
+    moment, pour ne pas l'exposer pendant l'énumération du menu et le clic.
 
-      - vide : rien à rendre, `savedClip` reste `missing value` et la remise
-        le remettra vide (jamais notre titre) ;
-      - restituable : sauvegardé en `record`, tous ses parfums avec lui ;
-      - non restituable : REFUS (`_CLIPBOARD_UNSAVEABLE_MARKER`), AVANT toute
-        écriture. Ce qu'on ne sait pas rendre, on ne l'écrase pas — et comme
-        ces lignes précèdent le clic de menu, le refus ne laisse aucun objet
-        derrière lui.
+    TROIS états explicites, et `inconnu` n'est jamais synonyme de `vide` :
 
-    `clipboard info` distingue « vide » de « non restituable » : sans lui, les
-    deux se confondraient en un `try` muet, et un presse-papiers non
-    restituable serait écrasé puis rendu vide.
+      - `unknown` : `clipboard info` a erré, on ne sait RIEN -> REFUS. C'était
+        le défaut : écrit `try / if … then set hadClip to true / end try`, un
+        `clipboard info` qui erre laissait le drapeau faux, sautait la
+        sauvegarde ET le refus, et la ligne d'écriture passait. Le contenu de
+        l'utilisateur était perdu sans sauvegarde et sans refus — fail-OPEN,
+        exactement le contraire de ce que la docstring déclarait.
+      - `empty` : rien à rendre. La remise le laissera VIDE, jamais avec notre
+        titre dedans.
+      - `present` : sauvegardé en `record`. Si la sauvegarde erre -> REFUS.
+
+    Les deux `try` subsistent, et c'est légitime : chacun mène désormais à un
+    refus, aucun ne laisse passer une écriture. C'est la propriété qui compte,
+    pas l'absence de `try`.
+
+    Éprouvé par EXÉCUTION, pas par relecture : les trois états et les deux
+    refus sont joués par `osascript` avec les primitives de pasteboard
+    remplacées par des valeurs contrôlées (`tests/test_create_heading.py`).
     """
     return (
-        'set savedClip to missing value\n'
-        'set hadClip to false\n'
+        'set clipState to "unknown"\n'
         'try\n'
-        '  if (count of (clipboard info)) > 0 then set hadClip to true\n'
+        '  if (count of (clipboard info)) > 0 then\n'
+        '    set clipState to "present"\n'
+        '  else\n'
+        '    set clipState to "empty"\n'
+        '  end if\n'
         'end try\n'
-        'if hadClip then\n'
+        f'if clipState is "unknown" then error "{_esc(_CLIPBOARD_UNKNOWN_MARKER)}"\n'
+        'set savedClip to missing value\n'
+        'set clipRestored to true\n'
+        'if clipState is "present" then\n'
         '  try\n'
         '    set savedClip to (the clipboard as record)\n'
         '  end try\n'
@@ -1773,22 +1807,78 @@ def _clipboard_capture_lines() -> str:
     )
 
 
-def _clipboard_restore_lines(indent: str = "") -> str:
-    """Lignes AppleScript qui RENDENT le presse-papiers.
+def _clipboard_restore_lines(chemin: str, indent: str = "") -> str:
+    """Lignes AppleScript qui RENDENT le presse-papiers. UN seul site de
+    définition, employé sur les DEUX chemins — deux copies divergeraient.
 
-    UN seul site de définition, employé sur les DEUX chemins (succès et
-    erreur) : deux copies divergeraient, et celle qui rend cesserait de
-    décrire celle qui emprunte.
+    `chemin` est un LIBELLÉ littéral, émis en commentaire AppleScript. Il n'est
+    pas décoratif : c'est par lui que les tests distinguent les deux
+    emplacements. Ils le faisaient d'abord par un compte d'`end try`, chiffre
+    affirmé deux fois (5, puis 6) et faux les deux fois — le script en porte 7,
+    dont 3 non indentées. Un libellé ne se périme pas comme un nombre recopié.
 
-    `set the clipboard to ""` quand il n'y avait rien : le titre de
-    l'utilisateur ne doit pas SURVIVRE à la commande dans son presse-papiers.
+    La remise est GARDÉE. Sans garde, son échec REMPLAÇAIT l'erreur en cours
+    sur le chemin d'erreur : `error errMsg number errNum` n'était jamais
+    atteint et le marqueur d'origine — `_LOST_FOCUS_MARKER` en particulier,
+    dont tout l'objet est d'avertir qu'un en-tête SANS TITRE a pu être créé —
+    n'atteignait plus `_interpret_ui_outcome`. Elle ne se tait pas pour autant :
+    `clipRestored` porte le verdict et le script en fait un AVERTISSEMENT.
+
+    `set the clipboard to ""` quand il n'y avait rien : le titre ne doit pas
+    SURVIVRE à la commande dans le presse-papiers de l'utilisateur.
     """
     return (
-        f'{indent}if savedClip is not missing value then\n'
-        f'{indent}  set the clipboard to savedClip\n'
-        f'{indent}else\n'
-        f'{indent}  set the clipboard to ""\n'
-        f'{indent}end if\n'
+        f'{indent}-- remise du presse-papiers (chemin : {_esc(chemin)})\n'
+        f'{indent}set clipRestored to false\n'
+        f'{indent}try\n'
+        f'{indent}  if savedClip is not missing value then\n'
+        f'{indent}    set the clipboard to savedClip\n'
+        f'{indent}  else\n'
+        f'{indent}    set the clipboard to ""\n'
+        f'{indent}  end if\n'
+        f'{indent}  set clipRestored to true\n'
+        f'{indent}end try\n'
+    )
+
+
+def _paste_lines(title: str) -> str:
+    """Écriture du titre, collage, validation, remise. Pure.
+
+    C'est ici que commence la FENÊTRE D'EXPOSITION, et elle est aussi courte
+    que la surface le permet : rien ne sépare l'écriture du titre de son
+    collage. Elle a d'abord englobé l'énumération de menu, le clic et deux
+    délais — 0,85 s de plancher mesuré, sans plafond, et une exposition sur
+    les chemins `NO_LABEL` et `LOST_FOCUS` où aucun collage n'a lieu.
+
+    Ce qui n'est PAS fermé et se déclare : rien ne borne le bloc System Events
+    ci-dessous — ni `with timeout`, ni `timeout=` côté `osa()`. Un System
+    Events qui traîne laisse le titre dans le pasteboard jusqu'au délai
+    d'AppleEvent par défaut, deux minutes. Le borner tuerait le script entre
+    le collage et la validation, donc laisserait un en-tête partiel : c'est le
+    même arbitrage que pour `_frontmost_check`, tranché du même côté.
+    """
+    return (
+        f'set the clipboard to "{_esc(title)}"\n'
+        'try\n'
+        '  tell application "System Events"\n'
+        '    keystroke "v" using {command down}\n'
+        f'    delay {HEADING_PASTE_COMMIT_DELAY}\n'
+        '    key code 36\n'
+        '  end tell\n'
+        'on error errMsg number errNum\n'
+        + _clipboard_restore_lines("erreur", "  ") +
+        '  if clipRestored then\n'
+        '    error errMsg number errNum\n'
+        '  else\n'
+        f'    error errMsg & " {_esc(_CLIPBOARD_NOT_RESTORED_MARKER)}" number errNum\n'
+        '  end if\n'
+        'end try\n'
+        + _clipboard_restore_lines("succès") +
+        'if clipRestored then\n'
+        '  return "OK"\n'
+        'else\n'
+        f'  return "OK {_esc(_CLIPBOARD_NOT_RESTORED_MARKER)}"\n'
+        'end if\n'
     )
 
 
@@ -1827,42 +1917,31 @@ def _build_heading_script(title: str, project_title: str,
         'tell application "Things3" to activate\n'
         + _frontmost_check(_NOT_FRONTMOST_MARKER, HEADING_FRONTMOST_ATTEMPTS)
         + _shown_list_comparison(project_title)
-        + _clipboard_capture_lines()
-        + f'set the clipboard to "{_esc(title)}"\n'
-        'try\n'
-        '  tell application "System Events"\n'
-        '    tell process "Things3"\n'
-        '      set targetLabel to missing value\n'
-        f'      repeat with candidate in {{{candidates}}}\n'
-        '        try\n'
-        '          if exists menu item candidate of menu "Fichier" of menu bar '
+        # Le REFUS du presse-papiers précède le clic — c'est lui qui garantit
+        # qu'aucun objet n'est créé. L'ÉCRITURE du titre, elle, ne vient qu'au
+        # dernier moment (`_paste_lines`), après le clic et le recontrôle de
+        # premier plan : c'est ce qui borne la fenêtre d'exposition.
+        + _clipboard_capture_lines() +
+        'tell application "System Events"\n'
+        '  tell process "Things3"\n'
+        '    set targetLabel to missing value\n'
+        f'    repeat with candidate in {{{candidates}}}\n'
+        '      try\n'
+        '        if exists menu item candidate of menu "Fichier" of menu bar '
         'item "Fichier" of menu bar 1 then\n'
-        '            set targetLabel to candidate\n'
-        '            exit repeat\n'
-        '          end if\n'
-        '        end try\n'
-        '      end repeat\n'
-        f'      if targetLabel is missing value then error "{_NO_LABEL_MARKER}"\n'
-        '      click menu item targetLabel of menu "Fichier" of menu bar item '
+        '          set targetLabel to candidate\n'
+        '          exit repeat\n'
+        '        end if\n'
+        '      end try\n'
+        '    end repeat\n'
+        f'    if targetLabel is missing value then error "{_NO_LABEL_MARKER}"\n'
+        '    click menu item targetLabel of menu "Fichier" of menu bar item '
         '"Fichier" of menu bar 1\n'
-        '    end tell\n'
         '  end tell\n'
-        '  delay 0.4\n'
-        # Indentation cosmétique non tenue ici : AppleScript n'en fait
-        # rien, et un helper de mise en forme serait du code à garder
-        # pour un effet nul.
-        + _frontmost_check(_LOST_FOCUS_MARKER, 1) +
-        '  tell application "System Events"\n'
-        '    keystroke "v" using {command down}\n'
-        f'    delay {HEADING_PASTE_COMMIT_DELAY}\n'
-        '    key code 36\n'
-        '  end tell\n'
-        'on error errMsg number errNum\n'
-        + _clipboard_restore_lines("  ") +
-        '  error errMsg number errNum\n'
-        'end try\n'
-        + _clipboard_restore_lines() +
-        'return "OK"\n'
+        'end tell\n'
+        'delay 0.4\n'
+        + _frontmost_check(_LOST_FOCUS_MARKER, 1)
+        + _paste_lines(title)
     )
 
 
@@ -1872,22 +1951,48 @@ def _interpret_ui_outcome(rc: int, out: str) -> tuple[bool, str]:
     """
     if rc == 0 and out.strip() == "OK":
         return True, "ok"
+    if rc == 0 and out.strip() == "OK " + _CLIPBOARD_NOT_RESTORED_MARKER:
+        # Le collage a réussi, l'en-tête existe : c'est un SUCCÈS assorti d'un
+        # avertissement, jamais un échec. Rendre un échec sur une écriture
+        # réussie ferait réessayer l'appelant, donc un doublon en base.
+        return True, _CLIPBOARD_NOT_RESTORED_NOTE
+    msg = _ui_failure_message(out)
+    if _CLIPBOARD_NOT_RESTORED_MARKER in out:
+        # La remise a échoué EN PLUS de l'incident d'origine. Les deux se
+        # disent : le marqueur d'origine reste le diagnostic principal.
+        msg += " — et " + _CLIPBOARD_NOT_RESTORED_NOTE
+    return False, msg
+
+
+def _ui_failure_message(out: str) -> str:
+    """Le diagnostic d'un échec d'automatisation, sans la question du
+    presse-papiers, qui s'y ajoute et ne le remplace jamais."""
     lo = out.lower()
     if _NOT_FRONTMOST_MARKER in out:
-        return False, (
+        return (
             "Things3 n'est pas passé au premier plan dans le délai imparti — "
             "rien n'a été cliqué ni tapé, aucun titre n'a pu partir dans une "
             f"autre application ({out!r})"
         )
     if _LOST_FOCUS_MARKER in out:
-        return False, (
+        return (
             "Things3 a perdu le premier plan entre le clic de menu et la "
             "frappe — rien n'a été tapé, mais le clic, lui, a eu lieu : un "
             "en-tête SANS TITRE a pu être créé dans le projet visé, à "
             f"supprimer à la main le cas échéant ({out!r})"
         )
+    if _CLIPBOARD_UNKNOWN_MARKER in out:
+        return (
+            "l'état du presse-papiers n'a pas pu être LU — il est peut-être "
+            "détenu par un autre processus, ou porte un contenu qu'il ne sait "
+            "pas décrire. Ne rien savoir n'est pas savoir qu'il est vide : le "
+            "titre y transiterait le temps du collage, et l'écraser sans "
+            "pouvoir le rendre n'est pas à nous de le décider : rien n'a été "
+            "cliqué ni tapé, le presse-papiers est intact. Réessayer, ou le "
+            f"vider ({out!r})"
+        )
     if _CLIPBOARD_UNSAVEABLE_MARKER in out:
-        return False, (
+        return (
             "le presse-papiers porte un contenu que le CLI ne saurait pas "
             "restituer à l'identique — le titre y transite le temps du "
             "collage, et l'écraser sans pouvoir le rendre n'est pas à nous de "
@@ -1895,31 +2000,31 @@ def _interpret_ui_outcome(rc: int, out: str) -> tuple[bool, str]:
             f"intact. Le vider ou le simplifier, puis réessayer ({out!r})"
         )
     if _NO_WINDOW_MARKER in out:
-        return False, (
+        return (
             "aucune fenêtre lisible dans Things3 au moment du contrôle — le "
             "nom de la liste affichée n'a pas pu être lu, donc rien ne "
             f"garantissait la cible : rien n'a été cliqué ni tapé ({out!r})"
         )
     if _WRONG_VIEW_MARKER in out:
-        return False, (
+        return (
             "la fenêtre au premier plan n'affichait pas le projet visé au "
             "moment du clic — rien n'a été cliqué ni tapé, aucun en-tête n'a "
             f"pu atterrir dans un autre projet ({out!r})"
         )
     if _NO_LABEL_MARKER in out:
-        return False, (
+        return (
             "aucun libellé de menu connu ('" + "' / '".join(HEADING_MENU_LABELS) +
             "') n'existe dans le menu Fichier de Things3 — l'interface a peut-être "
             "changé ou est dans une autre langue"
         )
     if any(m in lo for m in _ACCESSIBILITY_ERROR_MARKERS):
-        return False, (
+        return (
             "automatisation d'interface refusée — accorder l'accès "
             "Accessibilité à osascript/Terminal dans Réglages Système > "
             "Confidentialité et sécurité > Accessibilité, puis réessayer"
         )
-    return False, ("échec automatisation d'interface non identifié : "
-                   f"{(out or '(vide)')!r}")
+    return ("échec automatisation d'interface non identifié : "
+            f"{(out or '(vide)')!r}")
 
 
 def _resolve_project_for_heading(title: str) -> tuple[str | None, str | None]:
@@ -1979,11 +2084,20 @@ def _find_heading(project_uuid: str, title: str) -> str | None:
 def cmd_create_heading(a) -> int:
     offenders = _refused_title_chars(a.title)
     if offenders:
-        print(f"titre refusé : {a.title!r} contient des caractères non "
-              f"saisissables au clavier ({', '.join(offenders)}) — ils "
-              "seraient tapés dans le champ de saisie et y vaudraient "
-              "validation (heading tronqué, frappe orpheline). Aucun heading "
-              "créé, l'application n'a pas été sollicitée.", file=sys.stderr)
+        # Ce message portait, jusqu'au 2026-08-27, le motif que le passage au
+        # collage RÉFUTE — « ils seraient tapés dans le champ de saisie et y
+        # vaudraient validation (heading tronqué, frappe orpheline) ». Plus
+        # rien n'est tapé. La fonction avait été renommée, le commentaire et la
+        # constitution récrits ; la seule surface que l'utilisateur LIT était
+        # restée sur l'ancien récit. Son contenu est désormais sous test,
+        # comme tous les autres messages d'échec de cette commande.
+        print(f"titre refusé : {a.title!r} porte des caractères que le CLI "
+              f"refuse dans un nom d'objet ({', '.join(offenders)}) — ce sont "
+              "des caractères de contrôle ou de formatage invisibles, qu'il "
+              "refuse aussi d'émettre bruts sur sa propre sortie : un en-tête "
+              "ainsi nommé serait indésignable et pourrait travestir "
+              "l'affichage. Aucun en-tête créé, l'application n'a pas été "
+              "sollicitée.", file=sys.stderr)
         return 1
 
     project_uuid, err = _resolve_project_for_heading(a.project)
@@ -2029,6 +2143,11 @@ def cmd_create_heading(a) -> int:
     if not ok:
         print(f"ÉCHEC création heading {a.title!r} : {msg}", file=sys.stderr)
         return 1
+    if msg != "ok":
+        # Succès assorti d'un avertissement — la remise du presse-papiers a
+        # échoué. Le dire sans convertir l'écriture réussie en échec : un échec
+        # ferait réessayer l'appelant, donc un doublon en base.
+        print(f"AVERTISSEMENT : {msg}", file=sys.stderr)
 
     # Un en-tête a-t-il été créé sous un AUTRE titre ? C'est le cas mesuré le
     # 2026-08-27 sur la vraie base : l'automatisation rend « OK », l'objet

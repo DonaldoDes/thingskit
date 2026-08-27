@@ -370,22 +370,31 @@ def test_trashed_project_refuses_no_ui_call(thingskit, rigged):
 
 
 # ---------------------------------------------------------------------------
-# Caractères non saisissables : refus AVANT toute activation de Things
+# Classe de caractères refusée dans un titre : refus AVANT toute activation
 #
-# `_esc` transmet fidèlement ces caractères jusqu'à la valeur AppleScript
-# (mesuré : un saut de ligne source arrive bien avec l'identifiant 10). C'est
-# précisément le problème : `keystroke` les tape, et dans le champ de saisie
-# d'un heading un retour à la ligne vaut validation — heading tronqué, reste
-# du titre et `key code 36` partis hors du champ visé. Effet de bord déjà
-# produit dans les données réelles, que la vérification post-action ne peut
-# pas défaire.
+# **Le motif d'origine est RÉFUTÉ.** Il était : « `keystroke` les tape, et dans
+# le champ de saisie un retour à la ligne vaut validation — en-tête tronqué,
+# frappe orpheline ». Cela valait de la frappe. Depuis le collage, c'est faux :
+# mesuré le 2026-08-27 sur la vraie base, un titre "AVANT-é\nAPRES-ù\tTAB\x1bESC"
+# collé puis validé arrive OCTET POUR OCTET, un seul en-tête, rien de tronqué.
+#
+# Ce qui reste est une DÉCISION : le CLI ne fabrique pas d'objet dont le nom
+# porte la classe qu'il refuse d'émettre brute sur sa propre sortie. La classe
+# est donc `_REFUSED_CATEGORIES`, la même, et non une seconde liste — elle
+# valait `("Cc","Zl","Zp")` jusqu'au 2026-08-27, ce qui était un SOUS-refus :
+# U+202E (inversion de sens de lecture) passait dans un titre alors qu'il est
+# refusé en sortie.
 # ---------------------------------------------------------------------------
 
-UNTYPABLE = ["\n", "\r", "\t", "\x0b", "\x0c", "\x1b", "\x7f", "\u2028", "\u2029"]
+REFUSED_IN_TITLE = [
+    "\n", "\r", "\t", "\x0b", "\x0c", "\x1b", "\x7f",   # Cc
+    "\u2028", "\u2029",                                  # Zl / Zp
+    "\u202e", "\u200b",                                  # Cf — ajoutés à l'alignement
+]
 
 
-@pytest.mark.parametrize("ch", UNTYPABLE)
-def test_untypable_title_refused_before_any_activation(thingskit, rigged, ch):
+@pytest.mark.parametrize("ch", REFUSED_IN_TITLE)
+def test_refused_title_class_is_rejected_before_any_activation(thingskit, rigged, ch):
     calls, set_rows = rigged
     set_rows([{"uuid": "P1", "title": "Projet A", "type": 1}])
     rc = thingskit.cmd_create_heading(
@@ -396,15 +405,34 @@ def test_untypable_title_refused_before_any_activation(thingskit, rigged, ch):
     assert calls["open"] == []
 
 
-@pytest.mark.parametrize("title", [
-    'Titre "cité"', "Chemin C:\\dossier", "Éléments accentués — tiret cadratin",
-    "emoji 🙂", "espaces    multiples",
-])
-def test_typable_titles_are_accepted(thingskit, rigged, title):
+def test_the_title_class_is_the_one_refused_on_output_not_a_second_list(thingskit):
+    """Une seconde liste dérive de la première. Le principe écrit dans le code
+    dit « la classe qu'il refuse d'émettre brute » : il doit s'agir de CELLE-LÀ.
+    """
+    for categorie in thingskit._REFUSED_CATEGORIES:
+        assert categorie in {"Cc", "Cf", "Zl", "Zp", "Cs", "Co", "Cn"}
+    # U+202E : le cas qui rendait la phrase fausse avant l'alignement.
+    assert thingskit._refused_title_chars("a\u202eb") == ["U+202E"]
+    assert thingskit._refused_title_chars("a\u200bb") == ["U+200B"]
+
+
+def test_the_refusal_message_does_not_carry_the_refuted_motive(
+        thingskit, rigged, capsys):
+    """La seule surface que l'utilisateur LIT. Elle était restée sur « ils
+    seraient tapés dans le champ de saisie et y vaudraient validation (heading
+    tronqué, frappe orpheline) » alors que plus rien n'est tapé — et aucun test
+    ne l'assied, contrairement à tous les autres messages de cette commande.
+    """
     calls, set_rows = rigged
     set_rows([{"uuid": "P1", "title": "Projet A", "type": 1}])
-    thingskit.cmd_create_heading(_ns(title=title, project="Projet A"))
-    assert len(calls["osa"]) == 1  # le garde ne doit pas sur-refuser
+    thingskit.cmd_create_heading(_ns(title="Avant\u202eAprès", project="Projet A"))
+    err = capsys.readouterr().err
+
+    for mort in ("saisissables au clavier", "seraient tapés", "tronqué",
+                 "frappe orpheline", "keystroke"):
+        assert mort not in err, err
+    assert "U+202E" in err
+    assert "n'a pas été sollicitée" in err
 
 
 def test_refused_title_chars_lists_offenders(thingskit):
@@ -761,15 +789,6 @@ def test_the_pasted_title_still_goes_through_the_escape_function(thingskit):
     assert 'set the clipboard to "Il a dit \\"non\\" \\\\ ici"' in script
 
 
-def test_the_clipboard_is_taken_before_any_click(thingskit):
-    """Le presse-papiers est pris AVANT le clic de menu : son refus (contenu
-    non restituable) doit pouvoir tomber sans qu'aucun en-tête n'ait été créé.
-    """
-    script = thingskit._build_heading_script("Section", "Projet A")
-
-    assert script.index('set the clipboard to "Section"') < script.index("click menu item")
-
-
 def test_the_clipboard_is_saved_before_being_overwritten(thingskit):
     script = thingskit._build_heading_script("Section", "Projet A")
 
@@ -785,39 +804,6 @@ def test_an_unrestorable_clipboard_is_refused_before_it_is_overwritten(thingskit
 
     assert refus < script.index('set the clipboard to "Section"')
     assert refus < script.index("click menu item")
-
-
-def test_the_clipboard_is_restored_on_the_success_path(thingskit):
-    """La remise doit être HORS du `try`, sur le chemin que le succès emprunte.
-
-    Une assertion sur la première occurrence du texte de remise ne le dit pas :
-    celle de la branche d'erreur suit elle aussi le collage, et la retirer du
-    chemin de succès laissait la suite verte (mutation mesurée le 2026-08-27).
-    """
-    script = thingskit._build_heading_script("Section", "Projet A")
-    # DERNIER `end try` : le script en compte cinq autres, tous antérieurs
-    # (sonde d'affichage, premier plan, prise du presse-papiers). Ancrer sur le
-    # premier laissait `apres_try` couvrir tout le script, donc la remise de la
-    # branche d'erreur — et la mutation survivait.
-    apres_try = script[script.rindex("\nend try\n"):]
-
-    assert "set the clipboard to savedClip" in apres_try, script
-    assert apres_try.index("set the clipboard to savedClip") < \
-        apres_try.index('return "OK"')
-
-
-def test_the_clipboard_is_restored_on_the_error_path_which_then_reraises(thingskit):
-    """Un échec entre la prise et la remise laisserait le titre de l'utilisateur
-    dans SON presse-papiers. La remise est donc dans la branche d'erreur, et
-    l'erreur est relancée telle quelle — sans quoi les marqueurs de refus
-    seraient avalés et un échec passerait pour un succès."""
-    script = thingskit._build_heading_script("Section", "Projet A")
-    branche = script[script.index("on error errMsg number errNum"):]
-
-    assert "set the clipboard to savedClip" in branche
-    assert "error errMsg number errNum" in branche
-    assert branche.index("set the clipboard to savedClip") < \
-        branche.index("\n  error errMsg number errNum")
 
 
 def test_an_empty_clipboard_is_left_empty_not_carrying_our_title(thingskit):
@@ -996,3 +982,254 @@ def test_the_failure_message_uses_the_observed_state_not_a_fresh_query(
     assert rc != 0
     assert "H-TARDIF" not in err
     assert "AUTRE titre" not in err
+
+
+# ---------------------------------------------------------------------------
+# Presse-papiers : ces propriétés s'EXÉCUTENT, elles ne se relisent pas
+#
+# Les premières versions de ces tests étaient des assertions textuelles sur le
+# script produit. Elles ne pouvaient pas voir que le `try` autour de
+# `clipboard info` était fail-OPEN — un `clipboard info` qui erre laissait
+# `hadClip` faux, sautait la sauvegarde ET le refus, et le contenu de
+# l'utilisateur était écrasé sans filet. Une garde qu'on relit n'est pas une
+# garde qu'on éprouve.
+#
+# Le motif est celui de `_run_comparison` : ce qui tourne est l'AppleScript
+# RÉELLEMENT produit, seules les primitives qui toucheraient le pasteboard de
+# l'utilisateur sont remplacées par des valeurs contrôlées. Aucun test de ce
+# fichier n'écrit dans le presse-papiers réel.
+# ---------------------------------------------------------------------------
+
+ERRE = "(item 5 of {})"          # expression AppleScript qui LÈVE à l'exécution
+
+
+def _sans_pasteboard(script, info="{}", record='"CONTENU"', remise_erre=False):
+    """Neutralise les trois primitives de pasteboard, et rien d'autre."""
+    assert "(clipboard info)" in script or "the clipboard" in script, script
+    script = script.replace("(clipboard info)", info)
+    script = script.replace("the clipboard as record", record)
+    script = script.replace("set the clipboard to savedClip",
+                            f"set fakeClip to {ERRE}" if remise_erre
+                            else "set fakeClip to savedClip")
+    script = script.replace("set the clipboard to", "set fakeClip to")
+    return 'set fakeClip to "INTACT"\n' + script
+
+
+def _joue(corps):
+    proc = subprocess.run([shutil.which("osascript"), "-e", corps],
+                          capture_output=True, text=True)
+    return proc.returncode, (proc.stdout + proc.stderr).strip()
+
+
+# --- prise du presse-papiers : trois états, `inconnu` vaut REFUS -------------
+
+@requires_osascript
+def test_an_empty_clipboard_is_seen_as_empty(thingskit):
+    rc, out = _joue(_sans_pasteboard(thingskit._clipboard_capture_lines(), info="{}")
+                    + 'return clipState & "/" & (savedClip as text)\n')
+    assert rc == 0, out
+    assert out.startswith("empty/"), out
+
+
+@requires_osascript
+def test_a_saveable_clipboard_is_saved(thingskit):
+    rc, out = _joue(_sans_pasteboard(thingskit._clipboard_capture_lines(),
+                                     info='{"x"}', record='"CONTENU"')
+                    + 'return clipState & "/" & savedClip\n')
+    assert rc == 0, out
+    assert out == "present/CONTENU", out
+
+
+@requires_osascript
+def test_an_unsaveable_clipboard_is_refused(thingskit):
+    rc, out = _joue(_sans_pasteboard(thingskit._clipboard_capture_lines(),
+                                     info='{"x"}', record=ERRE)
+                    + 'return "PAS REFUSE"\n')
+    assert rc != 0, out
+    assert thingskit._CLIPBOARD_UNSAVEABLE_MARKER in out, out
+    assert "PAS REFUSE" not in out
+
+
+@requires_osascript
+def test_an_unreadable_clipboard_state_is_a_refusal_not_an_empty_clipboard(thingskit):
+    """LE bloqueur : `clipboard info` qui erre — pasteboard détenu par un autre
+    processus, contenu qu'il ne sait pas décrire. « Je n'ai pas pu lire » n'est
+    PAS « il est vide » : le premier vaut refus, le second laisse passer."""
+    rc, out = _joue(_sans_pasteboard(thingskit._clipboard_capture_lines(), info=ERRE)
+                    + 'return "PAS REFUSE : " & clipState\n')
+    assert rc != 0, out
+    assert thingskit._CLIPBOARD_UNKNOWN_MARKER in out, out
+    assert "PAS REFUSE" not in out
+    assert thingskit._CLIPBOARD_UNSAVEABLE_MARKER not in out   # deux causes, deux marqueurs
+
+
+def test_the_two_clipboard_refusals_are_distinct_and_diagnose_differently(thingskit):
+    assert thingskit._CLIPBOARD_UNKNOWN_MARKER != thingskit._CLIPBOARD_UNSAVEABLE_MARKER
+    _, inconnu = thingskit._interpret_ui_outcome(
+        1, f'error "{thingskit._CLIPBOARD_UNKNOWN_MARKER}" number -2700')
+    _, insauvable = thingskit._interpret_ui_outcome(
+        1, f'error "{thingskit._CLIPBOARD_UNSAVEABLE_MARKER}" number -2700')
+    assert inconnu != insauvable
+    for msg in (inconnu, insauvable):
+        assert "presse-papiers" in msg
+        assert "rien n'a été cliqué ni tapé" in msg
+
+
+# --- remise du presse-papiers : elle ne peut ni échouer en silence, ----------
+# --- ni remplacer l'erreur qu'elle accompagne -------------------------------
+
+@requires_osascript
+@pytest.mark.parametrize("chemin", ["succès", "erreur"])
+def test_the_restore_puts_the_saved_content_back(thingskit, chemin):
+    corps = ('set savedClip to "ORIGINE"\n'
+             + _sans_pasteboard(thingskit._clipboard_restore_lines(chemin))
+             + 'return fakeClip & "/" & (clipRestored as text)\n')
+    rc, out = _joue(corps)
+    assert rc == 0, out
+    assert out == "ORIGINE/true", out
+
+
+@requires_osascript
+@pytest.mark.parametrize("chemin", ["succès", "erreur"])
+def test_a_failing_restore_neither_raises_nor_passes_unnoticed(thingskit, chemin):
+    """Une remise qui échoue ne doit ni remonter (elle remplacerait l'erreur
+    d'origine et ferait disparaître son marqueur), ni se taire (le contenu de
+    l'utilisateur est perdu et le titre peut demeurer dans le pasteboard)."""
+    corps = ('set savedClip to "ORIGINE"\n'
+             + _sans_pasteboard(thingskit._clipboard_restore_lines(chemin),
+                                remise_erre=True)
+             + 'return "SUITE/" & (clipRestored as text)\n')
+    rc, out = _joue(corps)
+    assert rc == 0, out                      # ne remonte pas
+    assert out == "SUITE/false", out         # ne se tait pas
+
+
+@requires_osascript
+def test_a_failing_restore_never_swallows_the_original_marker(thingskit):
+    """Le bloqueur 2 : sans garde, l'erreur de la remise REMPLAÇAIT `errMsg` et
+    `_LOST_FOCUS_MARKER` — dont tout l'objet est d'avertir qu'un en-tête sans
+    titre a pu être créé — n'atteignait plus `_interpret_ui_outcome`."""
+    script = thingskit._paste_lines("Section")
+    script = (script
+              .replace('tell application "System Events"', "tell me")
+              .replace('keystroke "v" using {command down}',
+                       f'error "{thingskit._LOST_FOCUS_MARKER}" number -2700')
+              .replace("key code 36", "set fakeKeys to 0")
+              .replace("delay 0.4", "delay 0"))
+    corps = ('set savedClip to "ORIGINE"\n'
+             + _sans_pasteboard(script, remise_erre=True))
+    rc, out = _joue(corps)
+
+    assert rc != 0, out
+    assert thingskit._LOST_FOCUS_MARKER in out, out
+    assert thingskit._CLIPBOARD_NOT_RESTORED_MARKER in out, out
+    ok, msg = thingskit._interpret_ui_outcome(rc, out)
+    assert not ok
+    assert "en-tête SANS TITRE" in msg          # le marqueur d'origine parle encore
+    assert "presse-papiers" in msg              # et la remise ratée est dite
+
+
+@requires_osascript
+def test_a_failing_restore_on_the_success_path_does_not_turn_a_write_into_a_failure(
+        thingskit):
+    """Le collage a réussi, l'en-tête existe. Une remise ratée est un
+    AVERTISSEMENT, jamais un échec : rendre un échec ferait réessayer
+    l'appelant, donc un doublon en base — le mode d'échec que ce commit
+    corrige, réintroduit par son propre correctif."""
+    script = thingskit._paste_lines("Section")
+    script = (script
+              .replace('tell application "System Events"', "tell me")
+              .replace('keystroke "v" using {command down}', "set fakeKeys to 1")
+              .replace("key code 36", "set fakeKeys to 2")
+              .replace("delay 0.4", "delay 0"))
+    corps = 'set savedClip to "ORIGINE"\n' + _sans_pasteboard(script, remise_erre=True)
+    rc, out = _joue(corps)
+
+    assert rc == 0, out
+    assert out.startswith("OK"), out
+    assert thingskit._CLIPBOARD_NOT_RESTORED_MARKER in out, out
+    ok, msg = thingskit._interpret_ui_outcome(rc, out)
+    assert ok                                   # succès, PAS échec
+    assert msg != "ok"                          # mais pas silencieux
+
+
+@requires_osascript
+def test_the_nominal_paste_returns_a_plain_ok(thingskit):
+    """Contre-épreuve : sans incident, aucun avertissement ne doit apparaître."""
+    script = thingskit._paste_lines("Section")
+    script = (script
+              .replace('tell application "System Events"', "tell me")
+              .replace('keystroke "v" using {command down}', "set fakeKeys to 1")
+              .replace("key code 36", "set fakeKeys to 2")
+              .replace("delay 0.4", "delay 0"))
+    rc, out = _joue('set savedClip to "ORIGINE"\n' + _sans_pasteboard(script))
+
+    assert rc == 0, out
+    assert out == "OK", out
+    assert thingskit._interpret_ui_outcome(rc, out) == (True, "ok")
+
+
+def test_a_clipboard_warning_is_printed_without_failing_the_command(
+        thingskit, monkeypatch, tmp_path, capsys):
+    db_file = _make_db(tmp_path, [{"uuid": "P1", "title": "Projet A", "type": 1}])
+    monkeypatch.setattr(thingskit, "db_path", lambda: db_file)
+    monkeypatch.setattr(thingskit, "ensure_running", lambda: None)
+    monkeypatch.setattr(thingskit.subprocess, "run", inert_run)
+    monkeypatch.setattr(thingskit, "time",
+                        type("T", (), {"sleep": staticmethod(lambda s: None)}))
+
+    def _ui(script):
+        con = sqlite3.connect(db_file)
+        con.execute("insert into TMTask (uuid,title,type,trashed,project) "
+                    "values ('H9','Section',2,0,'P1')")
+        con.commit()
+        con.close()
+        return 0, "OK " + thingskit._CLIPBOARD_NOT_RESTORED_MARKER
+
+    monkeypatch.setattr(thingskit, "osa", _osa_answering_the_view_probe(_ui))
+
+    rc = thingskit.cmd_create_heading(_ns(title="Section", project="Projet A"))
+    sortie = capsys.readouterr()
+
+    assert rc == 0
+    assert "heading créé" in sortie.out
+    assert "presse-papiers" in sortie.err
+
+
+# --- fenêtre d'exposition : le titre n'est écrit qu'au dernier moment --------
+
+def test_the_refusal_precedes_the_click_but_the_title_is_written_after_it(thingskit):
+    """Deux exigences distinctes, portées par deux emplacements distincts.
+
+    Le REFUS doit précéder le clic — c'est lui qui garantit qu'aucun objet
+    n'est créé. L'ÉCRITURE du titre, elle, n'a rien à faire là : la mettre
+    avant le clic exposait le titre pendant l'énumération de menu, le clic et
+    un délai, et sur les chemins d'échec `NO_LABEL` et `LOST_FOCUS` où aucun
+    collage n'a lieu.
+    """
+    script = thingskit._build_heading_script("Section", "Projet A")
+    clic = script.index("click menu item")
+
+    assert script.index(thingskit._CLIPBOARD_UNKNOWN_MARKER) < clic
+    assert script.index(thingskit._CLIPBOARD_UNSAVEABLE_MARKER) < clic
+    assert script.index('set the clipboard to "Section"') > clic
+    # rien entre l'écriture et le collage que le collage lui-même
+    entre = script[script.index('set the clipboard to "Section"'):
+                   script.index(PASTE_CHORD)]
+    assert "click menu item" not in entre
+    assert "frontmost" not in entre
+    assert "delay" not in entre, entre
+
+
+def test_both_restore_paths_are_present_and_labelled(thingskit):
+    """Les deux chemins se distinguent par un LIBELLÉ, pas par un compte
+    d'occurrences d'`end try` — le script en porte 7, dont 3 non indentées, et
+    les deux chiffres que ce test a d'abord affirmés (5, puis 6) étaient faux.
+    Une propriété qu'on nomme ne se périme pas comme un nombre qu'on recopie.
+    """
+    script = thingskit._build_heading_script("Section", "Projet A")
+
+    assert "remise du presse-papiers (chemin : succès)" in script
+    assert "remise du presse-papiers (chemin : erreur)" in script
+    assert script.index("remise du presse-papiers (chemin : erreur)") < \
+        script.index("remise du presse-papiers (chemin : succès)")

@@ -717,6 +717,18 @@ redevient obligatoire.
       .venv/bin/python -m pytest tests/test_create_heading.py --collect-only -q -p no:cacheprovider | tail -1 -> 66
       .venv/bin/python -m pytest -q -p no:cacheprovider -> 1176 passed, 1 skipped
 
+  Baseline relevée à **1177** avant le lot de review du même jour, **1188**
+  après. L'écart de 11 tient entièrement dans `tests/test_create_heading.py`
+  (66 -> 77 collectés) : quatre tests textuels remplacés par des tests
+  d'EXÉCUTION du presse-papiers (trois états, deux refus, remise qui rend, qui
+  échoue sans remonter et sans se taire, marqueur d'origine préservé, succès
+  non converti en échec, contre-épreuve nominale), la séparation refus/écriture
+  autour du clic, l'alignement de classe et le message de refus. Les commandes :
+
+      .venv/bin/python -m pytest --collect-only -q -p no:cacheprovider | tail -1 -> 1188 tests collected
+      .venv/bin/python -m pytest tests/test_create_heading.py --collect-only -q -p no:cacheprovider | tail -1 -> 77
+      .venv/bin/python -m pytest -q -p no:cacheprovider -> 1187 passed, 1 skipped
+
   Le compte d'AVANT est mesuré sur l'arbre `master` lui-même, pas rappelé de
   mémoire :
 
@@ -1620,35 +1632,83 @@ de la documentation Things (cf. docstring module).
   `_esc` reste obligatoire : le titre part toujours dans un littéral
   AppleScript, le presse-papiers ne change rien à l'évasion de littéral.
 - **Le presse-papiers appartient à l'utilisateur : il est emprunté, jamais
-  pris.** Il est sauvegardé (`the clipboard as record`, tous parfums), puis
-  rendu — sur le chemin de succès ET dans la branche d'erreur, qui relance
-  ensuite l'erreur telle quelle pour ne pas avaler les marqueurs de refus.
-  Trois cas, et le refus est le cas par défaut : vide -> rien à rendre, mais
-  on le laisse **vide** plutôt que de laisser notre titre y survivre ;
-  restituable -> sauvegardé ; **non restituable -> REFUS avant tout
-  écrasement** (`_CLIPBOARD_UNSAVEABLE_MARKER`), et comme la prise précède le
-  clic de menu, ce refus ne laisse aucun objet derrière lui. `clipboard info`
-  distingue « vide » de « non restituable » : sans lui les deux se
-  confondraient dans un `try` muet, et un presse-papiers non restituable
-  serait écrasé puis rendu vide. Vérifié de bout en bout le 2026-08-27 :
-  valeur posée avant l'appel, relue identique après. Ces propriétés sont
-  gardées par MUTATION, pas par relecture — retirer la remise du chemin de
-  succès laissait la suite VERTE tant que le test s'ancrait sur la première
-  occurrence du texte de remise au lieu de la dernière (le script compte six
-  `end try`).
+  pris.** TROIS états explicites, et `inconnu` n'est JAMAIS synonyme de vide :
+  `clipboard info` qui erre -> **refus** (`_CLIPBOARD_UNKNOWN_MARKER`) ; vide
+  -> rien à rendre, mais on le laisse **vide** plutôt que d'y laisser notre
+  titre survivre ; présent -> sauvegardé en `record`, et une sauvegarde qui
+  erre vaut **refus** (`_CLIPBOARD_UNSAVEABLE_MARKER`). Les deux `try`
+  subsistent et c'est légitime : **chacun mène à un refus, aucun ne laisse
+  passer une écriture**. C'est la propriété qui compte, pas l'absence de `try`.
 
-  Ce que cela n'isole pas, et qui est nommé plutôt que tu : le titre transite
-  par le presse-papiers du système le temps du collage, donc lisible par tout
-  processus qui sait le lire, et enregistré par les gestionnaires
-  d'historique ; et un `osascript` tué entre la copie et la remise laisse le
-  titre dedans (`SECURITY.md` § « What the CLI does not isolate »).
-- **Une classe de caractères reste refusée dans un titre — et son motif
-  d'origine est RÉFUTÉ.** `cmd_create_heading` refuse tout titre portant un
-  caractère de catégorie Unicode `Cc`, `Zl` ou `Zp` (`_refused_title_chars`,
-  nommé `_untypable_chars` jusqu'au 2026-08-27), **avant** la résolution du
-  projet et **avant** toute activation de l'application
-  (`test_untypable_title_refused_before_any_activation`, paramétré sur la
-  classe ; `test_typable_titles_are_accepted` garde contre le sur-refus).
+  La première rédaction affirmait déjà cela et ne le tenait pas : écrite
+  `try / if … then set hadClip to true / end try`, elle rendait un
+  `clipboard info` en erreur indiscernable d'un pasteboard vide — la
+  sauvegarde ET le refus étaient sautés, et l'écriture passait. **Fail-open**,
+  et la docstring comme cette constitution affirmaient le contraire. Le `try`
+  muet n'avait pas été fermé, il avait été déplacé d'un cran.
+
+  **La remise est GARDÉE, et son échec est un AVERTISSEMENT, jamais un
+  échec.** Non gardée, l'erreur de la remise REMPLAÇAIT l'erreur en cours sur
+  le chemin d'erreur : `error errMsg number errNum` n'était jamais atteint et
+  le marqueur d'origine — `_LOST_FOCUS_MARKER` en particulier, dont tout
+  l'objet est d'avertir qu'un en-tête SANS TITRE a pu être créé — n'atteignait
+  plus `_interpret_ui_outcome`. Sur le chemin de succès, elle convertissait
+  une écriture RÉUSSIE en échec, donc un réessai, donc un doublon en base : le
+  mode d'échec que ce chantier corrige, réintroduit par son propre correctif.
+  Elle ne se tait pas pour autant — `clipRestored` porte le verdict, le script
+  rend `OK <marqueur>` et la commande imprime un avertissement sur `stderr`.
+
+  **Ces propriétés s'EXÉCUTENT, elles ne se relisent pas.** Les premières
+  versions étaient des assertions textuelles sur le script produit, et aucune
+  ne pouvait voir le fail-open. Ce qui tourne est l'AppleScript RÉELLEMENT
+  produit, seules les trois primitives de pasteboard remplacées par des
+  valeurs contrôlées — même motif que `_run_comparison`. Aucun test n'écrit
+  dans le presse-papiers réel. Six mutations les éprouvent, six tuées.
+
+  **La fenêtre d'exposition est bornée par construction : rien ne sépare
+  l'écriture du titre de son collage.** Elle a d'abord englobé l'énumération
+  de menu, le clic et deux délais — 0,85 s de plancher mesuré, plafond
+  inexistant — et exposait le titre sur les chemins `NO_LABEL` et
+  `LOST_FOCUS`, où aucun collage n'a lieu. Le **refus** précède le clic (c'est
+  lui qui garantit qu'aucun objet n'est créé) ; l'**écriture** ne vient
+  qu'après le recontrôle de premier plan. Les deux exigences sont portées par
+  deux emplacements distincts, et un test les sépare.
+
+  Ce que cela n'isole pas, et qui est nommé plutôt que tu — trois résidus :
+  le titre transite par le pasteboard système, donc lisible par tout processus
+  qui sait le lire et enregistré par les gestionnaires d'historique ; la
+  fenêtre n'est pas seulement non mesurée, elle est **non bornée** (aucun
+  `with timeout` sur le bloc System Events du collage, aucun `timeout=` côté
+  `osa()` — un System Events qui traîne l'étend jusqu'au délai d'AppleEvent
+  par défaut, deux minutes) ; et si un AUTRE processus écrit dans le
+  presse-papiers entre la prise et la remise, la remise écrase un contenu
+  qu'elle n'a jamais sauvegardé — course non refermable sans `changeCount`.
+
+  **« Tous parfums » était une généralisation, et elle est RÉFUTÉE.** Elle
+  avait été écrite sur la foi d'un aller-retour sur une valeur TEXTE. Mesuré
+  le 2026-08-27 sur un pasteboard RTF : `clipboard info` rend `«class RTF »43`
+  avant ET après, mais `pbpaste` rend **vide avant** et le contenu **après** —
+  le jeu de parfums n'est donc pas reproduit à l'identique par
+  `the clipboard as record` / `set the clipboard to`. Ce qui EST établi : le
+  contenu n'est pas perdu, et un pasteboard TEXTE revient identique octet pour
+  octet (accents, tiret cadratin, saut de ligne, tabulation compris). Rejeu :
+
+      printf '{\\rtf1\\ansi {\\b GRAS} et {\\i ital} \\u233 ?}' | pbcopy -Prefer rtf
+      osascript -e 'return (clipboard info) as text'; pbpaste | xxd | head -1
+      osascript -e 'set s to (the clipboard as record)
+      set the clipboard to "X"
+      delay 0.2
+      set the clipboard to s'
+      osascript -e 'return (clipboard info) as text'; pbpaste | xxd | head -1
+
+- **Une classe de caractères reste refusée dans un titre — son motif d'origine
+  est RÉFUTÉ, et la classe est celle de la sortie, pas une seconde liste.**
+  `cmd_create_heading` refuse tout titre portant un caractère de
+  `_REFUSED_CATEGORIES` (`_refused_title_chars`, nommé `_untypable_chars`
+  jusqu'au 2026-08-27), **avant** la résolution du projet et **avant** toute
+  activation de l'application (`test_refused_title_class_is_rejected_before_any_activation`,
+  paramétré sur la classe ; `test_typable_titles_are_accepted` garde contre le
+  sur-refus).
 
   Le motif écrit ici jusqu'au 2026-08-27 était : « `keystroke` les tape, un
   retour à la ligne vaut validation dans le champ, en-tête tronqué et frappe
@@ -1658,16 +1718,23 @@ de la documentation Things (cf. docstring module).
   **octet pour octet** — pas de troncature, pas de frappe orpheline, un seul
   en-tête créé.
 
-  Ce qui reste est une DÉCISION, plus une nécessité physique : le CLI ne
-  fabrique pas d'objet dont le NOM porte une classe qu'il refuse d'émettre
-  brute sur sa propre sortie (`_REFUSED_CATEGORIES`, § 1, dont `Cc`/`Zl`/`Zp`
-  sont un sous-ensemble). C'est un léger **sur-refus, assumé**, du côté qui ne
-  casse rien — même posture que le refus de l'homonyme projet/area dans cette
-  même commande. Ce qui le lèverait, et qui n'a PAS été fait : mesurer la
-  classe ENTIÈRE par le chemin du collage. Trois des neuf caractères du banc
-  l'ont été (`\n`, `\t`, `\x1b`) ; trois qui passent n'établissent pas neuf,
-  et U+0000 en particulier traverse `_esc` sans conversion et n'a jamais été
-  mesuré à travers `osascript`.
+  Ce qui reste est une DÉCISION : le CLI ne fabrique pas d'objet dont le NOM
+  porte la classe qu'il refuse d'émettre brute sur sa propre sortie (§ 1).
+  **Cette phrase a d'abord été écrite devant une classe qui ne la tenait
+  pas** : `("Cc", "Zl", "Zp")` contre les sept catégories de la sortie, décrit
+  ici comme « un léger sur-refus assumé » alors que c'était un **SOUS-refus** —
+  `_refused_title_chars("a\u202eb")` rendait `[]`, U+202E (inversion de sens
+  de lecture) passant dans un titre quand le CLI le refuse en sortie. Décrire
+  l'écart sans le trancher étant la voie interdite, la **classe est alignée**
+  plutôt que la phrase affaiblie. Le coût est nul en usage réel : sur les 902
+  titres mesurés le 2026-08-26, la classe à sept catégories en cite ZÉRO.
+
+  **Le message rendu à l'utilisateur porte le même motif que le code**, et il
+  est désormais SOUS TEST, comme tous les autres messages d'échec de cette
+  commande (`test_the_refusal_message_does_not_carry_the_refuted_motive`, qui
+  balaie les cinq formules mortes). Il avait survécu au renommage de la
+  fonction, à la réécriture du commentaire et à celle de cette constitution :
+  la seule surface que l'utilisateur LIT était restée sur l'ancien récit.
 - **La vérification post-action NOMME l'objet créé sous un autre titre.**
   Elle refusait déjà un titre différent — `_find_heading` compare le titre
   exact, et `test_ui_succeeds_but_heading_not_observed_fails` l'épinglait déjà

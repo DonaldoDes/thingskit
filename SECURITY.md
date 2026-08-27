@@ -63,17 +63,43 @@ A risk left unsaid is a risk that comes back as a surprise.
   character — `keystroke` silently mangled every composed character
   (measured: `Éprouvé — formalités é à ù ç` landed in the database as
   `aprouva — formalitas a a a ç`). It now copies the title to the pasteboard
-  and pastes it with Cmd-V. For the duration of that paste, the title is
+  and pastes it with Cmd-V. While that paste is in flight, the title is
   readable by **any process that can read the pasteboard**, and pasteboard
-  managers will record it in their history. The window is not measured. The
-  user's own pasteboard content is saved before and restored after, on both
-  the success and the failure path; a pasteboard whose content cannot be
-  saved is **refused before being overwritten**, and nothing is clicked or
-  typed in that case. What is *not* covered: if the `osascript` process is
-  killed between the copy and the restore, the title stays in the
-  pasteboard. Closing this would require a surface that assigns a heading
-  to an existing project without driving the interface — none exists today
-  (measured, see `constitution.md` § Sensitive zones).
+  managers will record it in their history.
+
+  The user's own pasteboard is **taken before the menu click and written only
+  after it**, so nothing is exposed while the menu is enumerated and clicked,
+  nor on the `NO_LABEL` and `LOST_FOCUS` failure paths where no paste happens.
+  Three states are distinguished, and *unknown is never treated as empty*: a
+  `clipboard info` that errors is a **refusal**, so is a content that cannot be
+  saved, and both refusals land **before anything is overwritten and before
+  anything is clicked**. The restore runs on both the success and the failure
+  path, and it is **guarded**: its own failure can neither replace the error it
+  accompanies (which would swallow the marker warning that a title-less heading
+  may have been created) nor turn a successful write into a failure (which
+  would make the caller retry, duplicating in the database). A failed restore
+  is reported as a **warning**, never silently.
+
+  Three residuals are named rather than left unsaid. **The window is not
+  merely unmeasured, it is unbounded**: the System Events block around the
+  paste carries no `with timeout`, and `osa()` passes no `timeout=`, so a
+  System Events that stalls extends the exposure to the default AppleEvent
+  timeout — two minutes. Bounding it would kill the script between the paste
+  and the commit, leaving a partial heading; same trade-off as
+  `_frontmost_check`, decided the same way. **If another process writes to the
+  pasteboard between the take and the restore**, the restore overwrites content
+  it never saved — a race that cannot be closed without tracking
+  `changeCount`. And **the restore does not reproduce the flavour set
+  exactly**: measured on an RTF pasteboard, `clipboard info` reports the same
+  class and size before and after, but `pbpaste` returns empty before and the
+  content after. The content is not lost; a plain-text pasteboard does come
+  back byte for byte. "All flavours are preserved" was written on the strength
+  of a text round-trip and is **refuted**.
+
+  Closing the transit itself would require a surface that assigns a heading to
+  an existing project without driving the interface. None exists — re-measured
+  on 2026-08-27 with the URL-scheme token in hand: a `project` / `update`
+  carrying `items` returns 0 from `open` and creates nothing.
 - **Child-process error text is dropped.** Since 2026-08-27 every child is
   spawned with its output captured, and a failure is reported by **return
   code only**, never by quoting the argv. `open` distinguishes its causes
