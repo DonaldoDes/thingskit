@@ -1694,9 +1694,23 @@ de la documentation Things (cf. docstring module).
   **Ces propriétés s'EXÉCUTENT, elles ne se relisent pas.** Les premières
   versions étaient des assertions textuelles sur le script produit, et aucune
   ne pouvait voir le fail-open. Ce qui tourne est l'AppleScript RÉELLEMENT
-  produit, seules les trois primitives de pasteboard remplacées par des
-  valeurs contrôlées — même motif que `_run_comparison`. Aucun test n'écrit
-  dans le presse-papiers réel. Six mutations les éprouvent, six tuées.
+  produit — même motif que `_run_comparison`. Aucun test n'écrit dans le
+  presse-papiers réel. Six mutations les éprouvent, six tuées.
+
+  **La fidélité du banc n'est PAS uniforme, et le dire faux coûte plus que ne
+  rien dire.** Cette section a affirmé que « seules les trois primitives de
+  pasteboard » étaient remplacées ; c'était vrai du cas commun
+  (`_sans_pasteboard`) et faux de trois tests, qui neutralisent EN PLUS le
+  bloc System Events (`_sans_system_events` : `tell` détourné, frappe,
+  validation et délai remplacés). Ils n'ont pas le choix — ils éprouvent la
+  remise du presse-papiers sur le chemin d'ERREUR de `_paste_lines`, qui ne
+  s'atteint qu'en faisant échouer le collage, et laisser le bloc intact
+  frapperait l'application au premier plan du poste. Ces trois-là ne
+  démontrent donc rien du collage lui-même ; ce qu'ils démontrent est la
+  remise. La substitution vit à UN seul endroit, et le délai qu'elle remplace
+  DÉRIVE de `HEADING_PASTE_COMMIT_DELAY` : recopié en littéral, il cessait de
+  matcher au premier réglage et le banc se serait mis à dormir en silence
+  (gardé par `test_the_bench_leaves_no_live_delay_behind`).
 
   **La fenêtre d'exposition est bornée par construction : rien ne sépare
   l'écriture du titre de son collage.** Elle a d'abord englobé l'énumération

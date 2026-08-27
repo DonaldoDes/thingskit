@@ -1085,9 +1085,23 @@ def test_the_failure_message_uses_the_observed_state_not_a_fresh_query(
 # garde qu'on éprouve.
 #
 # Le motif est celui de `_run_comparison` : ce qui tourne est l'AppleScript
-# RÉELLEMENT produit, seules les primitives qui toucheraient le pasteboard de
-# l'utilisateur sont remplacées par des valeurs contrôlées. Aucun test de ce
-# fichier n'écrit dans le presse-papiers réel.
+# RÉELLEMENT produit. Aucun test de ce fichier n'écrit dans le presse-papiers
+# réel.
+#
+# Ce que le banc substitue, et il substitue DEUX choses, pas une :
+#   - `_sans_pasteboard` ne touche que les primitives de pasteboard — c'est le
+#     cas commun, et le double System Events y reste intact ;
+#   - `_sans_system_events` neutralise EN PLUS le bloc System Events lui-même,
+#     et les tests qui l'emploient sont donc moins fidèles : ni frappe, ni
+#     validation, ni délai réels. Ils n'ont pas le choix — ils éprouvent la
+#     remise du presse-papiers sur les DEUX chemins de `_paste_lines`, dont le
+#     chemin d'erreur, qui ne s'atteint qu'en faisant ÉCHOUER le collage.
+#     Laisser ce bloc intact frapperait l'application au premier plan du poste.
+#
+# La formulation d'avant disait « seules les trois primitives de pasteboard
+# remplacées » et valait pour le premier cas seulement. Trois tests relevaient
+# du second au moment où elle a été écrite : un lecteur qui s'y fiait croyait
+# le double System Events intact partout.
 # ---------------------------------------------------------------------------
 
 ERRE = "(item 5 of {})"          # expression AppleScript qui LÈVE à l'exécution
