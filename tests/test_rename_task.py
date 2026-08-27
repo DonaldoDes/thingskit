@@ -6,8 +6,8 @@ symétrique de `cmd_set_notes` — mesuré le 2026-08-18 par `sdef
 SANS attribut `access` explicite (comme `notes`), donc rw par défaut ;
 confirmé de bout en bout sur une tâche jetable réelle (écriture + relecture en
 base, valeur exacte). Aucune automatisation d'interface, donc aucune garde de
-caractères non saisissables (`_untypable_chars` ne s'applique qu'à
-`create-heading`, seule commande qui pilote un `keystroke`).
+caractères refusés dans un titre (`_refused_title_chars` ne s'applique qu'à
+`create-heading`, seule commande qui pilote l'interface).
 
 Invariant central : l'UUID de la tâche est INCHANGÉ après renommage — jamais
 de suppression/recréation.
