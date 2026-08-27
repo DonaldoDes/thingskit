@@ -750,6 +750,32 @@ redevient obligatoire.
       git stash && .venv/bin/python -m pytest --collect-only -q -p no:cacheprovider | tail -1
       # -> 1162 tests collected     (puis `git stash pop`)
 
+  Baseline relevée à **1194** le 2026-08-27 avant POLISH-003/004/005,
+  **1200** après. L'écart de 6 tient entièrement dans
+  `tests/test_create_heading.py` (83 -> 89 collectés). Les cinq premiers
+  portent sur `HEADING_PASTE_COMMIT_DELAY`, jusque-là couverte par RIEN :
+  la pause existe et se place ENTRE le collage et sa validation ; elle est
+  réelle (relue dans le script ÉMIS, pas dans la constante) ; la valeur émise
+  DÉRIVE de la constante ; le motif de la durée devinée reste écrit à côté
+  d'elle ; et le banc de test ne laisse derrière lui aucun délai vivant.
+  Aucune assertion n'épingle la VALEUR : `== 0.4` aurait recopié le code et
+  rougi au premier réglage légitime sans rien avoir gardé. Les cinq sont
+  éprouvés par mutation, une chacun — constante à 0, littéral recopié au site
+  d'émission, délai déplacé après `key code 36`, motif retiré du commentaire,
+  banc recopiant le littéral pendant que la constante bouge. Le sixième,
+  `test_no_osascript_call_escapes_its_decorator_guard`, est une garde de
+  méta-niveau ajoutée au rework qui a suivi : elle balaie l'AST du fichier de
+  test et vérifie la correspondance décorateur `@requires_osascript` ↔ corps
+  exécutant réellement osascript, pour toute fonction `test_*` présente et
+  future — fermant la classe du défaut où insérer une fonction entre un
+  décorateur et la fonction qu'il protège fait glisser la garde d'un cran
+  sans changer aucun total. Éprouvée rouge par l'insertion d'une fonction
+  sous un décorateur. Les commandes :
+
+      .venv/bin/python -m pytest --collect-only -q -p no:cacheprovider | tail -1 -> 1200 tests collected
+      .venv/bin/python -m pytest tests/test_create_heading.py --collect-only -q -p no:cacheprovider | tail -1 -> 89
+      .venv/bin/python -m pytest -q -p no:cacheprovider -> 1199 passed, 1 skipped
+
   **Chronique des affirmations réfutées d'US-010 — elle vit ICI, plus dans le
   script.** Les six blocs de `bin/thingskit` qui la racontaient sont ramenés à
   leur invariant plus un renvoi vers ce paragraphe (2026-08-27, troisième tour
@@ -1676,9 +1702,23 @@ de la documentation Things (cf. docstring module).
   **Ces propriétés s'EXÉCUTENT, elles ne se relisent pas.** Les premières
   versions étaient des assertions textuelles sur le script produit, et aucune
   ne pouvait voir le fail-open. Ce qui tourne est l'AppleScript RÉELLEMENT
-  produit, seules les trois primitives de pasteboard remplacées par des
-  valeurs contrôlées — même motif que `_run_comparison`. Aucun test n'écrit
-  dans le presse-papiers réel. Six mutations les éprouvent, six tuées.
+  produit — même motif que `_run_comparison`. Aucun test n'écrit dans le
+  presse-papiers réel. Six mutations les éprouvent, six tuées.
+
+  **La fidélité du banc n'est PAS uniforme, et le dire faux coûte plus que ne
+  rien dire.** Cette section a affirmé que « seules les trois primitives de
+  pasteboard » étaient remplacées ; c'était vrai du cas commun
+  (`_sans_pasteboard`) et faux de trois tests, qui neutralisent EN PLUS le
+  bloc System Events (`_sans_system_events` : `tell` détourné, frappe,
+  validation et délai remplacés). Ils n'ont pas le choix — ils éprouvent la
+  remise du presse-papiers sur le chemin d'ERREUR de `_paste_lines`, qui ne
+  s'atteint qu'en faisant échouer le collage, et laisser le bloc intact
+  frapperait l'application au premier plan du poste. Ces trois-là ne
+  démontrent donc rien du collage lui-même ; ce qu'ils démontrent est la
+  remise. La substitution vit à UN seul endroit, et le délai qu'elle remplace
+  DÉRIVE de `HEADING_PASTE_COMMIT_DELAY` : recopié en littéral, il cessait de
+  matcher au premier réglage et le banc se serait mis à dormir en silence
+  (gardé par `test_the_bench_leaves_no_live_delay_behind`).
 
   **La fenêtre d'exposition est bornée par construction : rien ne sépare
   l'écriture du titre de son collage.** Elle a d'abord englobé l'énumération
