@@ -806,6 +806,79 @@ def test_the_pasted_title_still_goes_through_the_escape_function(thingskit):
     assert 'set the clipboard to "Il a dit \\"non\\" \\\\ ici"' in script
 
 
+# ---------------------------------------------------------------------------
+# HEADING_PASTE_COMMIT_DELAY — ce que la constante GARANTIT, pas sa valeur
+#
+# Un test qui assènerait `== 0.4` ne protégerait rien : il recopierait le code
+# et rougirait au premier réglage légitime sans avoir rien gardé. Ce qui est
+# épinglé ici est ce que le réglage ne doit pas cesser d'assurer :
+#   - une pause EXISTE entre le collage et sa validation, et elle est ENTRE
+#     les deux — la déplacer ou la retirer valide un champ où le collage n'a
+#     pas encore atterri, donc un en-tête au titre VIDE ;
+#   - elle est RÉELLE : `delay 0` rend la main immédiatement, ce qui est
+#     exactement l'absence de pause sous une forme qui en a l'air ;
+#   - la valeur émise DÉRIVE de la constante, elle n'est pas recopiée au site
+#     d'émission — sinon la constante ne règle plus rien.
+#
+# Une quatrième propriété a été envisagée puis ÉCARTÉE sur mesure : exiger une
+# forme décimale simple, au motif qu'une notation scientifique ne serait pas
+# lue par AppleScript. Elle l'est — mesuré le 2026-08-27 :
+#
+#     osascript -e 'if false then
+#     delay 1e-05
+#     end if
+#     return "OK"'        -> OK
+#
+# Il n'y a donc pas de défaut à garder de ce côté, et un test l'aurait interdit
+# sans raison.
+# ---------------------------------------------------------------------------
+
+PASTE_COMMIT = "key code 36"
+
+
+def test_a_pause_separates_the_paste_from_its_commit(thingskit):
+    """L'ordre est la propriété : coller, ATTENDRE, valider."""
+    script = thingskit._paste_lines("Section")
+    delais = re.findall(r"delay [^\n]*", script)
+
+    assert len(delais) == 1, delais
+    assert script.index(PASTE_CHORD) < script.index(delais[0]) \
+        < script.index(PASTE_COMMIT)
+
+
+def test_the_pause_between_paste_and_commit_is_real(thingskit):
+    """Relue DANS le script émis, pas dans la constante : c'est la valeur qui
+    part réellement à AppleScript qui doit être une attente, pas celle qu'on
+    croit avoir réglée."""
+    script = thingskit._paste_lines("Section")
+    valeur = float(re.search(r"delay (\S+)", script).group(1))
+
+    assert valeur > 0, valeur
+
+
+def test_the_emitted_delay_derives_from_the_constant(thingskit, monkeypatch):
+    """Tue la mutation « recopier le littéral au site d'émission » : une
+    constante que le script n'emploie pas ne règle rien, et rien ne le dirait.
+    """
+    monkeypatch.setattr(thingskit, "HEADING_PASTE_COMMIT_DELAY", 1.25)
+    script = thingskit._paste_lines("Section")
+
+    assert re.findall(r"delay [^\n]*", script) == ["delay 1.25"], script
+
+
+def test_the_constant_carries_the_reason_it_is_a_guessed_duration(thingskit):
+    """La constante est une durée DEVINÉE — la seule du chemin de collage —
+    et ce statut se déclare à côté d'elle. Sans ce commentaire, un lecteur la
+    prend pour une durée mesurée et la réduit sans savoir ce qu'il risque.
+    """
+    source = SCRIPT_SOURCE.read_text(encoding="utf-8")
+    tete = source[:source.index("HEADING_PASTE_COMMIT_DELAY =")]
+    bloc = tete[tete.rindex("\n\n") :]
+
+    assert "DEVIN" in bloc.upper(), bloc
+    assert "VIDE" in bloc.upper(), bloc
+
+
 def test_the_clipboard_is_saved_before_being_overwritten(thingskit):
     script = thingskit._build_heading_script("Section", "Projet A")
 
@@ -1032,6 +1105,24 @@ def _sans_pasteboard(script, info="{}", record='"CONTENU"', remise_erre=False):
     return 'set fakeClip to "INTACT"\n' + script
 
 
+def _sans_system_events(thingskit, script, collage="set fakeKeys to 1",
+                        validation="set fakeKeys to 2"):
+    """Neutralise le bloc System Events — AU-DELÀ des trois primitives de
+    pasteboard, cf. l'en-tête de section. UN seul site de définition : trois
+    tests le faisaient chacun de leur côté, avec la même chaîne de `replace`.
+
+    Le délai remplacé DÉRIVE de la constante. Recopié en littéral — ce qu'il
+    était —, il cesse de matcher au premier réglage de
+    `HEADING_PASTE_COMMIT_DELAY`, et le banc se met alors à DORMIR la durée
+    réelle sans qu'aucun test ne rougisse.
+    """
+    return (script
+            .replace('tell application "System Events"', "tell me")
+            .replace(PASTE_CHORD, collage)
+            .replace(PASTE_COMMIT, validation)
+            .replace(f"delay {thingskit.HEADING_PASTE_COMMIT_DELAY}", "delay 0"))
+
+
 def _joue(corps):
     proc = subprocess.run([shutil.which("osascript"), "-e", corps],
                           capture_output=True, text=True)
@@ -1126,13 +1217,10 @@ def test_a_failing_restore_never_swallows_the_original_marker(thingskit):
     """Le bloqueur 2 : sans garde, l'erreur de la remise REMPLAÇAIT `errMsg` et
     `_LOST_FOCUS_MARKER` — dont tout l'objet est d'avertir qu'un en-tête sans
     titre a pu être créé — n'atteignait plus `_interpret_ui_outcome`."""
-    script = thingskit._paste_lines("Section")
-    script = (script
-              .replace('tell application "System Events"', "tell me")
-              .replace('keystroke "v" using {command down}',
-                       f'error "{thingskit._LOST_FOCUS_MARKER}" number -2700')
-              .replace("key code 36", "set fakeKeys to 0")
-              .replace("delay 0.4", "delay 0"))
+    script = _sans_system_events(
+        thingskit, thingskit._paste_lines("Section"),
+        collage=f'error "{thingskit._LOST_FOCUS_MARKER}" number -2700',
+        validation="set fakeKeys to 0")
     corps = ('set savedClip to "ORIGINE"\n'
              + _sans_pasteboard(script, remise_erre=True))
     rc, out = _joue(corps)
@@ -1153,12 +1241,7 @@ def test_a_failing_restore_on_the_success_path_does_not_turn_a_write_into_a_fail
     AVERTISSEMENT, jamais un échec : rendre un échec ferait réessayer
     l'appelant, donc un doublon en base — le mode d'échec que ce commit
     corrige, réintroduit par son propre correctif."""
-    script = thingskit._paste_lines("Section")
-    script = (script
-              .replace('tell application "System Events"', "tell me")
-              .replace('keystroke "v" using {command down}', "set fakeKeys to 1")
-              .replace("key code 36", "set fakeKeys to 2")
-              .replace("delay 0.4", "delay 0"))
+    script = _sans_system_events(thingskit, thingskit._paste_lines("Section"))
     corps = 'set savedClip to "ORIGINE"\n' + _sans_pasteboard(script, remise_erre=True)
     rc, out = _joue(corps)
 
@@ -1171,14 +1254,19 @@ def test_a_failing_restore_on_the_success_path_does_not_turn_a_write_into_a_fail
 
 
 @requires_osascript
+def test_the_bench_leaves_no_live_delay_behind(thingskit):
+    """Contre-épreuve du banc lui-même : si le motif de délai cesse de matcher,
+    les tests ci-dessus DORMENT la durée réelle au lieu d'échouer. Un banc qui
+    se dégrade en silence est pire qu'un banc qui tombe.
+    """
+    neutralise = _sans_system_events(thingskit, thingskit._paste_lines("Section"))
+
+    assert re.findall(r"delay [^\n]*", neutralise) == ["delay 0"], neutralise
+
+
 def test_the_nominal_paste_returns_a_plain_ok(thingskit):
     """Contre-épreuve : sans incident, aucun avertissement ne doit apparaître."""
-    script = thingskit._paste_lines("Section")
-    script = (script
-              .replace('tell application "System Events"', "tell me")
-              .replace('keystroke "v" using {command down}', "set fakeKeys to 1")
-              .replace("key code 36", "set fakeKeys to 2")
-              .replace("delay 0.4", "delay 0"))
+    script = _sans_system_events(thingskit, thingskit._paste_lines("Section"))
     rc, out = _joue('set savedClip to "ORIGINE"\n' + _sans_pasteboard(script))
 
     assert rc == 0, out

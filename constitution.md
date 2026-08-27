@@ -750,6 +750,24 @@ redevient obligatoire.
       git stash && .venv/bin/python -m pytest --collect-only -q -p no:cacheprovider | tail -1
       # -> 1162 tests collected     (puis `git stash pop`)
 
+  Baseline relevée à **1194** le 2026-08-27 avant POLISH-003/004/005,
+  **1199** après. L'écart de 5 tient entièrement dans
+  `tests/test_create_heading.py` (83 -> 88 collectés), et tous les cinq
+  portent sur `HEADING_PASTE_COMMIT_DELAY`, jusque-là couverte par RIEN :
+  la pause existe et se place ENTRE le collage et sa validation ; elle est
+  réelle (relue dans le script ÉMIS, pas dans la constante) ; la valeur émise
+  DÉRIVE de la constante ; le motif de la durée devinée reste écrit à côté
+  d'elle ; et le banc de test ne laisse derrière lui aucun délai vivant.
+  Aucune assertion n'épingle la VALEUR : `== 0.4` aurait recopié le code et
+  rougi au premier réglage légitime sans rien avoir gardé. Les cinq sont
+  éprouvés par mutation, une chacun — constante à 0, littéral recopié au site
+  d'émission, délai déplacé après `key code 36`, motif retiré du commentaire,
+  banc recopiant le littéral pendant que la constante bouge. Les commandes :
+
+      .venv/bin/python -m pytest --collect-only -q -p no:cacheprovider | tail -1 -> 1199 tests collected
+      .venv/bin/python -m pytest tests/test_create_heading.py --collect-only -q -p no:cacheprovider | tail -1 -> 88
+      .venv/bin/python -m pytest -q -p no:cacheprovider -> 1198 passed, 1 skipped
+
   **Chronique des affirmations réfutées d'US-010 — elle vit ICI, plus dans le
   script.** Les six blocs de `bin/thingskit` qui la racontaient sont ramenés à
   leur invariant plus un renvoi vers ce paragraphe (2026-08-27, troisième tour
