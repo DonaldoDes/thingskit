@@ -219,3 +219,101 @@ def test_the_refusal_message_never_carries_a_token(thingskit, monkeypatch,
     monkeypatch.setattr(thingskit, "db_path", lambda: db)
     _, err = thingskit._uri_scheme_token("aucun déplacement effectué")
     assert "uriSchemeAuthenticationToken" not in err
+
+
+# =======================================================================
+# La CLASSE : aucun processus fils n'écrit sur nos descripteurs
+# =======================================================================
+#
+# `777c4fc` a fermé la fuite de `url_open` et a écrit que « la capture porte
+# sur la CLASSE ». C'était FAUX au moment où c'était écrit : sur les cinq
+# sites de lancement du script, deux n'attrapaient rien — `open -g -a Things3`
+# (argv littéral, bénin) et surtout `open things:///show?id=<uuid>` dans
+# `cmd_create_heading`, dont l'argv porte une valeur d'origine non contrôlée.
+# Ce dernier portait même un commentaire invoquant « même neutralisation que
+# `url_open` » : une parité vraie AVANT le correctif, rompue par lui.
+#
+# Le test ci-dessous ne vérifie pas les deux sites connus — il vérifie la
+# PROPRIÉTÉ, sur tous les sites présents et à venir. C'est la seule forme qui
+# ne redevienne pas fausse au prochain ajout.
+
+import ast
+
+from conftest import SCRIPT_PATH
+
+
+def _spawn_sites(source: str):
+    """(ligne, capture ?) pour chaque lancement de fils du script."""
+    sites = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        if not (isinstance(f, ast.Attribute)
+                and f.attr in ("run", "call", "check_call", "Popen")
+                and isinstance(f.value, ast.Name) and f.value.id == "subprocess"):
+            continue
+        kw = {k.arg for k in node.keywords}
+        sites.append((node.lineno,
+                      bool({"capture_output", "stdout", "stderr"} & kw)))
+    return sites
+
+
+def test_every_child_spawn_of_the_script_captures_its_output():
+    source = SCRIPT_PATH.read_text()
+    sites = _spawn_sites(source)
+    assert sites, "aucun lancement de fils trouvé — le balayage a cessé de voir"
+    nus = [ln for ln, capture in sites if not capture]
+    assert nus == [], (
+        f"{len(nus)} lancement(s) de fils sur {len(sites)} laissent leur "
+        f"sortie atteindre NOS descripteurs, lignes {nus} — ce que le fils "
+        "écrit sort sur le terminal de l'utilisateur, sans passer par une "
+        "seule ligne de ce programme.")
+
+
+def test_the_spawn_helper_keeps_the_child_output_off_our_streams(
+        thingskit, fake_open, capfd):
+    """Le helper, exercé pour lui-même : c'est par lui que passent désormais
+    les lancements dont la sortie ne nous appartient pas."""
+    thingskit._spawn([thingskit.OPEN, "things:///show?id=UUID-NON-CONTROLE"])
+    out, err = capfd.readouterr()
+    assert "Unable to find application" not in out + err
+    assert "argv-sur-stdout" not in out + err
+    assert "UUID-NON-CONTROLE" not in out + err
+
+
+def test_the_spawn_helper_says_the_return_code_without_citing_the_argv(
+        thingskit, fake_open, capfd):
+    thingskit._spawn([thingskit.OPEN, "things:///show?id=UUID-NON-CONTROLE"])
+    err = capfd.readouterr()[1]
+    assert err.strip(), "un échec de lancement doit être dit"
+    assert "UUID-NON-CONTROLE" not in err
+    assert "things:///" not in err
+
+
+def test_the_spawn_helper_stays_silent_on_success(thingskit, tmp_path,
+                                                  monkeypatch, capfd):
+    script = tmp_path / "silent"
+    script.write_text("#!/bin/sh\nexit 0\n")
+    script.chmod(0o755)
+    thingskit._spawn([str(script)])
+    assert capfd.readouterr() == ("", "")
+
+
+@pytest.mark.parametrize("hostile", ["\x1b[2K\r", "\n", "‮"])
+def test_the_spawn_label_is_bounded_even_though_every_caller_passes_a_literal(
+        thingskit, fake_open, capfd, hostile):
+    """Mutant survivant du 2026-08-27, tué plutôt que déclaré équivalent.
+
+    Retirer `_rendered` du libellé laissait tout vert : les TROIS sites
+    d'appel passent une chaîne littérale (`schéma d'URL`, `lancement de
+    Things`, `affichage du projet`), donc le mutant était équivalent SUR CE
+    DOMAINE. Le déclarer équivalent aurait fait dépendre une propriété de
+    sortie de l'inventaire des appelants du jour — exactement la forme
+    d'affirmation que ce lot existe pour corriger. Le quatrième appelant n'a
+    pas à relire cette garde pour ne pas la casser.
+    """
+    thingskit._spawn([thingskit.OPEN, "x"], f"étape{hostile}terminée")
+    err = capfd.readouterr()[1].rstrip("\n")
+    assert err, "l'échec doit être dit"
+    assert hostile not in err

@@ -60,6 +60,25 @@ CREATE TABLE TMTask (
 TARGET = "AAAAAAAAAAAAAAAAAAAAAA"
 
 
+class _InertResult:
+    """Ce que rend un lancement de fils NEUTRALISÉ.
+
+    Ces stubs rendaient `None` : ils décrivaient un `subprocess.run` dont
+    personne ne lisait le retour — ce qui a cessé d'être vrai le 2026-08-27,
+    `_spawn` lisant le code retour pour dire un échec sans citer l'argv. Un
+    stub qui ne peut pas porter ce que le code lit n'est pas un stub, c'est
+    un trou : il fait passer pour un défaut du code ce qui est un défaut de
+    la doublure.
+    """
+    returncode = 0
+    stdout = ""
+    stderr = ""
+
+
+def _inert_run(*a, **kw):
+    return _InertResult()
+
+
 def _make_db(tmp_path, rows):
     db_file = tmp_path / "main.sqlite"
     con = sqlite3.connect(db_file)
@@ -529,7 +548,7 @@ def _heading_rig(thingskit, monkeypatch, tmp_path, shown, land_heading=True):
         {"uuid": HEADING_PROJECT, "title": "Projet A", "type": 1}])
     monkeypatch.setattr(thingskit, "db_path", lambda: db_file)
     monkeypatch.setattr(thingskit, "ensure_running", lambda: None)
-    monkeypatch.setattr(thingskit.subprocess, "run", lambda *a, **kw: None)
+    monkeypatch.setattr(thingskit.subprocess, "run", _inert_run)
     clock = Clock()
     monkeypatch.setattr(thingskit, "time", clock)
     ui = {"clicked_at": None, "scripts": [], "probes": 0}

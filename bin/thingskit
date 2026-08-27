@@ -672,6 +672,55 @@ def osa(script: str) -> tuple[int, str]:
     return r.returncode, (r.stdout or r.stderr).strip()
 
 
+def _spawn(argv: list[str], what: str = "lancement") -> subprocess.CompletedProcess:
+    """Lance un processus fils SANS lui prêter nos descripteurs, et dit son
+    échec sans citer son argv.
+
+    **Ce helper existe parce que « la capture porte sur la classe » a été
+    écrit avant d'être vrai.** Le correctif du 2026-08-27 avait fermé la fuite
+    de `url_open` seul : sur les cinq sites de lancement du script, deux
+    laissaient encore leur fils écrire sur NOS descripteurs — `open -g -a
+    Things3` (argv littéral, bénin) et `open things:///show?id=<uuid>` dans
+    `cmd_create_heading`, dont l'argv porte une valeur d'origine non
+    contrôlée. Ce dernier portait même un commentaire invoquant « même
+    neutralisation que `url_open` » : une parité vraie AVANT le correctif, et
+    rompue PAR lui.
+
+    Encoder n'est pas capturer, et les deux ne se remplacent pas :
+    `urllib.parse.quote` borne les OCTETS qui partent, la capture borne le
+    CANAL par lequel ils reviennent. Un argv encodé reste un argv que `open`
+    recrache en clair quand LaunchServices ne résout pas le schéma.
+
+    `what` est un libellé LITTÉRAL fourni par l'appelant : il rend l'échec
+    diagnosticable sans que rien de l'argv n'ait à sortir. Le code retour est
+    la seule autre chose citée — et il coûte la classe d'erreur que `open`
+    distinguait dans son texte (`kLSApplicationNotFoundErr`, `-10814`, tous
+    rendus par un code retour de 1). Compromis assumé : la vérification
+    post-action tranche l'effet dans tous les cas, elle ne dépend d'aucun
+    diagnostic du lanceur.
+
+    Ce que ce helper ne ferme PAS, et qui est nommé plutôt que tu : l'argv
+    reste visible dans la table des processus (`ps`) pour tout processus du
+    même utilisateur, le temps du lancement. C'est vrai du jeton du schéma
+    d'URL comme de tout le reste — cf. `SECURITY.md` § « Ce que le CLI
+    n'isole pas ».
+    """
+    r = subprocess.run(argv, check=False, capture_output=True, text=True)
+    if r.returncode != 0:
+        # `_rendered` sur le code retour n'est PAS cérémoniel — ce mot avait
+        # été écrit ici le 2026-08-27, et la mutation le réfute : le retirer
+        # fait rougir `test_no_untrusted_value_reaches_the_output_unconverted`.
+        # Le balayage juge le TRAJET d'une valeur, pas son type, et `r` est
+        # lié par `subprocess.run`, donc racine. Le qualifier de cérémonie
+        # invitait le prochain lecteur à le supprimer — c'est-à-dire à
+        # sous-estimer une garde en croyant nettoyer.
+        print(f"{_rendered(what)} : échec (code {_rendered(r.returncode)}) — "
+              "sortie du processus RETENUE, elle citerait l'argv et donc ce "
+              "qu'il porte. L'effet reste tranché par la vérification "
+              "post-action.", file=sys.stderr)
+    return r
+
+
 def url_open(payload: list, background: bool = True,
              auth_token: str | None = None) -> None:
     """Envoie un payload au schéma d'URL de Things.
@@ -709,30 +758,27 @@ def url_open(payload: list, background: bool = True,
         json.dumps(payload, ensure_ascii=False)))
     url = "things:///json?" + "&".join(params)
     argv = [OPEN] + (["-g"] if background else []) + [url]
-    # La sortie du fils est CAPTURÉE, toujours. Sans capture il hérite des
-    # descripteurs 1 et 2 du parent, et `open` imprime l'URL COMPLÈTE — jeton
-    # compris — sur son stderr quand LaunchServices ne résout pas le schéma
-    # (mesuré le 2026-08-27 avec un `open` substitué). La branche est
-    # atteignable en usage nominal : `ensure_running()` ne s'arrête pas quand
-    # l'application ne démarre pas. La capture porte sur la CLASSE — la sortie
-    # d'un fils qui s'échappe — et non sur la seule invocation qui porte le
-    # secret : une URL sans jeton porte quand même les titres de l'utilisateur.
-    r = subprocess.run(argv, check=False, capture_output=True, text=True)
-    if r.returncode != 0:
-        # Capturer sans rien dire changerait un défaut visible en défaut muet.
-        # Le code retour suffit à diagnostiquer ; la sortie brute, elle, est
-        # RETENUE parce qu'elle cite l'URL. Rien de ce que le fils a écrit ne
-        # traverse cette ligne.
-        # `_rendered` sur un entier est CÉRÉMONIEL et il reste : le balayage
-        # d'AST juge le TRAJET d'une valeur, pas son type, et c'est ce qui
-        # lui fait attraper les vrais défauts. Le dispenser ici imposerait une
-        # exception, c'est-à-dire une liste — qui ne couvre que ce qu'on a
-        # pensé à y inscrire. Le prix est nul, la garde reste entière.
-        print(f"schéma d'URL : l'ouverture a échoué (code "
-              f"{_rendered(r.returncode)}) — "
-              "sortie du processus retenue, elle citerait l'URL et donc le "
-              "jeton. L'effet reste tranché par la vérification post-action.",
-              file=sys.stderr)
+    # La sortie du fils ne nous revient pas : `_spawn` la capture. Sans
+    # capture il hérite des descripteurs 1 et 2 du parent, et `open` imprime
+    # l'URL COMPLÈTE — jeton compris — sur son stderr quand LaunchServices ne
+    # résout pas le schéma (mesuré le 2026-08-27 avec un `open` substitué, et
+    # corroboré contre le vrai `/usr/bin/open`). La branche est atteignable en
+    # usage nominal : `ensure_running()` ne s'arrête pas quand l'application
+    # ne démarre pas.
+    #
+    # **« La capture porte sur la CLASSE » a d'abord été écrit ICI, et c'était
+    # faux.** Seul ce site capturait ; deux des cinq lancements du script n'y
+    # passaient pas, dont celui de `cmd_create_heading`, qui porte un uuid
+    # d'origine non contrôlée — et dont le commentaire invoquait « même
+    # neutralisation que `url_open` », parité vraie AVANT ce correctif et
+    # rompue par lui. La phrase n'est plus une affirmation posée à côté du
+    # code : elle est vraie parce que les lancements passent tous par le même
+    # helper, et parce que
+    # `test_every_child_spawn_of_the_script_captures_its_output` compte les
+    # sites NUS et exige zéro — sur ceux d'aujourd'hui comme sur ceux de
+    # demain. Une propriété de classe se tient par un compte, jamais par une
+    # phrase.
+    _spawn(argv, "schéma d'URL")
 
 
 def _uri_scheme_token(action_suffix: str) -> tuple[str | None, str | None]:
@@ -1003,7 +1049,7 @@ def ensure_running() -> None:
     """
     if _things3_is_running():
         return
-    subprocess.run([OPEN, "-g", "-a", "Things3"], check=False)
+    _spawn([OPEN, "-g", "-a", "Things3"], "lancement de Things")
     # La lambda n'est pas un ornement : passer `_things3_is_running` par son NOM
     # en ferait une fonction de module employée comme valeur, forme que le
     # balayage de `tests/test_fast_path_partition.py` ne sait pas résoudre. Le
@@ -1832,11 +1878,15 @@ def cmd_create_heading(a) -> int:
         return 0
 
     ensure_running()
-    # `project_uuid` est d'origine non contrôlée et l'argv de ce fils est
-    # émis sur NOTRE terminal (stdio hérité). Même neutralisation que
-    # `url_open`, qui encode déjà son payload.
-    subprocess.run([OPEN, "things:///show?id=" + urllib.parse.quote(project_uuid)],
-                   check=False)
+    # `project_uuid` est d'origine non contrôlée, et il repart DEUX fois
+    # bornée : `quote` borne les octets qui partent, `_spawn` borne le canal
+    # par lequel ils reviennent. Le commentaire qui tenait cette place
+    # invoquait « même neutralisation que `url_open` » — vrai jusqu'au
+    # 2026-08-27, où `url_open` a acquis une capture que ce site n'avait pas.
+    # La parité est rétablie en la rendant STRUCTURELLE : les deux passent par
+    # le même helper, plus par deux copies qui divergent.
+    _spawn([OPEN, "things:///show?id=" + urllib.parse.quote(project_uuid)],
+           "affichage du projet")
 
     seen = {"probe": None}
 

@@ -21,6 +21,24 @@ from pathlib import Path
 import pytest
 
 
+class _InertResult:
+    """Ce que rend un lancement de fils NEUTRALISÉ.
+
+    Les stubs de ce fichier rendaient `None`. Ils décrivaient un
+    `subprocess.run` dont personne ne lisait le retour — ce qui a cessé
+    d'être vrai le 2026-08-27, `_spawn` lisant le code retour pour dire un
+    échec sans citer l'argv. Un stub qui ne peut pas porter ce que le code
+    lit n'est pas un stub, c'est un trou.
+    """
+    returncode = 0
+    stdout = ""
+    stderr = ""
+
+
+def _inert_run(*a, **kw):
+    return _InertResult()
+
+
 SCRIPT_SOURCE = Path(__file__).resolve().parent.parent / "bin" / "thingskit"
 
 
@@ -111,7 +129,7 @@ def rigged(thingskit, monkeypatch, tmp_path):
     monkeypatch.setattr(thingskit, "ensure_running", lambda: None)
     monkeypatch.setattr(
         thingskit.subprocess, "run",
-        lambda args, **kw: calls["open"].append(args),
+        lambda args, **kw: (calls["open"].append(args), _InertResult())[1],
     )
     monkeypatch.setattr(thingskit, "time",
                          type("T", (), {"sleep": staticmethod(lambda s: None)}))
@@ -183,7 +201,8 @@ def test_heading_existing_in_other_project_is_created_in_target(
     monkeypatch.setattr(thingskit, "ensure_running", lambda: None)
     opened = []
     monkeypatch.setattr(thingskit.subprocess, "run",
-                         lambda args, **kw: opened.append(args))
+                         lambda args, **kw: (opened.append(args),
+                                            _InertResult())[1])
     monkeypatch.setattr(thingskit, "time",
                          type("T", (), {"sleep": staticmethod(lambda s: None)}))
 
@@ -216,7 +235,7 @@ def test_ui_succeeds_but_heading_not_observed_fails(thingskit, monkeypatch, tmp_
     db_file = _make_db(tmp_path, [{"uuid": "P1", "title": "Projet A", "type": 1}])
     monkeypatch.setattr(thingskit, "db_path", lambda: db_file)
     monkeypatch.setattr(thingskit, "ensure_running", lambda: None)
-    monkeypatch.setattr(thingskit.subprocess, "run", lambda *a, **kw: None)
+    monkeypatch.setattr(thingskit.subprocess, "run", _inert_run)
     monkeypatch.setattr(thingskit, "time",
                          type("T", (), {"sleep": staticmethod(lambda s: None)}))
     # osa "réussit" (rc=0, "OK") mais ne modifie rien en base : commande envoyée
@@ -231,7 +250,7 @@ def test_nominal_path_creates_and_verifies(thingskit, monkeypatch, tmp_path):
     db_file = _make_db(tmp_path, [{"uuid": "P1", "title": "Projet A", "type": 1}])
     monkeypatch.setattr(thingskit, "db_path", lambda: db_file)
     monkeypatch.setattr(thingskit, "ensure_running", lambda: None)
-    monkeypatch.setattr(thingskit.subprocess, "run", lambda *a, **kw: None)
+    monkeypatch.setattr(thingskit.subprocess, "run", _inert_run)
     monkeypatch.setattr(thingskit, "time",
                          type("T", (), {"sleep": staticmethod(lambda s: None)}))
 
@@ -255,7 +274,7 @@ def test_ui_reports_accessibility_denied_fails_explicitly(thingskit, monkeypatch
     db_file = _make_db(tmp_path, [{"uuid": "P1", "title": "Projet A", "type": 1}])
     monkeypatch.setattr(thingskit, "db_path", lambda: db_file)
     monkeypatch.setattr(thingskit, "ensure_running", lambda: None)
-    monkeypatch.setattr(thingskit.subprocess, "run", lambda *a, **kw: None)
+    monkeypatch.setattr(thingskit.subprocess, "run", _inert_run)
     monkeypatch.setattr(thingskit, "time",
                          type("T", (), {"sleep": staticmethod(lambda s: None)}))
     monkeypatch.setattr(
@@ -329,7 +348,7 @@ def test_the_displayed_project_is_refused_before_any_keystroke(
     db_file = _make_db(tmp_path, [{"uuid": "P1", "title": "Projet A", "type": 1}])
     monkeypatch.setattr(thingskit, "db_path", lambda: db_file)
     monkeypatch.setattr(thingskit, "ensure_running", lambda: None)
-    monkeypatch.setattr(thingskit.subprocess, "run", lambda *a, **kw: None)
+    monkeypatch.setattr(thingskit.subprocess, "run", _inert_run)
     monkeypatch.setattr(thingskit, "time",
                         type("T", (), {"sleep": staticmethod(lambda s: None)}))
     sent = []
@@ -652,7 +671,7 @@ def test_ui_reports_not_frontmost_fails_explicitly(thingskit, monkeypatch, tmp_p
     db_file = _make_db(tmp_path, [{"uuid": "P1", "title": "Projet A", "type": 1}])
     monkeypatch.setattr(thingskit, "db_path", lambda: db_file)
     monkeypatch.setattr(thingskit, "ensure_running", lambda: None)
-    monkeypatch.setattr(thingskit.subprocess, "run", lambda *a, **kw: None)
+    monkeypatch.setattr(thingskit.subprocess, "run", _inert_run)
     monkeypatch.setattr(thingskit, "time",
                         type("T", (), {"sleep": staticmethod(lambda s: None)}))
     monkeypatch.setattr(

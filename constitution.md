@@ -700,6 +700,30 @@ redevient obligatoire.
       .venv/bin/python -m pytest tests/test_annotations_resolve.py --collect-only -q | tail -1 -> 37
       .venv/bin/python -m pytest -q -p no:cacheprovider -> 1119 passed, 1 skipped
 
+  Baseline relevée à **1120** le 2026-08-27 avant le second lot de review
+  d'US-010, **1135** après. L'écart de 15 se décompose, et chaque terme est
+  mesuré : +7 dans `tests/test_url_scheme_token.py` (12 -> 19 : le compte des
+  lancements de fils NUS, les trois épreuves du helper `_spawn`, et les trois
+  instances du libellé borné) ; +8 dans `tests/test_untrusted_rendering.py`
+  (81 -> 89 : quatre formes d'argv composé de plus, chacune parcourue par les
+  DEUX contrôles paramétrés — celui qui exige le refus et sa contre-épreuve
+  qui exige que le balayage seul ne l'ait pas déjà vue). Aucun fichier de test
+  neuf, donc le contrôle paramétré de `test_annotations_resolve.py` ne bouge
+  pas (37). Les commandes :
+
+      .venv/bin/python -m pytest --collect-only -q | tail -1 -> 1135 tests collected
+      .venv/bin/python -m pytest tests/test_url_scheme_token.py --collect-only -q | tail -1 -> 19
+      .venv/bin/python -m pytest tests/test_untrusted_rendering.py --collect-only -q | tail -1 -> 89
+      .venv/bin/python -m pytest tests/test_annotations_resolve.py --collect-only -q | tail -1 -> 37
+      .venv/bin/python -m pytest -q -p no:cacheprovider -> 1134 passed, 1 skipped
+
+  **7 mutants, 7 rouges, 0 survivant** sur la garde élargie et sur `_spawn`.
+  Le seul qui a d'abord survécu — `_rendered` retiré du libellé de `_spawn` —
+  était équivalent SUR LE DOMAINE DU JOUR : les trois appelants passent une
+  chaîne littérale. Il a été TUÉ plutôt que déclaré équivalent, parce que le
+  déclarer aurait fait dépendre une propriété de sortie de l'inventaire des
+  appelants — la forme d'affirmation exacte que ce lot corrige.
+
   **Ce lot corrige une affirmation, pas seulement un défaut.** `url_open`
   déclarait qu'« aucune branche, de succès comme d'échec, ne cite l'URL
   construite ici » — vrai des branches Python, FAUX de l'effet observable :
@@ -1186,8 +1210,46 @@ irréversible pour un gestionnaire de tâches personnel utilisé au quotidien.
     relevaient de ces formes et n'étaient bénins que par accident ; ils ont
     été corrigés le 2026-08-26 (deux `{exc}` d'un `except … as`, et un
     `subprocess` dont l'argv portait un uuid non encodé, désormais passé par
-    `urllib.parse.quote` comme dans `url_open`). Angle mort de cette garde-là :
-    un `subprocess` dont l'argv est passé par un NOM, qu'elle n'inspecte pas.
+    `urllib.parse.quote` comme dans `url_open`).
+
+    **La liste d'angles morts qui tenait cette place était elle-même plus
+    étroite que la mesure, et c'est le défaut le plus coûteux de cette
+    garde.** Elle ne déclarait qu'un angle mort — « un `subprocess` dont
+    l'argv est passé par un NOM ». Mesuré le 2026-08-27 en substituant les
+    formes, le détecteur F15 ne déclenchait en réalité que sur un
+    `ast.JoinedStr` : **quatre formes sur cinq lui échappaient** —
+    concaténation (`"a" + x`), `%`-format, `.format()`, et l'argv par un nom.
+    La forme qui vivait RÉELLEMENT dans le script était la **concaténation**,
+    ligne 1838 (`cmd_create_heading`), et le balayage rendait `0 finding`
+    dessus alors qu'elle relève littéralement du libellé du détecteur.
+
+    Corrigé le 2026-08-27 en retournant la borne : F15 ne reconnaît plus des
+    formes de composition, il exige que chaque élément d'argv soit INERTE —
+    un littéral, ou une constante de module (`_is_inert_argv_element`). Une
+    garde qui énumère les formes ne couvre que l'exemple qui l'a fait naître ;
+    une garde qui borne ce qui est sûr couvre celles qu'on n'a pas écrites.
+    L'argv passé par un nom cesse d'être un angle mort par la même occasion :
+    ce qu'un nom porte est invisible au point d'appel, donc il vaut composé.
+    Rejeu, contre le blob d'avant la correction du site :
+
+        git show 777c4fc:bin/thingskit > /tmp/pre
+        # puis scope_and_sink_findings(open("/tmp/pre").read())
+        # -> [(1838, 'subprocess à stdio hérité, argv composé')]
+
+    **Ce que F15 ne tient toujours pas, nommément** : un lancement par
+    INDIRECTION, c'est-à-dire un appelable reçu en paramètre (`runner` de
+    `code_identity_refusal`, l. 435) — il n'est pas syntaxiquement
+    `subprocess.*` au point d'appel, aucune des deux gardes ne le voit. Il est
+    bénin aujourd'hui (argv entièrement littéral, sortie capturée), et il est
+    écrit ici plutôt que tu.
+
+    **La propriété de fond ne se tient plus par une phrase mais par un
+    compte.** `test_every_child_spawn_of_the_script_captures_its_output`
+    énumère les lancements de fils du script et exige ZÉRO site à stdio
+    hérité. C'est ce compte qui rend vraie l'affirmation « la capture porte
+    sur la classe », écrite dans `url_open` le 2026-08-27 **avant** de l'être
+    : deux sites sur cinq ne capturaient pas au moment où elle était écrite.
+    Tous passent désormais par `_spawn`.
   - L'analyse est insensible au flot et fusionne les portées imbriquées,
     toujours dans le sens de la sur-approximation.
   - Le code de MODULE n'est analysé par rien (voir « portée réelle »).
