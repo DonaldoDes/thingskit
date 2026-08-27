@@ -435,6 +435,23 @@ def test_the_refusal_message_does_not_carry_the_refuted_motive(
     assert "n'a pas été sollicitée" in err
 
 
+@pytest.mark.parametrize("title", [
+    'Titre "cité"', "Chemin C:\\dossier", "Éléments accentués — tiret cadratin",
+    "emoji 🙂", "espaces    multiples", "espace insécable\u00a0!",
+])
+def test_typable_titles_are_accepted(thingskit, rigged, title):
+    """Contre-épreuve du sur-refus. L'espace insécable (U+00A0, catégorie Zs)
+    est ajouté à l'alignement de classe : c'était le seul caractère que
+    l'ancienne borne `str.isprintable()` citait sur la base réelle — 2 titres
+    sur 902, 100 % de faux positifs (§ Zones sensibles 1). La classe alignée
+    ne le refuse pas, et ce test l'épingle dans ce sens-là.
+    """
+    calls, set_rows = rigged
+    set_rows([{"uuid": "P1", "title": "Projet A", "type": 1}])
+    thingskit.cmd_create_heading(_ns(title=title, project="Projet A"))
+    assert len(calls["osa"]) == 1  # le garde ne doit pas sur-refuser
+
+
 def test_refused_title_chars_lists_offenders(thingskit):
     assert thingskit._refused_title_chars("propre") == []
     assert thingskit._refused_title_chars("a\nb\tc") == ["U+000A", "U+0009"]

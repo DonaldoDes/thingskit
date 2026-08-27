@@ -717,17 +717,32 @@ redevient obligatoire.
       .venv/bin/python -m pytest tests/test_create_heading.py --collect-only -q -p no:cacheprovider | tail -1 -> 66
       .venv/bin/python -m pytest -q -p no:cacheprovider -> 1176 passed, 1 skipped
 
-  Baseline relevée à **1177** avant le lot de review du même jour, **1188**
-  après. L'écart de 11 tient entièrement dans `tests/test_create_heading.py`
-  (66 -> 77 collectés) : quatre tests textuels remplacés par des tests
+  Baseline relevée à **1177** avant le lot de review du même jour, **1194**
+  après. L'écart de 17 tient entièrement dans `tests/test_create_heading.py`
+  (66 -> 83 collectés) : quatre tests textuels remplacés par des tests
   d'EXÉCUTION du presse-papiers (trois états, deux refus, remise qui rend, qui
   échoue sans remonter et sans se taire, marqueur d'origine préservé, succès
   non converti en échec, contre-épreuve nominale), la séparation refus/écriture
-  autour du clic, l'alignement de classe et le message de refus. Les commandes :
+  autour du clic, l'alignement de classe et le message de refus.
 
-      .venv/bin/python -m pytest --collect-only -q -p no:cacheprovider | tail -1 -> 1188 tests collected
-      .venv/bin/python -m pytest tests/test_create_heading.py --collect-only -q -p no:cacheprovider | tail -1 -> 77
-      .venv/bin/python -m pytest -q -p no:cacheprovider -> 1187 passed, 1 skipped
+  Ce compte a d'abord été inscrit **1188**, et il était juste d'un arbre où un
+  test PRÉEXISTANT manquait : `test_typable_titles_are_accepted`, la
+  contre-épreuve de sur-refus, emportée par un remplacement de bloc. Le
+  balayage qui l'a trouvée compare les noms de fonctions `test_*` de `master`
+  à ceux de l'arbre — trois disparitions, dont deux renommages voulus. Il se
+  rejoue, et c'est lui qu'il faut lancer après toute réécriture de bloc :
+
+      git show master:tests/<fichier> > /tmp/av.py
+      python3 -c "import ast,pathlib
+      n=lambda p:{x.name for x in ast.walk(ast.parse(pathlib.Path(p).read_text()))
+                  if isinstance(x,ast.FunctionDef) and x.name.startswith('test_')}
+      print(sorted(n('/tmp/av.py')-n('tests/<fichier>')))"
+
+  Les commandes du compte :
+
+      .venv/bin/python -m pytest --collect-only -q -p no:cacheprovider | tail -1 -> 1194 tests collected
+      .venv/bin/python -m pytest tests/test_create_heading.py --collect-only -q -p no:cacheprovider | tail -1 -> 83
+      .venv/bin/python -m pytest -q -p no:cacheprovider -> 1193 passed, 1 skipped
 
   Le compte d'AVANT est mesuré sur l'arbre `master` lui-même, pas rappelé de
   mémoire :
