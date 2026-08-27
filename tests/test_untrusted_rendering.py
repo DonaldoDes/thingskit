@@ -170,6 +170,8 @@ import sys
 import unicodedata
 from pathlib import Path
 
+from conftest import (is_child_spawn, spawn_argv, spawn_bindings,
+                      spawn_bounds_both_streams)
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -1237,6 +1239,7 @@ def scope_and_sink_findings(source: str) -> list[tuple[int, str]]:
     """Formes que le balayage ne voit pas — par la PORTÉE ou par le PUITS."""
     tree = ast.parse(source)
     module_names = _module_level_names(tree)
+    spawn_roots = spawn_bindings(tree)
     found: list[tuple[int, str]] = []
     top_funcs = [n for n in tree.body
                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
@@ -1316,12 +1319,17 @@ def scope_and_sink_findings(source: str) -> list[tuple[int, str]]:
                     if any(isinstance(n, ast.NamedExpr) for n in ast.walk(a)):
                         found.append((node.lineno, "walrus en argument de puits"))
             # F15 — stdio HÉRITÉ : ce que le fils écrit sort sur notre terminal.
-            if (isinstance(f, ast.Attribute)
-                    and f.attr in ("run", "call", "check_call", "Popen")
-                    and isinstance(f.value, ast.Name) and f.value.id == "subprocess"):
-                kw = {k.arg for k in node.keywords}
-                herite = not ({"capture_output", "stdout", "stderr"} & kw)
-                argv = node.args[0] if node.args else None
+            #
+            # Le RECENSEMENT (quels appels lancent un fils) et le PRÉDICAT DE
+            # CAPTURE (lesquels bornent leurs deux flux) sont partagés avec la
+            # garde de classe de `tests/test_url_scheme_token.py`, site de
+            # définition unique dans `conftest.py`. Ils y vivaient en deux
+            # copies jusqu'au 2026-08-27, et les deux portaient le même défaut :
+            # une DISJONCTION qui déclarait sûr un site bornant `stdout` seul,
+            # alors que `stderr` — le canal de la fuite — restait hérité.
+            if is_child_spawn(node, spawn_roots):
+                herite = not spawn_bounds_both_streams(node)
+                argv = spawn_argv(node)
                 if herite and isinstance(argv, (ast.List, ast.Tuple)) and any(
                         not _is_inert_argv_element(e, module_names)
                         for e in argv.elts):
@@ -1472,6 +1480,33 @@ import subprocess
 def cmd_x(a):
     argv = ["/usr/bin/open", "things:///show?id=" + a.title]
     subprocess.run(argv, check=False)
+''',
+    # --- relevé du 2026-08-27 : l'argv passé par MOT-CLÉ, et les formes que
+    # le recensement lui-même ne voyait pas. F15 ne lisait que `node.args[0]`,
+    # donc `args=` lui échappait ; et le recensement énumérait quatre noms
+    # d'appel, donc `check_output`, l'import direct, l'alias de module et
+    # l'indirection lui échappaient — avec leur argv composé au passage.
+    "subprocess_a_stdio_herite_argv_en_mot_cle": '''
+import subprocess
+def cmd_x(a):
+    subprocess.run(args=["/usr/bin/open", "things:///show?id=" + a.title],
+                   check=False)
+''',
+    "check_output_a_stderr_herite_argv_compose": '''
+import subprocess
+def cmd_x(a):
+    subprocess.check_output(["/usr/bin/open", "things:///show?id=" + a.title])
+''',
+    "stdout_borne_seul_laisse_stderr_herite": '''
+import subprocess
+def cmd_x(a):
+    subprocess.run(["/usr/bin/open", "things:///show?id=" + a.title],
+                   check=False, stdout=subprocess.DEVNULL)
+''',
+    "lancement_par_un_alias_de_module": '''
+import subprocess as sp
+def cmd_x(a):
+    sp.run(["/usr/bin/open", "things:///show?id=" + a.title], check=False)
 ''',
 }
 

@@ -700,6 +700,71 @@ redevient obligatoire.
       .venv/bin/python -m pytest tests/test_annotations_resolve.py --collect-only -q | tail -1 -> 37
       .venv/bin/python -m pytest -q -p no:cacheprovider -> 1119 passed, 1 skipped
 
+  **Chronique des affirmations réfutées d'US-010 — elle vit ICI, plus dans le
+  script.** Les six blocs de `bin/thingskit` qui la racontaient sont ramenés à
+  leur invariant plus un renvoi vers ce paragraphe (2026-08-27, troisième tour
+  de review). Motif : pour savoir ce que fait une fonction, il fallait
+  traverser l'historique de ce qu'on avait cru à tort. **Aucun fait n'est
+  perdu — les deux qui ne vivaient QUE dans le script sont reportés ici avant
+  d'y être retirés**, et les constats MESURÉS (35 lignes, « mesuré le … sur la
+  vraie base ») restent dans le script : le § « Ce que le projet fait » les y
+  exige, les déplacer serait la suppression sèche qu'on veut éviter.
+
+  1. **`url_open` : « aucune branche, de succès comme d'échec, ne cite l'URL
+     construite ici ».** Vrai des branches Python, faux de l'effet observable —
+     `subprocess.run(argv, check=False)` sans capture laisse le fils hériter
+     des descripteurs 1 et 2, et `open` imprime l'URL entière, jeton compris.
+  2. **En-tête de `move-task` : « le jeton ne sort jamais sur stdout ni
+     stderr ».** Même défaut, même endroit, écrit deux fois.
+  3. **`url_open` : « la capture porte sur la CLASSE ».** Écrite au moment où
+     deux des cinq lancements du script ne capturaient pas.
+  4. **`cmd_create_heading` : « même neutralisation que `url_open` ».** Vraie
+     AVANT le correctif de la fuite, **rompue par lui** — `url_open` a acquis
+     une capture que ce site n'avait pas, et le commentaire a continué
+     d'affirmer une parité qui n'existait plus. Ce fait ne vivait que dans le
+     script.
+  5. **`_spawn` : « `_rendered` sur le code retour est cérémoniel ».** Réfuté
+     par mutation — le retirer fait rougir
+     `test_no_untrusted_value_reaches_the_output_unconverted` : le balayage
+     juge le TRAJET d'une valeur, pas son type, et `r` est lié par
+     `subprocess.run`, donc racine. Le mot invitait le prochain lecteur à
+     supprimer une garde en croyant nettoyer. Ce fait ne vivait que dans le
+     script.
+  6. **La garde de classe elle-même n'était pas sous test sur sa branche
+     discriminante.** `nus == []` était satisfait À VIDE sur le code sain :
+     un double mutant — lancement nu remis dans `ensure_running` **plus**
+     prédicat du recenseur forcé — laissait `1134 passed`. Deux causes
+     distinctes, et la seconde est la plus instructive : le recensement
+     ÉNUMÉRAIT des noms d'appel (`subprocess.{run, call, check_call, Popen}`)
+     alors qu'`_is_inert_argv_element`, écrit dans le MÊME commit, appliquait
+     la doctrine inverse — borner ce qui est sûr. **La règle et sa violation
+     dans le même diff.** La première : le prédicat de capture était une
+     DISJONCTION, si bien que `stdout=` seul déclarait sûr un site dont
+     `stderr` — le canal de la fuite — restait hérité.
+
+  **Ce que le recensement des lancements ne tient PAS**, nommément, après
+  l'élargissement du 2026-08-27 (`conftest.child_spawn_sites`, site de
+  définition unique partagé par les deux gardes) :
+
+  - la surface de lancement d'`os` est **énumérée** (`OS_SPAWN_MEMBERS`), là où
+    celle de `subprocess` est bornée sur le module. L'écart est assumé : c'est
+    une surface de bibliothèque standard, close et hors de notre code, alors
+    que les formes d'appel sont les nôtres ;
+  - un lancement par un appelable reçu d'**ailleurs que d'une liaison visible
+    dans le fichier** (attribut d'objet, entrée de dictionnaire, `getattr`)
+    n'est pas suivi. L'indirection par un NOM re-lié, elle, l'est désormais —
+    `runner = runner or subprocess.run` dans `code_identity_refusal` est
+    recensé, ce qui porte le compte du script de 3 à **4** ;
+  - `capture_output=<valeur calculée>` est traité comme NON bornant, faute de
+    pouvoir décider au point d'appel. Sur-approximation assumée, dans le sens
+    qui compte un site de trop plutôt qu'un de moins.
+
+  La garde couvre les **deux** artefacts exécutables du dépôt — `bin/thingskit`
+  (4 lancements) et `build/bundle.py` (8), tous bornés. `build/bundle.py` y a
+  été ajouté après mesure, et pas par symétrie : il manipule la sortie de
+  `codesign`, qui porte l'identité de signature — la valeur personnelle que
+  `test_bundle.py` interdit déjà de publier.
+
   Baseline relevée à **1120** le 2026-08-27 avant le second lot de review
   d'US-010, **1135** après. L'écart de 15 se décompose, et chaque terme est
   mesuré : +7 dans `tests/test_url_scheme_token.py` (12 -> 19 : le compte des
@@ -716,6 +781,21 @@ redevient obligatoire.
       .venv/bin/python -m pytest tests/test_untrusted_rendering.py --collect-only -q | tail -1 -> 89
       .venv/bin/python -m pytest tests/test_annotations_resolve.py --collect-only -q | tail -1 -> 37
       .venv/bin/python -m pytest -q -p no:cacheprovider -> 1134 passed, 1 skipped
+
+  Baseline relevée à **1135** le 2026-08-27 avant le troisième lot de review
+  d'US-010, **1161** après. L'écart de 26 se décompose, et chaque terme est
+  mesuré : +18 dans `tests/test_url_scheme_token.py` (19 -> 37 : le corpus de
+  douze formes NUES et de quatre formes bornées passé au recenseur, la
+  contre-épreuve des fantômes, et la garde de classe désormais paramétrée sur
+  les deux artefacts) ; +8 dans `tests/test_untrusted_rendering.py`
+  (89 -> 97 : quatre formes d'argv de plus — mot-clé `args=`, `check_output`,
+  `stdout` seul, alias de module — chacune parcourue par les DEUX contrôles
+  paramétrés. Les commandes :
+
+      .venv/bin/python -m pytest --collect-only -q | tail -1 -> 1161 tests collected
+      .venv/bin/python -m pytest tests/test_url_scheme_token.py --collect-only -q | tail -1 -> 37
+      .venv/bin/python -m pytest tests/test_untrusted_rendering.py --collect-only -q | tail -1 -> 97
+      .venv/bin/python -m pytest -q -p no:cacheprovider -> 1160 passed, 1 skipped
 
   **7 mutants, 7 rouges, 0 survivant** sur la garde élargie et sur `_spawn`.
   Le seul qui a d'abord survécu — `_rendered` retiré du libellé de `_spawn` —

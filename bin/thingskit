@@ -676,15 +676,11 @@ def _spawn(argv: list[str], what: str = "lancement") -> subprocess.CompletedProc
     """Lance un processus fils SANS lui prêter nos descripteurs, et dit son
     échec sans citer son argv.
 
-    **Ce helper existe parce que « la capture porte sur la classe » a été
-    écrit avant d'être vrai.** Le correctif du 2026-08-27 avait fermé la fuite
-    de `url_open` seul : sur les cinq sites de lancement du script, deux
-    laissaient encore leur fils écrire sur NOS descripteurs — `open -g -a
-    Things3` (argv littéral, bénin) et `open things:///show?id=<uuid>` dans
-    `cmd_create_heading`, dont l'argv porte une valeur d'origine non
-    contrôlée. Ce dernier portait même un commentaire invoquant « même
-    neutralisation que `url_open` » : une parité vraie AVANT le correctif, et
-    rompue PAR lui.
+    **Point de passage UNIQUE de tout lancement dont la sortie ne nous
+    appartient pas.** C'est ce qui rend la propriété tenable par un compte
+    plutôt que par une phrase : `tests/test_url_scheme_token.py` recense les
+    lancements des deux artefacts exécutables et exige zéro site nu. Pourquoi
+    un helper plutôt que la même correction posée à chaque site : constitution.md § Tests, « Chronique des affirmations réfutées d'US-010 ».
 
     Encoder n'est pas capturer, et les deux ne se remplacent pas :
     `urllib.parse.quote` borne les OCTETS qui partent, la capture borne le
@@ -707,13 +703,10 @@ def _spawn(argv: list[str], what: str = "lancement") -> subprocess.CompletedProc
     """
     r = subprocess.run(argv, check=False, capture_output=True, text=True)
     if r.returncode != 0:
-        # `_rendered` sur le code retour n'est PAS cérémoniel — ce mot avait
-        # été écrit ici le 2026-08-27, et la mutation le réfute : le retirer
-        # fait rougir `test_no_untrusted_value_reaches_the_output_unconverted`.
-        # Le balayage juge le TRAJET d'une valeur, pas son type, et `r` est
-        # lié par `subprocess.run`, donc racine. Le qualifier de cérémonie
-        # invitait le prochain lecteur à le supprimer — c'est-à-dire à
-        # sous-estimer une garde en croyant nettoyer.
+        # `_rendered` sur le code retour est EXIGÉ, pas décoratif : le
+        # balayage juge le trajet d'une valeur, pas son type, et `r` est lié
+        # par `subprocess.run`, donc racine. Le retirer fait rougir
+        # `test_no_untrusted_value_reaches_the_output_unconverted`.
         print(f"{_rendered(what)} : échec (code {_rendered(r.returncode)}) — "
               "sortie du processus RETENUE, elle citerait l'argv et donc ce "
               "qu'il porte. L'effet reste tranché par la vérification "
@@ -735,21 +728,13 @@ def url_open(payload: list, background: bool = True,
     (mesuré le 2026-08-27 : une `update` sans jeton est un NO-OP SILENCIEUX et
     `open` rend malgré tout 0). C'est un SECRET.
 
-    **Cette fonction a porté une affirmation fausse, et il faut la lire pour
-    savoir ce qu'elle garde vraiment.** Elle disait « aucune branche, de succès
-    comme d'échec, ne cite l'URL construite ici » — vrai des branches Python,
-    faux de l'effet observable. `subprocess.run(argv, check=False)` sans
-    capture laisse le fils hériter des descripteurs 1 et 2, et `open` imprime
-    l'URL entière, jeton compris, quand LaunchServices ne résout pas le
-    schéma. Une affirmation d'établissement qui survit à sa réfutation est
-    pire que son absence.
-
-    Ce qui est vrai APRÈS correction, et mesuré : la sortie du processus fils
-    est capturée sur TOUS les chemins, avec ou sans jeton ; sur échec, seul le
-    CODE RETOUR est cité, jamais l'URL ni la sortie brute. Gardé par
+    L'URL ne sort par AUCUNE sortie, y compris par le processus fils : elle
+    part par `_spawn`, qui capture. Sur échec, seul le code retour est cité —
+    jamais l'URL ni la sortie brute. Gardé par
     `tests/test_url_scheme_token.py`, qui exerce le vrai `subprocess.run`
-    contre un `open` jetable et lit les DESCRIPTEURS — un test qui remplace la
-    frontière qu'il prétend garder ne garde rien.
+    contre un `open` jetable et lit les DESCRIPTEURS : un test qui remplace la
+    frontière qu'il prétend garder ne garde rien. Ce que cette fonction a
+    affirmé à tort avant de le tenir : constitution.md § Tests, « Chronique des affirmations réfutées d'US-010 ».
     """
     params = []
     if auth_token:
@@ -758,26 +743,12 @@ def url_open(payload: list, background: bool = True,
         json.dumps(payload, ensure_ascii=False)))
     url = "things:///json?" + "&".join(params)
     argv = [OPEN] + (["-g"] if background else []) + [url]
-    # La sortie du fils ne nous revient pas : `_spawn` la capture. Sans
-    # capture il hérite des descripteurs 1 et 2 du parent, et `open` imprime
-    # l'URL COMPLÈTE — jeton compris — sur son stderr quand LaunchServices ne
-    # résout pas le schéma (mesuré le 2026-08-27 avec un `open` substitué, et
-    # corroboré contre le vrai `/usr/bin/open`). La branche est atteignable en
-    # usage nominal : `ensure_running()` ne s'arrête pas quand l'application
-    # ne démarre pas.
-    #
-    # **« La capture porte sur la CLASSE » a d'abord été écrit ICI, et c'était
-    # faux.** Seul ce site capturait ; deux des cinq lancements du script n'y
-    # passaient pas, dont celui de `cmd_create_heading`, qui porte un uuid
-    # d'origine non contrôlée — et dont le commentaire invoquait « même
-    # neutralisation que `url_open` », parité vraie AVANT ce correctif et
-    # rompue par lui. La phrase n'est plus une affirmation posée à côté du
-    # code : elle est vraie parce que les lancements passent tous par le même
-    # helper, et parce que
-    # `test_every_child_spawn_of_the_script_captures_its_output` compte les
-    # sites NUS et exige zéro — sur ceux d'aujourd'hui comme sur ceux de
-    # demain. Une propriété de classe se tient par un compte, jamais par une
-    # phrase.
+    # Sans capture, le fils hérite des descripteurs 1 et 2 du parent et `open`
+    # imprime l'URL COMPLÈTE — jeton compris — sur son stderr quand
+    # LaunchServices ne résout pas le schéma (mesuré le 2026-08-27 avec un
+    # `open` substitué, corroboré contre le vrai `/usr/bin/open`). La branche
+    # est atteignable en usage nominal : `ensure_running()` ne s'arrête pas
+    # quand l'application ne démarre pas. D'où `_spawn`, seul point de passage.
     _spawn(argv, "schéma d'URL")
 
 
@@ -1879,12 +1850,10 @@ def cmd_create_heading(a) -> int:
 
     ensure_running()
     # `project_uuid` est d'origine non contrôlée, et il repart DEUX fois
-    # bornée : `quote` borne les octets qui partent, `_spawn` borne le canal
-    # par lequel ils reviennent. Le commentaire qui tenait cette place
-    # invoquait « même neutralisation que `url_open` » — vrai jusqu'au
-    # 2026-08-27, où `url_open` a acquis une capture que ce site n'avait pas.
-    # La parité est rétablie en la rendant STRUCTURELLE : les deux passent par
-    # le même helper, plus par deux copies qui divergent.
+    # borné : `quote` borne les octets qui partent, `_spawn` borne le canal
+    # par lequel ils reviennent. La parité avec `url_open` est STRUCTURELLE —
+    # même helper, pas deux copies qui affirment leur ressemblance. Pourquoi
+    # cette précision : constitution.md § Tests, « Chronique des affirmations réfutées d'US-010 ».
     _spawn([OPEN, "things:///show?id=" + urllib.parse.quote(project_uuid)],
            "affichage du projet")
 
@@ -2875,15 +2844,12 @@ def cmd_reschedule_task(a) -> int:
 #     reste. C'est ce qui distingue ce cas de `reschedule-task`, où la même
 #     surface avait été écartée au motif qu'elle « impose à l'utilisateur
 #     d'aller chercher et de stocker un secret » — elle ne l'impose pas.
-#     Le jeton est un secret, et l'affirmation qui tenait cette place —
-#     « il ne sort jamais sur stdout ni stderr » — était FAUSSE : elle
-#     décrivait les branches Python, pas l'effet observable. Le processus
-#     fils lancé par `url_open` héritait des descripteurs 1 et 2 et `open`
-#     imprimait l'URL entière, jeton compris, dès que LaunchServices ne
-#     résolvait pas le schéma. Corrigé le 2026-08-27 : la sortie du fils est
-#     capturée sur tous les chemins et seul le code retour est cité. Ce qui
-#     est vrai désormais est vrai parce que `tests/test_url_scheme_token.py`
-#     l'exerce contre un vrai processus, pas parce que c'est écrit ici.
+#     Le jeton est un SECRET : il ne quitte le processus que dans l'argv
+#     remis à `_spawn`, qui capture la sortie du fils — la propriété est
+#     tenue LÀ, et éprouvée contre un vrai processus par
+#     `tests/test_url_scheme_token.py`, jamais par ce commentaire. Résidu
+#     nommé : l'argv reste lisible par `ps` (SECURITY.md). Ce que cette
+#     place a affirmé à tort : constitution.md § Tests, « Chronique des affirmations réfutées d'US-010 ».
 #   - SANS jeton, `update` est un NO-OP SILENCIEUX et `open` rend malgré tout
 #     0 — mesuré par CONTRÔLE sur un attribut notoirement supporté (`title`),
 #     pour établir que la sonde atteignait bien la surface qu'elle croyait

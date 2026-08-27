@@ -239,36 +239,29 @@ def test_the_refusal_message_never_carries_a_token(thingskit, monkeypatch,
 
 import ast
 
-from conftest import SCRIPT_PATH
+from conftest import SCRIPT_PATH, child_spawn_sites
 
 
-def _spawn_sites(source: str):
-    """(ligne, capture ?) pour chaque lancement de fils du script."""
-    sites = []
-    for node in ast.walk(ast.parse(source)):
-        if not isinstance(node, ast.Call):
-            continue
-        f = node.func
-        if not (isinstance(f, ast.Attribute)
-                and f.attr in ("run", "call", "check_call", "Popen")
-                and isinstance(f.value, ast.Name) and f.value.id == "subprocess"):
-            continue
-        kw = {k.arg for k in node.keywords}
-        sites.append((node.lineno,
-                      bool({"capture_output", "stdout", "stderr"} & kw)))
-    return sites
+#: Les DEUX artefacts exécutables du dépôt. `build/bundle.py` y a été ajouté
+#: le 2026-08-27 après mesure : ses huit lancements bornent déjà leurs deux
+#: flux, et il manipule la sortie de `codesign`, qui porte l'identité de
+#: signature — précisément la valeur personnelle que `test_bundle.py` interdit
+#: de publier. Une garde qui ne couvre que le fichier où le défaut a été
+#: trouvé couvre l'incident, pas la classe.
+GUARDED_EXECUTABLES = (SCRIPT_PATH, SCRIPT_PATH.parent.parent / "build" / "bundle.py")
 
 
-def test_every_child_spawn_of_the_script_captures_its_output():
-    source = SCRIPT_PATH.read_text()
-    sites = _spawn_sites(source)
-    assert sites, "aucun lancement de fils trouvé — le balayage a cessé de voir"
-    nus = [ln for ln, capture in sites if not capture]
+@pytest.mark.parametrize("artefact", GUARDED_EXECUTABLES, ids=lambda p: p.name)
+def test_every_child_spawn_captures_its_output(artefact):
+    sites = child_spawn_sites(artefact.read_text())
+    assert sites, f"aucun lancement de fils trouvé dans {artefact.name} — le " \
+                  "recensement a cessé de voir"
+    nus = [ln for ln, borne in sites if not borne]
     assert nus == [], (
-        f"{len(nus)} lancement(s) de fils sur {len(sites)} laissent leur "
-        f"sortie atteindre NOS descripteurs, lignes {nus} — ce que le fils "
-        "écrit sort sur le terminal de l'utilisateur, sans passer par une "
-        "seule ligne de ce programme.")
+        f"{len(nus)} lancement(s) de fils sur {len(sites)} dans "
+        f"{artefact.name} laissent leur sortie atteindre NOS descripteurs, "
+        f"lignes {nus} — ce que le fils écrit sort sur le terminal de "
+        "l'utilisateur, sans passer par une seule ligne de ce programme.")
 
 
 def test_the_spawn_helper_keeps_the_child_output_off_our_streams(
@@ -317,3 +310,161 @@ def test_the_spawn_label_is_bounded_even_though_every_caller_passes_a_literal(
     err = capfd.readouterr()[1].rstrip("\n")
     assert err, "l'échec doit être dit"
     assert hostile not in err
+
+
+# =======================================================================
+# Le RECENSEMENT lui-même, exercé au lieu d'être attesté
+# =======================================================================
+#
+# `544ceae` a ajouté « aucun site nu » comme garde de classe. Mesuré au tour
+# suivant : sur le code sain, `nus == []` est satisfait À VIDE — rien ne
+# prouvait que le recenseur sache reconnaître un site nu, puisqu'on ne lui en
+# avait jamais montré un. Un double mutant (lancement nu REMIS dans
+# `ensure_running` + prédicat du recenseur forcé) laissait `1134 passed`.
+#
+# Deux défauts distincts, tous deux de la même famille — une garde neuve
+# vérifiée avec les instruments d'avant :
+#
+#   1. le prédicat de capture était une DISJONCTION : `stdout=` seul suffisait
+#      à déclarer un site sûr, alors que `stderr` restait hérité — et `stderr`
+#      est le canal, le seul, par lequel le jeton sortait ;
+#   2. le recensement ÉNUMÉRAIT des noms d'appel (`subprocess.{run,call,
+#      check_call,Popen}`), là où `_is_inert_argv_element`, écrit dans le même
+#      commit, appliquait la doctrine inverse — borner ce qui est SÛR. La
+#      règle et sa violation dans le même diff.
+#
+# Le corpus ci-dessous porte les formes MESURÉES comme échappant au
+# recensement d'alors. Il est construit sur le modèle de `SCOPE_AND_SINK_FORMS`
+# (`tests/test_untrusted_rendering.py`), qui, lui, tue ses mutants.
+
+NAKED_SPAWN_FORMS = {
+    # --- axe 1 : un seul flux borné n'est pas une capture -------------------
+    "stdout_seul_laisse_stderr_herite": '''
+import subprocess
+def cmd_x(a):
+    subprocess.run(["/usr/bin/open", a.title], check=False,
+                   stdout=subprocess.DEVNULL)
+''',
+    "stderr_seul_laisse_stdout_herite": '''
+import subprocess
+def cmd_x(a):
+    subprocess.run(["/usr/bin/open", a.title], check=False,
+                   stderr=subprocess.DEVNULL)
+''',
+    # --- axe 2 : le recensement énumérait des noms -------------------------
+    "check_output_herite_stderr_par_construction": '''
+import subprocess
+def cmd_x(a):
+    subprocess.check_output(["/usr/bin/open", a.title])
+''',
+    "import_from_subprocess": '''
+from subprocess import run
+def cmd_x(a):
+    run(["/usr/bin/open", a.title], check=False)
+''',
+    "module_importe_sous_un_alias": '''
+import subprocess as sp
+def cmd_x(a):
+    sp.run(["/usr/bin/open", a.title], check=False)
+''',
+    "os_system": '''
+import os
+def cmd_x(a):
+    os.system("/usr/bin/open " + a.title)
+''',
+    "argv_en_mot_cle": '''
+import subprocess
+def cmd_x(a):
+    subprocess.run(args=["/usr/bin/open", a.title], check=False)
+''',
+    "lancement_par_indirection": '''
+import subprocess
+def cmd_x(a, runner=None):
+    runner = runner or subprocess.run
+    return runner(["/usr/bin/open", a.title], check=False)
+''',
+    "capture_output_a_faux": '''
+import subprocess
+def cmd_x(a):
+    subprocess.run(["/usr/bin/open", a.title], check=False, capture_output=False)
+''',
+    "capture_output_a_valeur_indecidable": '''
+import subprocess
+def cmd_x(a, quiet=False):
+    subprocess.run(["/usr/bin/open", a.title], check=False, capture_output=quiet)
+''',
+    "kwargs_opaques_sans_capture_declaree": '''
+import subprocess
+def cmd_x(a, **kw):
+    subprocess.run(["/usr/bin/open", a.title], check=False, **kw)
+''',
+    "forme_nue_de_reference": '''
+import subprocess
+def cmd_x(a):
+    subprocess.run(["/usr/bin/open", a.title], check=False)
+''',
+}
+
+BOUNDED_SPAWN_FORMS = {
+    "capture_output": '''
+import subprocess
+def cmd_x(a):
+    subprocess.run(["/usr/bin/open", a.title], check=False, capture_output=True)
+''',
+    "les_deux_flux_nommes": '''
+import subprocess
+def cmd_x(a):
+    subprocess.run(["/usr/bin/open", a.title], check=False,
+                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+''',
+    "capture_output_vrai_malgre_des_kwargs_opaques": '''
+import subprocess
+def _run(cmd, **kw):
+    return subprocess.run(cmd, check=True, capture_output=True, **kw)
+''',
+    "check_output_avec_stderr_borne": '''
+import subprocess
+def cmd_x(a):
+    subprocess.check_output(["/usr/bin/open", a.title],
+                            stderr=subprocess.DEVNULL)
+''',
+}
+
+
+@pytest.mark.parametrize("form", sorted(NAKED_SPAWN_FORMS))
+def test_the_census_counts_each_naked_form_as_naked(form):
+    """C'est LE test qui manquait : le recenseur est mis devant un site nu.
+
+    Sans lui, `nus == []` sur le code sain est satisfait à vide, et forcer le
+    prédicat à `True` ne fait rougir personne."""
+    sites = child_spawn_sites(NAKED_SPAWN_FORMS[form])
+    assert sites, f"forme `{form}` non RECENSÉE — le lancement est invisible"
+    assert [ln for ln, borne in sites if not borne], (
+        f"forme `{form}` recensée mais déclarée BORNÉE — son fils écrit "
+        "encore sur nos descripteurs")
+
+
+@pytest.mark.parametrize("form", sorted(BOUNDED_SPAWN_FORMS))
+def test_the_census_does_not_cry_wolf_on_a_bounded_form(form):
+    """Contre-épreuve du sur-refus : borner les DEUX flux suffit, et un
+    recenseur qui refuserait tout serait aussi inutile qu'un recenseur qui
+    n'accepterait rien."""
+    sites = child_spawn_sites(BOUNDED_SPAWN_FORMS[form])
+    assert sites, f"forme `{form}` non recensée"
+    assert [ln for ln, borne in sites if not borne] == [], (
+        f"forme `{form}` déclarée nue alors qu'elle borne ses deux flux")
+
+
+def test_the_census_ignores_what_does_not_spawn():
+    """Un attribut de `subprocess` qui n'est pas APPELÉ n'est pas un
+    lancement — sinon `subprocess.DEVNULL` et l'annotation de type de `_spawn`
+    peupleraient le recensement de fantômes."""
+    source = '''
+import subprocess
+DEVNULL = subprocess.DEVNULL
+def _spawn(argv) -> subprocess.CompletedProcess:
+    return subprocess.run(argv, check=False, capture_output=True)
+'''
+    sites = child_spawn_sites(source)
+    assert len(sites) == 1, f"fantômes recensés : {sites}"
+    assert sites[0][1] is True
