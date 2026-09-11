@@ -1113,6 +1113,56 @@ redevient obligatoire.
       .venv/bin/python -m pytest tests/test_agenda.py --collect-only -q -p no:cacheprovider | tail -1 -> 24
       .venv/bin/python -m pytest -q -p no:cacheprovider -> 1211 passed, 1 skipped
 
+  Baseline relevée à **1212** le 2026-09-11 avant TOOL-436, **1258** après.
+  L'écart de 46 tient entièrement dans `tests/test_agenda.py` (24 -> 70
+  collectés ; 3 tests de TOOL-433 RÉÉCRITS sur place, sans changer le
+  compte, parce que TOOL-436 inverse leur décision : J+3 sur `today` est
+  désormais rendu, une échéance dépassée hors période civile aussi, et la
+  forme JSON gagne un champ). « À faire aujourd'hui » ≠ « échéance
+  aujourd'hui » (décision utilisateur 2026-09-11) : sur tout horizon
+  s'ajoutent toute échéance DÉPASSÉE encore ouverte, sans plancher de
+  période — sinon `today` cessait d'être inclus dans `year` —, et toute
+  échéance dans la fenêtre de démarrage [J, J+N], N = `--lead-days`
+  (`LEAD_DAYS_DEFAULT` = 7, refusé hors [0, `LEAD_DAYS_MAX` = 366]) ou la
+  fenêtre propre de la tâche, portée par le marqueur `lead: Nj` seul sur une
+  ligne de sa NOTE Things (`_task_lead_days`, `_LEAD_MARKER`). Second champ
+  AJOUTÉ à `--json` : `start_window` = `{reason: overdue|near|lead, deadline,
+  lead_days}`, `null` hors fenêtre. Les quatre blocs conditionnels par
+  horizon sont factorisés dans `_agenda_classify` ; un test bissextile
+  épingle `_month_last_day`. Le marqueur est une valeur lue en base, donc
+  non fiable (§ Zones sensibles 1) : 19 des 46 tests sont des tests
+  d'adversité — négatif, non numérique, chiffres non ASCII, séquence de
+  contrôle, NUL, deux occurrences, 5 000 chiffres (borné AVANT `int()`, qui
+  refuse au-delà de 4 300), et la LINÉARITÉ du parseur. Ce dernier point est
+  un défaut trouvé en review sécurité, pas prévu : deux classes de blancs
+  adjacentes autour de l'unité optionnelle backtrackaient en O(n²) — mesuré
+  16 000 blancs -> 1 194 ms, 100 000 -> 46 370 ms ; corrigé en fusionnant
+  les blancs dans le groupe d'unité, 100 000 -> 4,3 ms, 1 024 000 -> 43,6 ms
+  (best of 5). Gardé par un test d'horloge (< 50 ms) ET une garde
+  structurelle sur le motif, qui tient quand l'horloge ne le peut pas. Les
+  commandes :
+
+      .venv/bin/python -m pytest --collect-only -q -p no:cacheprovider | tail -1 -> 1258 tests collected in 0.19s
+      .venv/bin/python -m pytest tests/test_agenda.py --collect-only -q -p no:cacheprovider | tail -1 -> 70 tests collected in 0.01s
+      .venv/bin/python -m pytest -q -p no:cacheprovider -> 1257 passed, 1 skipped in 62.75s (0:01:02)
+
+  **Interpréteur et couleur — un fait mesuré le 2026-09-11, pas une
+  hypothèse.** La forme documentée est `.venv/bin/python` (3.12.9). Sous
+  `python3` = **3.14.7**, dont `argparse` COLORISE son aide et ses erreurs
+  d'usage, et avec `FORCE_COLOR` posé dans l'environnement (la session de
+  l'utilisateur porte `FORCE_COLOR=3`), deux tests échouent sur `master`
+  intact — `test_an_unrecognised_argument_never_reaches_stderr_raw` et
+  `test_the_bound_leaves_the_parser_own_help_untouched`
+  (`tests/test_untrusted_rendering.py`) : ils lisent `\x1b[1;34musage:` là
+  où ils attendent `usage:`. Ce n'est pas un défaut du code : c'est
+  `argparse` qui émet ESC, hors du module, et `PYTHON_COLORS=0` le lui
+  interdit. Rejeu : `python3 -m pytest -q -p no:cacheprovider
+  tests/test_untrusted_rendering.py` -> `2 failed, 95 passed` ; la même
+  commande préfixée de `PYTHON_COLORS=0` -> `97 passed` ; et
+  `.venv/bin/python` rend `97 passed` dans les deux cas. Toute mesure de
+  non-régression lancée avec `python3` se préfixe donc de `PYTHON_COLORS=0`,
+  ou elle attribue au lot un échec qui est celui de l'environnement.
+
 ## Zones sensibles
 
 ### 1. Écriture dans la base d'un gestionnaire de tâches personnel
