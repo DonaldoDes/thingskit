@@ -1146,6 +1146,22 @@ redevient obligatoire.
       .venv/bin/python -m pytest tests/test_agenda.py --collect-only -q -p no:cacheprovider | tail -1 -> 70 tests collected in 0.01s
       .venv/bin/python -m pytest -q -p no:cacheprovider -> 1257 passed, 1 skipped in 62.75s (0:01:02)
 
+  Baseline relevée à **1258** le 2026-09-11 avant la correction UAT de
+  TOOL-436, **1261** après (`tests/test_agenda.py` 70 -> 73). Décision
+  utilisateur validée en UAT : **« le retard n'est jamais omis »** — une
+  échéance dépassée encore ouverte est rendue `overdue` sur TOUT horizon,
+  sans plancher de période civile (ce qui remplace la règle de TOOL-433,
+  qui bornait le retard à la période), ET même quand la tâche est planifiée
+  aujourd'hui : `_agenda_classify` évalue l'échéance dépassée AVANT
+  `scheduling_list == "today"`, qui la masquait (rendu `True, False, None`).
+  Deux tests l'épinglent (JSON et « ⚠ en retard » en texte), un troisième
+  garde la symétrie (planifiée aujourd'hui, échéance à venir : jamais
+  `overdue`). Les commandes :
+
+      .venv/bin/python -m pytest --collect-only -q -p no:cacheprovider | tail -1 -> 1261 tests collected in 0.12s
+      .venv/bin/python -m pytest tests/test_agenda.py --collect-only -q -p no:cacheprovider | tail -1 -> 73 tests collected in 0.01s
+      .venv/bin/python -m pytest -q -p no:cacheprovider -> 1260 passed, 1 skipped in 62.05s (0:01:02)
+
   **Interpréteur et couleur — un fait mesuré le 2026-09-11, pas une
   hypothèse.** La forme documentée est `.venv/bin/python` (3.12.9). Sous
   `python3` = **3.14.7**, dont `argparse` COLORISE son aide et ses erreurs
