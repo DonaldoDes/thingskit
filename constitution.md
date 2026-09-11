@@ -1093,6 +1093,26 @@ redevient obligatoire.
   construction de script AppleScript) sont testées isolément, sans jamais
   invoquer `osascript` ni `open` réellement.
 
+  Baseline relevée à **1200** le 2026-09-11 avant TOOL-433, **1212** après.
+  L'écart de 12 tient entièrement dans `tests/test_agenda.py` (12 -> 24
+  collectés — 3 tests préexistants ont été RÉÉCRITS sur place, sans en
+  changer le compte, pour cesser de dépendre de `dt.date.today()` sur une
+  hypothèse de fenêtre glissante qui ne tenait plus). `--horizon` gagne
+  `month` et `year` à côté de `today`/`week`, les quatre sont désormais des
+  périodes CIVILES (semaine lundi->dimanche, mois 1er->dernier jour, année
+  1er janvier->31 décembre) vues depuis J plutôt que des fenêtres de N jours
+  glissants — décision utilisateur du 2026-09-11. Le champ `overdue` est
+  AJOUTÉ aux objets de `--json` (jamais une restructuration) pour ce qui est
+  daté avant J dans la période civile et encore ouvert : ça ne s'omet plus.
+  `--today` (et `THINGSKIT_TODAY` en repli) rend la date du jour injectable,
+  seul moyen de tester lundi/vendredi/dimanche et les bornes de mois/année
+  sans dépendre du jour d'exécution (`_agenda_today`, `_agenda_period`). Les
+  commandes :
+
+      .venv/bin/python -m pytest --collect-only -q -p no:cacheprovider | tail -1 -> 1212 tests collected
+      .venv/bin/python -m pytest tests/test_agenda.py --collect-only -q -p no:cacheprovider | tail -1 -> 24
+      .venv/bin/python -m pytest -q -p no:cacheprovider -> 1211 passed, 1 skipped
+
 ## Zones sensibles
 
 ### 1. Écriture dans la base d'un gestionnaire de tâches personnel

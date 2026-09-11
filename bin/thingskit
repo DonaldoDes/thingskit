@@ -252,6 +252,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import re
 import sqlite3
 import subprocess
@@ -1209,8 +1210,49 @@ def cmd_uuid(a) -> int:
     return 0
 
 
+def _agenda_today(a) -> dt.date:
+    """`aujourd'hui` injectable — `--today` (paramètre) prime sur
+    `THINGSKIT_TODAY` (env), qui prime sur `dt.date.today()`. Existe pour que
+    les tests d'horizons civils (lundi/vendredi/dimanche, bornes de mois,
+    31 décembre) soient déterministes sans dépendre du jour d'exécution.
+    """
+    override = getattr(a, "today", None) or os.environ.get("THINGSKIT_TODAY")
+    if override:
+        return dt.date.fromisoformat(override)
+    return dt.date.today()
+
+
+def _month_last_day(d: dt.date) -> dt.date:
+    if d.month == 12:
+        return d.replace(day=31)
+    return d.replace(month=d.month + 1, day=1) - dt.timedelta(days=1)
+
+
+def _agenda_period(today: dt.date, horizon: str) -> tuple[dt.date, dt.date]:
+    """(period_start, period_end) de la période CIVILE en cours contenant
+    `today`, pour l'horizon donné. Décision utilisateur 2026-09-11 : toute
+    période nommée est civile, jamais une fenêtre de N jours glissants.
+
+    `period_start` n'est PAS la borne basse de la plage rendue (qui est
+    toujours `today`, vu depuis J) : elle sert uniquement à borner la
+    détection du retard (ce qui est daté avant J, dans la période, encore
+    ouvert).
+    """
+    if horizon == "today":
+        return today, today
+    if horizon == "week":
+        start = today - dt.timedelta(days=today.weekday())  # lundi
+        return start, start + dt.timedelta(days=6)  # dimanche
+    if horizon == "month":
+        return today.replace(day=1), _month_last_day(today)
+    if horizon == "year":
+        return today.replace(month=1, day=1), today.replace(month=12, day=31)
+    raise ValueError(f"horizon inconnu : {horizon!r}")
+
+
 def cmd_agenda(a) -> int:
-    """Ce qui est à faire aujourd'hui / cette semaine — la question de l'agent agenda.
+    """Ce qui est à faire aujourd'hui / cette semaine / ce mois / cette
+    année — la question de l'agent agenda.
 
     BUG-001 (2026-08-12) : `startBucket` ne discrimine rien de pertinent
     (mesuré à 0 pour les 610 tâches ouvertes de la base réelle) et aucune
@@ -1220,13 +1262,20 @@ def cmd_agenda(a) -> int:
     `scheduling_list(start, startDate)` (table de vérité mesurée à sa
     définition) et `decode_things_date`.
 
-    `--horizon today` : tâches dont `scheduling_list(...) == "today"` — ce qui
-    inclut, comportement natif Things assumé et non masqué, ce qui était
-    planifié un jour antérieur et n'a pas été fait — plus les tâches à
-    échéance dure du jour même, quel que soit leur bucket.
-    `--horizon week` : élargit à une fenêtre de 7 jours sur le même signal
-    (`when` pour les tâches `upcoming`, `deadline`), sans jamais inclure
-    `anytime`/`someday`/`inbox`.
+    TOOL-433 (2026-09-11) : les quatre horizons sont des périodes CIVILES,
+    vues depuis J (`_agenda_today`) — jamais des fenêtres glissantes de N
+    jours. `--horizon today` : tâches dont `scheduling_list(...) == "today"`
+    — ce qui inclut, comportement natif Things assumé et non masqué, ce qui
+    était planifié un jour antérieur et n'a pas été fait — plus les tâches à
+    échéance dure du jour même, quel que soit leur bucket. `--horizon week`
+    (lundi->dimanche), `month` (1er->dernier jour) et `year`
+    (1er janvier->31 décembre) élargissent la plage FORWARD (J -> fin de
+    période civile) sur le même signal (`when` pour les tâches `upcoming`,
+    `deadline`), sans jamais inclure `anytime`/`someday`/`inbox`. Dans les
+    trois cas, ce qui est daté AVANT J dans la période civile et encore
+    ouvert (déjà filtré `status=0` en SQL) est rendu en RETARD
+    (`overdue: true`), jamais omis — c'est le seul champ ajouté à la forme
+    JSON existante.
     """
     rows = q(
         "select t.uuid, t.title, coalesce(p.title, hp.title, ar.title,'Inbox'), "
@@ -1239,28 +1288,40 @@ def cmd_agenda(a) -> int:
         "where t.type=? and t.trashed=0 and t.status=0 "
         "order by t.deadline is null, t.deadline, 3",
         (TYPE_TASK,))
-    today = dt.date.today().isoformat()
-    horizon_end = ((dt.date.today() + dt.timedelta(days=7)).isoformat()
-                   if a.horizon == "week" else today)
+    today_date = _agenda_today(a)
+    today = today_date.isoformat()
+    period_start, period_end = _agenda_period(today_date, a.horizon)
+    horizon_end = period_end.isoformat()
+    overdue_floor = period_start.isoformat()
     out = []
     for u, ti, w, sb, sd, dl in rows:
         lst = scheduling_list(sb, sd)
         when = decode_things_date(sd)
         deadline = decode_things_date(dl)
         included = lst == "today"
+        overdue = False
         if not included and deadline is not None and today <= deadline <= horizon_end:
             included = True
-        if (not included and a.horizon == "week" and lst == "upcoming"
+        if (not included and a.horizon != "today" and lst == "upcoming"
                 and when is not None and today <= when <= horizon_end):
             included = True
+        if (not included and deadline is not None
+                and overdue_floor <= deadline < today):
+            included = True
+            overdue = True
+        if (not included and a.horizon != "today" and lst == "upcoming"
+                and when is not None and overdue_floor <= when < today):
+            included = True
+            overdue = True
         if included:
             out.append({"uuid": u, "title": ti, "where": w,
-                        "today": lst == "today", "has_deadline": deadline is not None})
+                        "today": lst == "today", "has_deadline": deadline is not None,
+                        "overdue": overdue})
     if a.json:
         print(json.dumps(out, ensure_ascii=False, indent=1))
     else:
         for o in out:
-            mark = "⏰" if o["has_deadline"] else ("•" if o["today"] else " ")
+            mark = "⚠" if o["overdue"] else ("⏰" if o["has_deadline"] else ("•" if o["today"] else " "))
             print(f"{mark} {_rendered(o['where'][:30]):<32} "
                   f"{_rendered(o['title'][:64])}")
         print(f"\n{len(out)} actionnable(s)", file=sys.stderr)
@@ -3746,9 +3807,23 @@ def main() -> int:
     s.add_argument("--when", help="today|tomorrow|evening|anytime|someday|AAAA-MM-JJ, "
                                   "suffixable de @HH:MM pour une alerte")
     s.add_argument("--deadline", help="AAAA-MM-JJ — échéance DURE, rare par nature")
-    s = add("agenda", cmd_agenda)
-    s.add_argument("--horizon", choices=["today", "week"], default="today")
+    s = add("agenda", cmd_agenda,
+            description="Ce qui est à faire, par période CIVILE (pas une "
+                        "fenêtre de N jours glissants) : today (le jour), "
+                        "week (lundi->dimanche de la semaine en cours), "
+                        "month (1er->dernier jour du mois en cours), year "
+                        "(1er janvier->31 décembre de l'année en cours). "
+                        "Vu depuis J, la plage va de J à la fin de la "
+                        "période ; ce qui est daté avant J dans la période "
+                        "et encore ouvert est rendu en retard "
+                        "(champ `overdue`), jamais omis.")
+    s.add_argument("--horizon", choices=["today", "week", "month", "year"],
+                    default="today")
     s.add_argument("--json", action="store_true")
+    s.add_argument("--today", help="AAAA-MM-JJ — override de la date du "
+                                   "jour (tests/déterminisme uniquement ; "
+                                   "sinon THINGSKIT_TODAY puis la date "
+                                   "réelle)")
     s = add("delete-task", cmd_delete_task,
             description="Supprime une tâche (déplacement vers la Corbeille Things, "
                         "récupérable — pas une destruction définitive). --id "

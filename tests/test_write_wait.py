@@ -707,10 +707,12 @@ def test_the_project_title_is_escaped_in_the_view_comparison(thingskit):
 # surface d'attente (`asyncio.sleep`, `anyio.sleep`) force à relire cette
 # garde au lieu de passer inaperçue.
 
-# Imports de `bin/thingskit` relus le 2026-08-25 : aucun ne porte de
-# primitive d'attente autre que `time.sleep`.
+# Imports de `bin/thingskit` relus le 2026-08-25, puis le 2026-09-11
+# (ajout de `os` par TOOL-433, `os.environ.get` pour `THINGSKIT_TODAY` —
+# aucune primitive d'attente dans ce module) : aucun ne porte de primitive
+# d'attente autre que `time.sleep`.
 _REVIEWED_IMPORTS = frozenset({
-    "__future__", "argparse", "datetime", "json", "re", "sqlite3",
+    "__future__", "argparse", "datetime", "json", "os", "re", "sqlite3",
     "subprocess", "sys", "time", "unicodedata", "urllib", "pathlib",
 })
 
