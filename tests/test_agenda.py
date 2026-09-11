@@ -89,7 +89,6 @@ def _run_agenda(thingskit, monkeypatch, tmp_path, rows, capsys, horizon="today",
 TODAY = dt.date.today()
 YESTERDAY = TODAY - dt.timedelta(days=1)
 TOMORROW = TODAY + dt.timedelta(days=1)
-IN_3_DAYS = TODAY + dt.timedelta(days=3)
 IN_10_DAYS = TODAY + dt.timedelta(days=10)
 
 
@@ -133,11 +132,13 @@ def test_horizon_today_excludes_future_upcoming_task(thingskit, monkeypatch,
     assert out == []
 
 
-def test_horizon_today_excludes_future_deadline(thingskit, monkeypatch,
-                                                tmp_path, capsys):
+def test_horizon_today_excludes_deadline_beyond_the_start_window(
+        thingskit, monkeypatch, tmp_path, capsys):
+    # TOOL-433 excluait J+3 ; TOOL-436 l'inclut (fenêtre de démarrage, 7 j).
+    # Ce qui reste exclu de `today` : une échéance au-delà de la fenêtre.
     out = _run_agenda(thingskit, monkeypatch, tmp_path, [
-        {"uuid": "t5", "title": "Échéance dans 3 jours", "start": 1,
-         "startDate": None, "deadline": _encode(IN_3_DAYS)},
+        {"uuid": "t5", "title": "Échéance dans 10 jours", "start": 1,
+         "startDate": None, "deadline": _encode(IN_10_DAYS)},
     ], capsys, horizon="today")
     assert out == []
 
@@ -156,7 +157,7 @@ def test_horizon_week_includes_upcoming_within_civil_week(
         thingskit, monkeypatch, tmp_path, capsys):
     # TOOL-433 : semaine CIVILE (lundi->dimanche), plus une fenêtre de 7
     # jours glissants — remplace l'ancien test BUG-001-02 dont l'hypothèse
-    # (IN_3_DAYS toujours dans la fenêtre) ne tient plus une fois la semaine
+    # (J+3 toujours dans la fenêtre) ne tient plus une fois la semaine
     # civile en place. Vu depuis lundi, mercredi de la même semaine est
     # inclus.
     out = _run_agenda(thingskit, monkeypatch, tmp_path, [
@@ -627,7 +628,9 @@ def test_lead_marker_on_non_string_notes_is_ignored(thingskit):
 def test_lead_marker_value_never_reaches_the_output_raw(
         thingskit, monkeypatch, tmp_path, capsys):
     # Le rendu ne porte QUE l'entier converti — jamais la note.
-    hostile = "lead: 14j \x1b[2K\rTÂCHE FAITE"
+    # Marqueur VALIDE sur sa ligne, puis du contenu hostile sur la suivante :
+    # la fenêtre est lue (14), la note ne sort jamais.
+    hostile = "lead: 14j\n\x1b[2K\rTÂCHE FAITE"
     out = _run_agenda(thingskit, monkeypatch, tmp_path, [
         _deadline_task("d10", 10, notes=hostile),
     ], capsys, horizon="today", today=FIXED.isoformat(), text=True)

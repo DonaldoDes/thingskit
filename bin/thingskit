@@ -1250,6 +1250,93 @@ def _agenda_period(today: dt.date, horizon: str) -> tuple[dt.date, dt.date]:
     raise ValueError(f"horizon inconnu : {horizon!r}")
 
 
+# TOOL-436 — fenêtre de démarrage. « À faire aujourd'hui » ≠ « échéance
+# aujourd'hui » (décision utilisateur 2026-09-11) : une échéance se prépare,
+# et la préparation commence AVANT. Par défaut, 7 jours avant l'échéance
+# (`--lead-days N` pour changer le défaut d'un appel) ; une tâche peut porter
+# sa propre fenêtre par un marqueur dans sa NOTE Things : `lead: 14j`, seul
+# sur sa ligne. La note plutôt que le tag, parce que (1) le CLI lit déjà
+# `t.notes` et sait l'écrire (`set-notes`/`append-notes`) — un agent peut
+# poser le marqueur sans nouvelle surface —, (2) un tag par valeur
+# (`lead:14j`, `lead:21j`…) polluerait l'espace de tags de l'utilisateur, et
+# (3) le CLI ne lit aucune table de tags aujourd'hui (aucun `TMTag` dans le
+# module) : la forme note n'ajoute ni jointure ni schéma présumé.
+LEAD_DAYS_DEFAULT = 7
+# Plafond de la fenêtre, appliqué au marqueur (écrêté) comme à `--lead-days`
+# (refusé). 366 = une année bissextile : au-delà, « à commencer » ne veut plus
+# rien dire — et une valeur lue en base est une entrée non fiable, dont la
+# taille n'est bornée par rien d'autre que ceci.
+LEAD_DAYS_MAX = 366
+# Forme acceptée : `lead`, `:`, une suite de chiffres ASCII, une unité
+# facultative (j, jours, d, days), rien d'autre sur la ligne. Blancs
+# tolérés autour de chaque terme (dont U+00A0 devant `:`, typographie
+# française). `[0-9]` et non `\d` : `\d` accepte les chiffres de toutes les
+# écritures, et la valeur ne doit être qu'un entier dont on connaît la forme.
+_LEAD_MARKER = re.compile(
+    r"^[ \t\u00a0]*lead[ \t\u00a0]*:[ \t\u00a0]*([0-9]+)[ \t\u00a0]*"
+    r"(?:j|jours|d|days)?[ \t\u00a0]*\r?$",
+    re.IGNORECASE | re.MULTILINE)
+
+
+def _task_lead_days(notes) -> int | None:
+    """Fenêtre propre à la tâche, lue dans sa note — `None` si aucun marqueur
+    valide. La note est une valeur d'origine non contrôlée (§ Zones sensibles
+    1) : seule la suite de chiffres capturée est convertie, jamais la note ;
+    une valeur absurde ne lève pas, elle est ignorée (négatif, non numérique,
+    texte après l'unité) ou écrêtée à `LEAD_DAYS_MAX` (énorme). La longueur
+    est bornée AVANT `int()` : Python refuse la conversion au-delà de 4300
+    chiffres, et une note peut en porter davantage.
+    """
+    if not isinstance(notes, str):
+        return None
+    found = _LEAD_MARKER.findall(notes)
+    if len(found) != 1:
+        return None
+    digits = found[0]
+    if len(digits) > 4:
+        return LEAD_DAYS_MAX
+    return min(int(digits), LEAD_DAYS_MAX)
+
+
+def _agenda_classify(lst, when, deadline, today: dt.date, period, window,
+                     horizon) -> tuple[bool, bool, dict | None]:
+    """(included, overdue, start_window) pour une tâche ouverte. Les quatre
+    blocs conditionnels de TOOL-433 (today/week/month/year) tiennent ici en
+    une seule séquence, dans l'ordre de priorité des raisons :
+      1. planifiée aujourd'hui (`scheduling_list`) — jamais une fenêtre ;
+      2. échéance DÉPASSÉE, sur tout horizon (TOOL-436 § 1) — `overdue` ;
+      3. échéance dans la fenêtre de démarrage [J, J+lead] — `near` ou
+         `lead` selon que la fenêtre vient du défaut ou de la tâche ; la
+         fenêtre déborde la période civile, c'est son objet ;
+      4. échéance dans la période civile mais au-delà de la fenêtre ;
+      5. `upcoming` daté dans la période, hors `today` — en retard si
+         daté avant J (plancher : début de période, comme TOOL-433).
+    `start_window` n'est posé que par 2 et 3 ; `lead_days` y est la fenêtre
+    qui a servi (le défaut, ou celle de la tâche si elle en porte une).
+    """
+    period_start, period_end = period
+    lead_days, reason = window
+    today_iso = today.isoformat()
+    window_last = (today + dt.timedelta(days=lead_days)).isoformat()
+    if lst == "today":
+        return True, False, None
+    if deadline is not None:
+        if deadline < today_iso:
+            return True, True, {"reason": "overdue", "deadline": deadline,
+                                "lead_days": lead_days}
+        if deadline <= window_last:
+            return True, False, {"reason": reason, "deadline": deadline,
+                                 "lead_days": lead_days}
+        if deadline <= period_end:
+            return True, False, None
+    if horizon != "today" and lst == "upcoming" and when is not None:
+        if today_iso <= when <= period_end:
+            return True, False, None
+        if period_start <= when < today_iso:
+            return True, True, None
+    return False, False, None
+
+
 def cmd_agenda(a) -> int:
     """Ce qui est à faire aujourd'hui / cette semaine / ce mois / cette
     année — la question de l'agent agenda.
@@ -1276,10 +1363,32 @@ def cmd_agenda(a) -> int:
     ouvert (déjà filtré `status=0` en SQL) est rendu en RETARD
     (`overdue: true`), jamais omis — c'est le seul champ ajouté à la forme
     JSON existante.
+
+    TOOL-436 (2026-09-11) : « à faire aujourd'hui » ≠ « échéance
+    aujourd'hui ». Sur TOUT horizon s'ajoutent (a) toute échéance DÉPASSÉE
+    encore ouverte, sans plancher de période — TOOL-433 bornait le retard à
+    la période civile, ce qui faisait de `today` un ensemble non inclus dans
+    `year` dès que § 1 du ticket le rendait — et (b) toute échéance dans la
+    fenêtre de démarrage [J, J+N], N = `--lead-days` (`LEAD_DAYS_DEFAULT`)
+    ou la fenêtre propre de la tâche (`_task_lead_days`, marqueur
+    `lead: Nj` en note), même hors période civile. Second champ ajouté :
+    `start_window` = `{reason: overdue|near|lead, deadline, lead_days}`,
+    `null` pour ce qui est rendu sans fenêtre (planifié du jour, `upcoming`
+    dans la période, échéance dans la période mais au-delà de la fenêtre).
+    Les quatre blocs conditionnels par horizon de TOOL-433 sont factorisés
+    dans `_agenda_classify`. La note est une entrée non fiable : seul
+    l'entier converti en sort, jamais son texte.
     """
+    lead_default = getattr(a, "lead_days", None)
+    if lead_default is None:
+        lead_default = LEAD_DAYS_DEFAULT
+    if not 0 <= lead_default <= LEAD_DAYS_MAX:
+        print(f"--lead-days : {lead_default!r} hors de [0, {LEAD_DAYS_MAX}]",
+              file=sys.stderr)
+        return 2
     rows = q(
         "select t.uuid, t.title, coalesce(p.title, hp.title, ar.title,'Inbox'), "
-        "t.start, t.startDate, t.deadline "
+        "t.start, t.startDate, t.deadline, t.notes "
         "from TMTask t "
         "left join TMTask p on t.project=p.uuid "
         "left join TMTask h on t.heading=h.uuid "
@@ -1291,39 +1400,35 @@ def cmd_agenda(a) -> int:
     today_date = _agenda_today(a)
     today = today_date.isoformat()
     period_start, period_end = _agenda_period(today_date, a.horizon)
-    horizon_end = period_end.isoformat()
-    overdue_floor = period_start.isoformat()
+    period = (period_start.isoformat(), period_end.isoformat())
     out = []
-    for u, ti, w, sb, sd, dl in rows:
+    for u, ti, w, sb, sd, dl, notes in rows:
         lst = scheduling_list(sb, sd)
         when = decode_things_date(sd)
         deadline = decode_things_date(dl)
-        included = lst == "today"
-        overdue = False
-        if not included and deadline is not None and today <= deadline <= horizon_end:
-            included = True
-        if (not included and a.horizon != "today" and lst == "upcoming"
-                and when is not None and today <= when <= horizon_end):
-            included = True
-        if (not included and deadline is not None
-                and overdue_floor <= deadline < today):
-            included = True
-            overdue = True
-        if (not included and a.horizon != "today" and lst == "upcoming"
-                and when is not None and overdue_floor <= when < today):
-            included = True
-            overdue = True
+        task_lead = _task_lead_days(notes)
+        window = ((task_lead, "lead") if task_lead is not None
+                  else (lead_default, "near"))
+        included, overdue, start_window = _agenda_classify(
+            lst, when, deadline, today_date, period, window, a.horizon)
         if included:
             out.append({"uuid": u, "title": ti, "where": w,
                         "today": lst == "today", "has_deadline": deadline is not None,
-                        "overdue": overdue})
+                        "overdue": overdue, "start_window": start_window})
     if a.json:
         print(json.dumps(out, ensure_ascii=False, indent=1))
     else:
         for o in out:
             mark = "⚠" if o["overdue"] else ("⏰" if o["has_deadline"] else ("•" if o["today"] else " "))
+            sw = o["start_window"]
+            if sw is None:
+                hint = ""
+            elif sw["reason"] == "overdue":
+                hint = "  ⚠ en retard"
+            else:
+                hint = f"  → à commencer, échéance le {_rendered(sw['deadline'])}"
             print(f"{mark} {_rendered(o['where'][:30]):<32} "
-                  f"{_rendered(o['title'][:64])}")
+                  f"{_rendered(o['title'][:64])}{hint}")
         print(f"\n{len(out)} actionnable(s)", file=sys.stderr)
     return 0
 
@@ -3816,9 +3921,26 @@ def main() -> int:
                         "Vu depuis J, la plage va de J à la fin de la "
                         "période ; ce qui est daté avant J dans la période "
                         "et encore ouvert est rendu en retard "
-                        "(champ `overdue`), jamais omis.")
+                        "(champ `overdue`), jamais omis. Fenêtre de "
+                        "démarrage (TOOL-436) : « à faire aujourd'hui » ≠ "
+                        "« échéance aujourd'hui » — s'ajoutent à chaque "
+                        "horizon toute échéance DÉPASSÉE encore ouverte, et "
+                        "toute échéance à moins de --lead-days jours, même "
+                        "hors période. Une tâche porte sa propre fenêtre par "
+                        "le marqueur `lead: 14j` dans sa note Things (seul "
+                        "sur sa ligne ; unité j/jours/d/days facultative ; "
+                        "il REMPLACE le défaut pour cette tâche ; écrêté à "
+                        f"{LEAD_DAYS_MAX} j ; ignoré s'il est invalide). "
+                        "JSON : champ `start_window` "
+                        "{reason: overdue|near|lead, deadline, lead_days}, "
+                        "null hors fenêtre.")
     s.add_argument("--horizon", choices=["today", "week", "month", "year"],
                     default="today")
+    s.add_argument("--lead-days", type=int, default=LEAD_DAYS_DEFAULT,
+                    metavar="N",
+                    help=f"fenêtre de démarrage par défaut, en jours avant "
+                         f"l'échéance (défaut {LEAD_DAYS_DEFAULT}, 0 = le "
+                         f"jour même seulement, max {LEAD_DAYS_MAX})")
     s.add_argument("--json", action="store_true")
     s.add_argument("--today", help="AAAA-MM-JJ — override de la date du "
                                    "jour (tests/déterminisme uniquement ; "
