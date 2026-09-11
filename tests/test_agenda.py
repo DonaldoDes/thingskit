@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import re
 import sqlite3
 
 import pytest
@@ -662,3 +663,27 @@ def test_agenda_help_documents_lead_days_and_the_marker(run_cli):
     assert "--lead-days" in help_text
     assert "défaut 7" in help_text
     assert "lead: 14j" in help_text
+
+
+def test_lead_marker_parsing_is_linear_in_the_length_of_the_note(thingskit):
+    # Review sécurité TOOL-436 : deux classes de blancs adjacentes autour de
+    # l'unité optionnelle donnaient un backtracking quadratique — mesuré
+    # 4 000 blancs -> 75 ms, 16 000 -> 1 194 ms sur le motif fautif. Une note
+    # Things est une entrée non fiable ; sa longueur ne doit pas commander
+    # le temps de `agenda`. Le motif fautif tient ici plusieurs dizaines de
+    # secondes ; le motif attendu, quelques millisecondes.
+    import time
+    hostile = "lead: 5" + " " * 100_000 + "x"
+    started = time.perf_counter()
+    result = thingskit._task_lead_days(hostile)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    assert result is None
+    assert elapsed_ms < 50, f"{elapsed_ms:.0f} ms"
+
+
+def test_lead_marker_pattern_has_no_adjacent_overlapping_quantifiers(thingskit):
+    # Garde STRUCTURELLE, indépendante de l'horloge : deux quantifieurs
+    # `[...]*` portant sur la même classe ne doivent jamais être séparés par
+    # un seul terme optionnel — c'est la forme exacte qui backtrack.
+    pattern = thingskit._LEAD_MARKER.pattern
+    assert not re.search(r"\]\*\(\?:[^)]*\)\?\[", pattern), pattern
