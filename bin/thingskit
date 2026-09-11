@@ -1310,8 +1310,11 @@ def _agenda_classify(lst, when, deadline, today: dt.date, period, window,
     """(included, overdue, start_window) pour une tâche ouverte. Les quatre
     blocs conditionnels de TOOL-433 (today/week/month/year) tiennent ici en
     une seule séquence, dans l'ordre de priorité des raisons :
-      1. planifiée aujourd'hui (`scheduling_list`) — jamais une fenêtre ;
-      2. échéance DÉPASSÉE, sur tout horizon (TOOL-436 § 1) — `overdue` ;
+      1. échéance DÉPASSÉE, sur tout horizon (TOOL-436 § 1) — `overdue`.
+         AVANT la planification : « le retard n'est jamais omis » (UAT
+         2026-09-11) — une tâche planifiée aujourd'hui dont l'échéance est
+         déjà passée est en retard, sa planification ne le masque pas ;
+      2. planifiée aujourd'hui (`scheduling_list`) — jamais une fenêtre ;
       3. échéance dans la fenêtre de démarrage [J, J+lead] — `near` ou
          `lead` selon que la fenêtre vient du défaut ou de la tâche ; la
          fenêtre déborde la période civile, c'est son objet ;
@@ -1325,12 +1328,12 @@ def _agenda_classify(lst, when, deadline, today: dt.date, period, window,
     lead_days, reason = window
     today_iso = today.isoformat()
     window_last = (today + dt.timedelta(days=lead_days)).isoformat()
+    if deadline is not None and deadline < today_iso:
+        return True, True, {"reason": "overdue", "deadline": deadline,
+                            "lead_days": lead_days}
     if lst == "today":
         return True, False, None
     if deadline is not None:
-        if deadline < today_iso:
-            return True, True, {"reason": "overdue", "deadline": deadline,
-                                "lead_days": lead_days}
         if deadline <= window_last:
             return True, False, {"reason": reason, "deadline": deadline,
                                  "lead_days": lead_days}
@@ -3931,7 +3934,11 @@ def main() -> int:
                         "(champ `overdue`), jamais omis. Fenêtre de "
                         "démarrage (TOOL-436) : « à faire aujourd'hui » ≠ "
                         "« échéance aujourd'hui » — s'ajoutent à chaque "
-                        "horizon toute échéance DÉPASSÉE encore ouverte, et "
+                        "horizon toute échéance DÉPASSÉE encore ouverte "
+                        "(sur TOUT horizon, sans plancher de période, et "
+                        "même si la tâche est planifiée aujourd'hui : le "
+                        "retard n'est jamais omis — remplace la règle de "
+                        "TOOL-433), et "
                         "toute échéance à moins de --lead-days jours, même "
                         "hors période. Une tâche porte sa propre fenêtre par "
                         "le marqueur `lead: 14j` dans sa note Things (seul "
