@@ -688,3 +688,44 @@ def test_lead_marker_pattern_has_no_adjacent_overlapping_quantifiers(thingskit):
     pattern = thingskit._LEAD_MARKER.pattern
     assert not re.search(r"\]\*\(\?:[^)]*\)\?\[", pattern), pattern
 
+
+
+def test_today_scheduled_task_with_past_deadline_is_overdue(
+        thingskit, monkeypatch, tmp_path, capsys):
+    # UAT TOOL-436 : « le retard n'est jamais omis ». Planifiée aujourd'hui
+    # (`scheduling_list == "today"`) ET échéance dépassée : la planification
+    # ne masque pas le retard — `overdue: true`, `start_window: overdue`.
+    out = _run_agenda(thingskit, monkeypatch, tmp_path, [
+        {"uuid": "d1", "title": "Planifiée aujourd'hui, échéance passée",
+         "start": 1, "startDate": _encode(FIXED),
+         "deadline": _encode(FIXED - dt.timedelta(days=4))},
+    ], capsys, horizon="today", today=FIXED.isoformat())
+    assert [o["uuid"] for o in out] == ["d1"]
+    assert out[0]["today"] is True
+    assert out[0]["overdue"] is True
+    assert out[0]["start_window"] == {
+        "reason": "overdue", "deadline": "2026-09-07", "lead_days": 7}
+
+
+def test_today_scheduled_task_with_past_deadline_is_marked_late_in_text(
+        thingskit, monkeypatch, tmp_path, capsys):
+    out = _run_agenda(thingskit, monkeypatch, tmp_path, [
+        {"uuid": "d1", "title": "Planifiée aujourd'hui, échéance passée",
+         "start": 1, "startDate": _encode(FIXED),
+         "deadline": _encode(FIXED - dt.timedelta(days=4))},
+    ], capsys, horizon="today", today=FIXED.isoformat(), text=True)
+    assert "⚠ en retard" in out, out
+
+
+def test_today_scheduled_task_with_future_deadline_is_not_overdue(
+        thingskit, monkeypatch, tmp_path, capsys):
+    # Garde symétrique : planifiée aujourd'hui, échéance à venir -> jamais
+    # `overdue`. (Si elle doit porter `start_window: near`, c'est une
+    # décision à part — non prise ici.)
+    out = _run_agenda(thingskit, monkeypatch, tmp_path, [
+        {"uuid": "d1", "title": "Planifiée aujourd'hui, échéance J+3",
+         "start": 1, "startDate": _encode(FIXED),
+         "deadline": _encode(FIXED + dt.timedelta(days=3))},
+    ], capsys, horizon="today", today=FIXED.isoformat())
+    assert out[0]["today"] is True
+    assert out[0]["overdue"] is False
