@@ -1272,10 +1272,17 @@ LEAD_DAYS_MAX = 366
 # tolérés autour de chaque terme (dont U+00A0 devant `:`, typographie
 # française). `[0-9]` et non `\d` : `\d` accepte les chiffres de toutes les
 # écritures, et la valeur ne doit être qu'un entier dont on connaît la forme.
+# Les blancs qui précèdent l'unité sont DANS son groupe optionnel : deux
+# classes `[ \t\u00a0]*` adjacentes de part et d'autre d'un terme optionnel
+# backtrackent en O(n²) sur une suite de blancs non suivie d'une fin de ligne
+# (review sécurité TOOL-436 : 16 000 blancs -> 1,2 s, 100 000 -> 46 s). Gardé
+# par `test_lead_marker_parsing_is_linear_in_the_length_of_the_note` et par la
+# garde structurelle `test_lead_marker_pattern_has_no_adjacent_overlapping_quantifiers`.
 _LEAD_MARKER = re.compile(
-    r"^[ \t\u00a0]*lead[ \t\u00a0]*:[ \t\u00a0]*([0-9]+)[ \t\u00a0]*"
-    r"(?:j|jours|d|days)?[ \t\u00a0]*\r?$",
+    r"^[ \t\u00a0]*lead[ \t\u00a0]*:[ \t\u00a0]*([0-9]+)"
+    r"(?:[ \t\u00a0]*(?:j|jours|d|days))?[ \t\u00a0]*\r?$",
     re.IGNORECASE | re.MULTILINE)
+
 
 
 def _task_lead_days(notes) -> int | None:

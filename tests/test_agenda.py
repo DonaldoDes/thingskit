@@ -687,3 +687,4 @@ def test_lead_marker_pattern_has_no_adjacent_overlapping_quantifiers(thingskit):
     # un seul terme optionnel — c'est la forme exacte qui backtrack.
     pattern = thingskit._LEAD_MARKER.pattern
     assert not re.search(r"\]\*\(\?:[^)]*\)\?\[", pattern), pattern
+
