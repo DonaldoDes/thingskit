@@ -11,6 +11,8 @@ import datetime as dt
 import json
 import sqlite3
 
+import pytest
+
 
 SCHEMA = """
 CREATE TABLE TMArea (uuid TEXT PRIMARY KEY, title TEXT);
@@ -69,12 +71,18 @@ def _make_db(tmp_path, rows):
 
 
 def _run_agenda(thingskit, monkeypatch, tmp_path, rows, capsys, horizon="today",
-                 today=None):
+                 today=None, lead_days=None, text=False):
     db_file = _make_db(tmp_path, rows)
     monkeypatch.setattr(thingskit, "db_path", lambda: db_file)
-    ns = argparse.Namespace(horizon=horizon, json=True, today=today)
+    kwargs = {}
+    if lead_days is not None:
+        kwargs["lead_days"] = lead_days
+    ns = argparse.Namespace(horizon=horizon, json=not text, today=today,
+                            **kwargs)
     rc = thingskit.cmd_agenda(ns)
     assert rc == 0
+    if text:
+        return capsys.readouterr().out
     return json.loads(capsys.readouterr().out)
 
 
@@ -328,16 +336,20 @@ def test_horizon_year_overdue_task_is_reported_not_omitted(
     assert out[0]["overdue"] is True
 
 
-def test_horizon_year_excludes_overdue_from_previous_year(
+def test_horizon_year_includes_overdue_deadline_from_previous_year(
         thingskit, monkeypatch, tmp_path, capsys):
-    # Datée avant J mais HORS de la période civile (année précédente) :
-    # n'est pas un retard "dans la période" — reste exclue.
+    # TOOL-433 l'excluait (« pas un retard dans la période »). TOOL-436 :
+    # une échéance DÉPASSÉE encore ouverte est en retard quel que soit
+    # l'horizon — sinon `today` (qui la rend, § 1 du ticket) ne serait plus
+    # un sous-ensemble de `year`.
     today = dt.date(2026, 12, 15)
     out = _run_agenda(thingskit, monkeypatch, tmp_path, [
         {"uuid": "y1", "title": "Échéance de l'an dernier", "start": 1,
          "startDate": None, "deadline": _encode(dt.date(2025, 12, 20))},
     ], capsys, horizon="year", today=today.isoformat())
-    assert out == []
+    assert [o["uuid"] for o in out] == ["y1"]
+    assert out[0]["overdue"] is True
+    assert out[0]["start_window"]["reason"] == "overdue"
 
 
 def test_horizon_json_shape_preserved_plus_overdue_field(
@@ -350,8 +362,9 @@ def test_horizon_json_shape_preserved_plus_overdue_field(
     ], capsys, horizon="today")
     assert isinstance(out, list)
     assert out[0].keys() == {"uuid", "title", "where", "today",
-                              "has_deadline", "overdue"}
+                              "has_deadline", "overdue", "start_window"}
     assert out[0]["overdue"] is False
+    assert out[0]["start_window"] is None
 
 
 def test_agenda_today_injection_makes_today_horizon_deterministic(
@@ -382,3 +395,267 @@ def test_agenda_today_injection_via_env(thingskit, monkeypatch, tmp_path,
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
     assert [o["uuid"] for o in out] == ["t1"]
+
+
+# ---------------------------------------------------------------------------
+# TOOL-436 — fenêtre de démarrage : « à faire aujourd'hui » ≠ « échéance
+# aujourd'hui ». Sur `today`, en plus du planifié du jour : toute échéance
+# DÉPASSÉE encore ouverte, toute échéance dans la fenêtre par défaut
+# (`LEAD_DAYS_DEFAULT` = 7, `--lead-days N`), et les tâches portant un
+# marqueur `lead: Nj` en note (fenêtre propre à la tâche).
+# ---------------------------------------------------------------------------
+FIXED = dt.date(2026, 9, 11)  # un vendredi
+
+
+def _deadline_task(uuid, days_from_today, notes=None, today=FIXED):
+    return {"uuid": uuid, "title": f"Échéance J{days_from_today:+d}",
+            "start": 1, "startDate": None, "notes": notes,
+            "deadline": _encode(today + dt.timedelta(days=days_from_today))}
+
+
+def test_today_includes_overdue_deadline_with_start_window(
+        thingskit, monkeypatch, tmp_path, capsys):
+    out = _run_agenda(thingskit, monkeypatch, tmp_path, [
+        _deadline_task("d1", -30),
+    ], capsys, horizon="today", today=FIXED.isoformat())
+    assert [o["uuid"] for o in out] == ["d1"]
+    assert out[0]["overdue"] is True
+    assert out[0]["start_window"] == {
+        "reason": "overdue", "deadline": "2026-08-12", "lead_days": 7}
+
+
+def test_today_includes_deadline_at_j_plus_3_as_near(
+        thingskit, monkeypatch, tmp_path, capsys):
+    out = _run_agenda(thingskit, monkeypatch, tmp_path, [
+        _deadline_task("d1", 3),
+    ], capsys, horizon="today", today=FIXED.isoformat())
+    assert [o["uuid"] for o in out] == ["d1"]
+    assert out[0]["overdue"] is False
+    assert out[0]["start_window"] == {
+        "reason": "near", "deadline": "2026-09-14", "lead_days": 7}
+
+
+def test_today_excludes_deadline_at_j_plus_10_without_lead(
+        thingskit, monkeypatch, tmp_path, capsys):
+    out = _run_agenda(thingskit, monkeypatch, tmp_path, [
+        _deadline_task("d1", 10),
+    ], capsys, horizon="today", today=FIXED.isoformat())
+    assert out == []
+
+
+def test_today_includes_deadline_at_j_plus_10_with_lead_14(
+        thingskit, monkeypatch, tmp_path, capsys):
+    out = _run_agenda(thingskit, monkeypatch, tmp_path, [
+        _deadline_task("d1", 10, notes="Prérequis lourds.\nlead: 14j\n"),
+    ], capsys, horizon="today", today=FIXED.isoformat())
+    assert [o["uuid"] for o in out] == ["d1"]
+    assert out[0]["start_window"] == {
+        "reason": "lead", "deadline": "2026-09-21", "lead_days": 14}
+
+
+def test_today_default_window_is_seven_days_inclusive(
+        thingskit, monkeypatch, tmp_path, capsys):
+    assert thingskit.LEAD_DAYS_DEFAULT == 7
+    out = _run_agenda(thingskit, monkeypatch, tmp_path, [
+        _deadline_task("d7", 7), _deadline_task("d8", 8),
+    ], capsys, horizon="today", today=FIXED.isoformat())
+    assert [o["uuid"] for o in out] == ["d7"]
+
+
+def test_lead_days_zero_keeps_only_the_deadline_of_the_day(
+        thingskit, monkeypatch, tmp_path, capsys):
+    out = _run_agenda(thingskit, monkeypatch, tmp_path, [
+        _deadline_task("d0", 0), _deadline_task("d1", 1),
+        _deadline_task("d14", 10, notes="lead: 14j"),
+    ], capsys, horizon="today", today=FIXED.isoformat(), lead_days=0)
+    assert sorted(o["uuid"] for o in out) == ["d0", "d14"]
+    by = {o["uuid"]: o for o in out}
+    assert by["d0"]["start_window"] == {
+        "reason": "near", "deadline": "2026-09-11", "lead_days": 0}
+    assert by["d14"]["start_window"]["reason"] == "lead"
+
+
+def test_lead_days_option_widens_the_default_window(
+        thingskit, monkeypatch, tmp_path, capsys):
+    out = _run_agenda(thingskit, monkeypatch, tmp_path, [
+        _deadline_task("d10", 10), _deadline_task("d31", 31),
+    ], capsys, horizon="today", today=FIXED.isoformat(), lead_days=30)
+    assert [o["uuid"] for o in out] == ["d10"]
+    assert out[0]["start_window"]["lead_days"] == 30
+
+
+def test_task_lead_marker_replaces_the_default_window(
+        thingskit, monkeypatch, tmp_path, capsys):
+    # La fenêtre est PROPRE à la tâche : `lead: 2j` la rend invisible à J+5
+    # même si le défaut est 7 — le marqueur remplace, il ne s'ajoute pas.
+    out = _run_agenda(thingskit, monkeypatch, tmp_path, [
+        _deadline_task("d5", 5, notes="lead: 2j"),
+        _deadline_task("d2", 2, notes="lead: 2j"),
+    ], capsys, horizon="today", today=FIXED.isoformat())
+    assert [o["uuid"] for o in out] == ["d2"]
+    assert out[0]["start_window"] == {
+        "reason": "lead", "deadline": "2026-09-13", "lead_days": 2}
+
+
+def test_week_includes_deadline_outside_civil_week_but_inside_window(
+        thingskit, monkeypatch, tmp_path, capsys):
+    # Vendredi 11 : la semaine civile finit dimanche 13, la fenêtre de 7
+    # jours va jusqu'au vendredi 18. Lundi 14 est hors période, dans la
+    # fenêtre -> inclus ; samedi 19 est hors des deux -> exclu.
+    out = _run_agenda(thingskit, monkeypatch, tmp_path, [
+        _deadline_task("d3", 3), _deadline_task("d8", 8),
+    ], capsys, horizon="week", today=FIXED.isoformat())
+    assert [o["uuid"] for o in out] == ["d3"]
+    assert out[0]["start_window"]["reason"] == "near"
+
+
+def test_month_includes_deadline_outside_civil_month_but_inside_lead(
+        thingskit, monkeypatch, tmp_path, capsys):
+    today = dt.date(2026, 9, 28)
+    out = _run_agenda(thingskit, monkeypatch, tmp_path, [
+        _deadline_task("m1", 12, notes="lead: 20j", today=today),
+        _deadline_task("m2", 12, today=today),
+    ], capsys, horizon="month", today=today.isoformat())
+    assert [o["uuid"] for o in out] == ["m1"]
+    assert out[0]["start_window"]["reason"] == "lead"
+
+
+def test_year_includes_deadline_of_next_january_inside_window(
+        thingskit, monkeypatch, tmp_path, capsys):
+    today = dt.date(2026, 12, 29)
+    out = _run_agenda(thingskit, monkeypatch, tmp_path, [
+        _deadline_task("y1", 4, today=today),   # 2 janvier 2027
+        _deadline_task("y2", 20, today=today),  # 18 janvier 2027
+    ], capsys, horizon="year", today=today.isoformat())
+    assert [o["uuid"] for o in out] == ["y1"]
+    assert out[0]["start_window"]["deadline"] == "2027-01-02"
+
+
+def test_deadline_inside_period_but_beyond_window_has_no_start_window(
+        thingskit, monkeypatch, tmp_path, capsys):
+    today = dt.date(2026, 9, 1)
+    out = _run_agenda(thingskit, monkeypatch, tmp_path, [
+        _deadline_task("m1", 20, today=today),
+    ], capsys, horizon="month", today=today.isoformat())
+    assert [o["uuid"] for o in out] == ["m1"]
+    assert out[0]["start_window"] is None
+
+
+def test_horizon_month_leap_year_ends_february_29th(
+        thingskit, monkeypatch, tmp_path, capsys):
+    # Mineur relevé en review de TOOL-433 : 2028 est bissextile.
+    today = dt.date(2028, 2, 10)
+    out = _run_agenda(thingskit, monkeypatch, tmp_path, [
+        {"uuid": "b1", "title": "29 février", "start": 2,
+         "startDate": _encode(dt.date(2028, 2, 29))},
+        {"uuid": "b2", "title": "1er mars", "start": 2,
+         "startDate": _encode(dt.date(2028, 3, 1))},
+    ], capsys, horizon="month", today=today.isoformat())
+    assert [o["uuid"] for o in out] == ["b1"]
+    assert thingskit._month_last_day(dt.date(2028, 2, 1)) == dt.date(2028, 2, 29)
+    assert thingskit._month_last_day(dt.date(2027, 2, 1)) == dt.date(2027, 2, 28)
+
+
+def test_text_rendering_marks_overdue_and_start(
+        thingskit, monkeypatch, tmp_path, capsys):
+    out = _run_agenda(thingskit, monkeypatch, tmp_path, [
+        _deadline_task("d1", -2), _deadline_task("d2", 3),
+    ], capsys, horizon="today", today=FIXED.isoformat(), text=True)
+    lines = out.splitlines()
+    assert any("⚠ en retard" in ln for ln in lines), lines
+    assert any("→ à commencer, échéance le 2026-09-14" in ln for ln in lines), lines
+
+
+# --- Marqueur `lead:` : entrée NON FIABLE (zone sensible 1) -----------------
+@pytest.mark.parametrize("notes", [
+    "lead: -5j",                    # négatif
+    "lead: abc",                    # non numérique
+    "lead: 1e3",                    # notation scientifique
+    "lead:",                        # vide
+    "lead: \x1b[2K\r14j",           # séquence de contrôle
+    "lead: ١٤j",                    # chiffres non ASCII (arabe-indien)
+    "lead: 14​j",              # espace de largeur nulle dans la valeur
+    "lead: 14j 15j",                # deux valeurs
+    "xlead: 14j",                   # préfixe collé
+    "lead: 14 jours de plus que prévu",  # texte après la valeur
+    "lead: 14j\x00",                # NUL final
+])
+def test_lead_marker_garbage_never_crashes_and_falls_back_to_default(
+        thingskit, monkeypatch, tmp_path, capsys, notes):
+    assert thingskit._task_lead_days(notes) is None
+    out = _run_agenda(thingskit, monkeypatch, tmp_path, [
+        _deadline_task("d10", 10, notes=notes),
+        _deadline_task("d3", 3, notes=notes),
+    ], capsys, horizon="today", today=FIXED.isoformat())
+    assert [o["uuid"] for o in out] == ["d3"]
+    assert out[0]["start_window"] == {
+        "reason": "near", "deadline": "2026-09-14", "lead_days": 7}
+
+
+@pytest.mark.parametrize("notes, expected", [
+    ("lead: 14j", 14),
+    ("LEAD : 14 J", 14),
+    ("lead:14", 14),
+    ("lead: 14 jours", 14),
+    ("lead: 14d", 14),
+    ("lead: 14 days", 14),
+    ("Contexte.\r\nlead: 14j\r\nSuite.", 14),
+    (" lead: 14j", 14),        # espace insécable devant
+    ("lead: 0j", 0),
+    ("lead: 007j", 7),
+])
+def test_lead_marker_accepted_forms(thingskit, notes, expected):
+    assert thingskit._task_lead_days(notes) == expected
+
+
+@pytest.mark.parametrize("notes", [
+    "lead: 99999j",
+    "lead: " + "9" * 5000 + "j",    # au-delà de la limite int(str) de Python
+    "lead: 400j",
+], ids=["99999", "5000-chiffres", "400"])
+def test_lead_marker_huge_value_is_clamped_to_the_ceiling(thingskit, notes):
+    assert thingskit._task_lead_days(notes) == thingskit.LEAD_DAYS_MAX
+    assert thingskit.LEAD_DAYS_MAX == 366
+
+
+def test_lead_marker_on_non_string_notes_is_ignored(thingskit):
+    assert thingskit._task_lead_days(None) is None
+    assert thingskit._task_lead_days(b"lead: 14j") is None
+    assert thingskit._task_lead_days(14) is None
+
+
+def test_lead_marker_value_never_reaches_the_output_raw(
+        thingskit, monkeypatch, tmp_path, capsys):
+    # Le rendu ne porte QUE l'entier converti — jamais la note.
+    hostile = "lead: 14j \x1b[2K\rTÂCHE FAITE"
+    out = _run_agenda(thingskit, monkeypatch, tmp_path, [
+        _deadline_task("d10", 10, notes=hostile),
+    ], capsys, horizon="today", today=FIXED.isoformat(), text=True)
+    assert "\x1b" not in out and "\r" not in out
+    assert "TÂCHE FAITE" not in out
+    js = _run_agenda(thingskit, monkeypatch, tmp_path, [
+        _deadline_task("d10", 10, notes=hostile),
+    ], capsys, horizon="today", today=FIXED.isoformat())
+    assert js[0]["start_window"]["lead_days"] == 14
+
+
+@pytest.mark.parametrize("value", [-1, 367, 10**9])
+def test_lead_days_option_out_of_bounds_is_refused(
+        thingskit, monkeypatch, tmp_path, capsys, value):
+    db_file = _make_db(tmp_path, [_deadline_task("d1", 1)])
+    monkeypatch.setattr(thingskit, "db_path", lambda: db_file)
+    ns = argparse.Namespace(horizon="today", json=True, today=FIXED.isoformat(),
+                            lead_days=value)
+    rc = thingskit.cmd_agenda(ns)
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "lead-days" in captured.err
+
+
+def test_agenda_help_documents_lead_days_and_the_marker(run_cli):
+    code, help_text, err = run_cli(["agenda", "--help"])
+    assert code == 0, err
+    assert "--lead-days" in help_text
+    assert "défaut 7" in help_text
+    assert "lead: 14j" in help_text
