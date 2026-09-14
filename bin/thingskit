@@ -171,6 +171,25 @@ Constaté par test le 2026-08-11, pas déduit de la documentation :
                                     l'opération qui manquait aux deux, et leurs
                                     messages de refus doivent le dire plutôt
                                     que d'affirmer qu'aucune n'existe
+                  créer en Inbox -> JSON, SANS la clé `list` du tout (pas une
+                                    valeur vide, son ABSENCE) : `add-task
+                                    --inbox`. Mesuré le 2026-09-14 sur une
+                                    tâche jetable réelle : `project`/`area`/
+                                    `heading` reviennent tous NULS en base —
+                                    constat séparé de celui du `list` qui ne
+                                    nomme rien (ci-dessus), pour ne rien
+                                    déduire de l'un à l'autre (TOOL-452)
+                  détacher       -> AppleScript `move to do id … to list
+                                    "<libellé Inbox>"` : `move-task
+                                    --to-inbox`. Mesuré le 2026-09-14 sur une
+                                    tâche jetable réelle sortie d'un projet
+                                    ouvert (« Cycle Fiscal Annuel ») :
+                                    `project`/`area`/`heading` reviennent
+                                    tous NULS après coup. Libellé LOCALISÉ,
+                                    comme les listes intégrées de
+                                    `reschedule-task` : « À classer » sur ce
+                                    poste, « Inbox » à l'anglaise —
+                                    `THINGS_INBOX_LABELS` (TOOL-452)
 
 La lecture ne passe jamais par AppleScript : elle interroge la base SQLite en
 lecture seule (`mode=ro`), ce qui est plus rapide, scriptable, et ne dépend pas
@@ -251,7 +270,7 @@ Usage
     thingskit create-area NOM
     thingskit create-project TITRE --area NOM [--notes TEXTE] [--heading H]...
     thingskit create-heading TITRE --project TITRE
-    thingskit add-task TITRE --list CIBLE [--heading H] [--notes TEXTE]
+    thingskit add-task TITRE (--list CIBLE [--heading H] | --inbox) [--notes TEXTE]
     thingskit set-notes --project TITRE|--project-id UUID --notes TEXTE
     thingskit set-notes --task TITRE|--task-id UUID --notes TEXTE
     thingskit append-notes --project TITRE|--project-id UUID --line LIGNE
@@ -263,7 +282,8 @@ Usage
     thingskit reschedule-task [--id UUID] [--title TITRE] [--when VAL]
                               [--deadline AAAA-MM-JJ] [--clear-deadline]
     thingskit move-task [--id UUID] [--title TITRE]
-                        --to-project TITRE [--to-heading H] | --to-area NOM
+                        (--to-project TITRE [--to-heading H] | --to-area NOM
+                         | --to-inbox)
     thingskit move-project --project TITRE|--project-id UUID --area NOM
     thingskit delete-project --project TITRE|--project-id UUID
                              [--delete-open-tasks]
@@ -1618,6 +1638,16 @@ def _tasks_titled(title: str) -> list[tuple]:
 def cmd_add_task(a) -> int:
     """Crée une tâche par le schéma d'URL, dans une cible RÉSOLUE avant d'écrire.
 
+    TOOL-452 — `--inbox` crée directement dans l'Inbox, sans passer par
+    `--list`. Exclusif de `--list` (groupe argparse) et de `--heading` (refus
+    explicite ici : un en-tête vit DANS un projet, jamais dans l'Inbox — la
+    combinaison n'a pas de sens). Mesuré le 2026-09-14 sur une tâche jetable
+    réelle : un payload SANS la clé `list` du tout (pas une valeur vide,
+    l'ABSENCE de la clé) atterrit en Inbox, `project`/`area`/`heading` tous
+    NULS en base — mesure séparée du constat déjà établi pour un `list` qui
+    ne nomme ni projet ni area (docstring module), pour ne rien déduire de
+    l'un à l'autre.
+
     BUG-005 — `--list` était recopié tel quel dans le payload. Une valeur qui
     ne nomme aucun projet ni aucune area fait atterrir la tâche en **Inbox**,
     et Things ne le dit pas : la commande sortait en `0` avec un message de
@@ -1642,44 +1672,56 @@ def cmd_add_task(a) -> int:
     """
     action_suffix = "aucune tâche créée"
 
-    project_uuid, area_uuid, heading_uuid, err = _resolve_find_target(
-        a.list, a.heading)
-    if err:
-        print(f"{err} — {action_suffix}. La tâche n'est jamais envoyée vers "
-              "une cible non résolue (elle atterrirait sinon en Inbox sans le "
-              "dire).", file=sys.stderr)
+    if a.inbox and a.heading:
+        print(f"erreur : --inbox et --heading sont exclusifs (un en-tête vit "
+              f"DANS un projet, jamais dans l'Inbox), {action_suffix}",
+              file=sys.stderr)
         return 1
 
-    if heading_uuid:
-        target_kind, target_id = "heading", heading_uuid
-    elif project_uuid:
-        target_kind, target_id = "project", project_uuid
-    else:
-        target_kind, target_id = "area", area_uuid
-    where = a.list + (f" › {a.heading}" if a.heading else "")
-
-    # Statut du projet visé, relevé AVANT l'écriture. Il ne décide RIEN — ni
-    # refus, ni succès : il est capturé pour que le message d'échec puisse
-    # citer un fait utile au diagnostic sans redemander à la base. Un projet
-    # terminé se résout et se laisse viser, comme partout ailleurs dans ce
-    # script (les quatre résolveurs de projet par titre filtrent `trashed=0`,
-    # jamais le statut) ; que Things range ou non une tâche dans un projet
-    # terminé n'est PAS établi ici — l'établir impose d'écrire dans la base
-    # réelle de l'utilisateur.
     target_note = ""
-    if target_kind == "project":
-        status_rows = q("select status from TMTask where uuid=? and type=?",
-                        (target_id, TYPE_PROJECT))
-        if status_rows and status_rows[0][0] != STATUS_OPEN:
-            label = _rendered(STATUS_LABELS.get(status_rows[0][0],
-                                              status_rows[0][0]))
-            target_note = f" — le projet visé est {label}"
+    if a.inbox:
+        target_kind, target_id = "inbox", None
+        where = "Inbox"
+    else:
+        project_uuid, area_uuid, heading_uuid, err = _resolve_find_target(
+            a.list, a.heading)
+        if err:
+            print(f"{err} — {action_suffix}. La tâche n'est jamais envoyée "
+                  "vers une cible non résolue (elle atterrirait sinon en "
+                  "Inbox sans le dire).", file=sys.stderr)
+            return 1
+
+        if heading_uuid:
+            target_kind, target_id = "heading", heading_uuid
+        elif project_uuid:
+            target_kind, target_id = "project", project_uuid
+        else:
+            target_kind, target_id = "area", area_uuid
+        where = a.list + (f" › {a.heading}" if a.heading else "")
+
+        # Statut du projet visé, relevé AVANT l'écriture. Il ne décide RIEN —
+        # ni refus, ni succès : il est capturé pour que le message d'échec
+        # puisse citer un fait utile au diagnostic sans redemander à la base.
+        # Un projet terminé se résout et se laisse viser, comme partout
+        # ailleurs dans ce script (les quatre résolveurs de projet par titre
+        # filtrent `trashed=0`, jamais le statut) ; que Things range ou non
+        # une tâche dans un projet terminé n'est PAS établi ici — l'établir
+        # impose d'écrire dans la base réelle de l'utilisateur.
+        if target_kind == "project":
+            status_rows = q("select status from TMTask where uuid=? and type=?",
+                            (target_id, TYPE_PROJECT))
+            if status_rows and status_rows[0][0] != STATUS_OPEN:
+                label = _rendered(STATUS_LABELS.get(status_rows[0][0],
+                                                  status_rows[0][0]))
+                target_note = f" — le projet visé est {label}"
 
     # Relevé AVANT l'écriture : ce qui portait déjà ce titre ne pourra pas
     # servir de preuve que la nouvelle tâche a atterri au bon endroit.
     known = {row[0] for row in _tasks_titled(a.title)}
 
-    attrs = {"title": a.title, "list": a.list}
+    attrs = {"title": a.title}
+    if not a.inbox:
+        attrs["list"] = a.list
     if a.heading:
         attrs["heading"] = a.heading
     if a.notes:
@@ -1714,6 +1756,9 @@ def cmd_add_task(a) -> int:
                 ok = obs_heading == target_id
             elif target_kind == "project":
                 ok = obs_project == target_id and obs_area is None
+            elif target_kind == "inbox":
+                ok = (obs_project is None and obs_area is None
+                      and obs_heading is None)
             else:
                 ok = obs_area == target_id and obs_project is None
             if ok:
@@ -1726,8 +1771,9 @@ def cmd_add_task(a) -> int:
         observed = " ; ".join(
             f"{u!r} (project={p!r}, area={ar!r}, heading={h!r})"
             for u, p, ar, h in fresh)
-        return (f"créée mais rattachée ailleurs : {observed}, attendu "
-                f"{target_kind}={target_id!r}")
+        attendu = "inbox (aucun projet, aucune area, aucun heading)" if (
+            target_kind == "inbox") else f"{target_kind}={target_id!r}"
+        return f"créée mais rattachée ailleurs : {observed}, attendu {attendu}"
 
     # La valeur qui compose le message est celle que la sonde a OBSERVÉE : une
     # seconde lecture court après l'effet et rendrait « aucun problème » —
@@ -2989,6 +3035,11 @@ THINGS_LIST_LABELS = {
     "someday": ("Un jour", "Someday"),
 }
 
+# Libellé de l'Inbox — même risque de localisation, mesuré séparément
+# (TOOL-452, 2026-09-14, `name of lists`) : « À classer » sur un poste
+# français, « Inbox » à l'anglaise.
+THINGS_INBOX_LABELS = ("À classer", "Inbox")
+
 _NO_LIST_MARKER = "THINGSKIT_NO_LIST"
 
 _ISO_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -3397,6 +3448,38 @@ def _resolve_area_by_title(title: str, action_suffix: str) -> tuple[str | None, 
     return rows[0][0], None
 
 
+def _build_move_to_inbox_script(task_id: str,
+                                labels: tuple[str, ...] | None = None) -> str:
+    """Compose l'AppleScript qui détache une tâche vers l'Inbox — même motif
+    que la branche `move to list` de `_build_reschedule_script` : les
+    libellés candidats sont essayés un à un (`exists list`), le premier
+    trouvé est utilisé. Pure — testable sans Things.
+
+    Mesuré le 2026-09-14 sur une tâche jetable réelle (projet ouvert « Cycle
+    Fiscal Annuel ») : `move to do id … to list "À classer"` efface
+    `project`/`area`/`heading`, comme les propriétés dédiées le font pour un
+    projet/area cible (docstring de section, ci-dessus).
+    """
+    labels = labels or THINGS_INBOX_LABELS
+    candidates = ", ".join(f'"{_esc(l)}"' for l in labels)
+    body = [
+        'tell application "Things3"',
+        "set targetList to missing value",
+        f"repeat with candidate in {{{candidates}}}",
+        "  try",
+        "    if exists list candidate then",
+        "      set targetList to candidate",
+        "      exit repeat",
+        "    end if",
+        "  end try",
+        "end repeat",
+        f'if targetList is missing value then error "{_NO_LIST_MARKER}"',
+        f'move to do id "{_esc(task_id)}" to list targetList',
+        "end tell",
+    ]
+    return "\n".join(body)
+
+
 def cmd_move_task(a) -> int:
     """Déplace une tâche déjà créée vers un autre projet ou une autre area,
     sans jamais changer son UUID (pas de suppression puis recréation).
@@ -3409,6 +3492,13 @@ def cmd_move_task(a) -> int:
     de l'utilisateur — c'est le même raisonnement que `set-notes`/
     `append-notes` (qui acceptent les deux), pas celui de `complete-task`
     (qui refuse `canceled` parce qu'il *convertirait* cet état).
+
+    TOOL-452 — `--to-inbox` détache la tâche de son projet/area/en-tête,
+    exclusif de `--to-project` et `--to-area` (groupe argparse). Surface :
+    AppleScript `move to do id … to list "<libellé Inbox>"`, mesurée le
+    2026-09-14 sur une tâche jetable réelle — `project`/`area`/`heading`
+    reviennent tous les trois à NUL après coup, même famille de garde que
+    `THINGS_LIST_LABELS` (libellé localisé, jamais un littéral).
     """
     action_suffix = "aucun déplacement effectué"
 
@@ -3439,13 +3529,19 @@ def cmd_move_task(a) -> int:
               file=sys.stderr)
         return 1
 
-    if not getattr(a, "to_project", None) and not getattr(a, "to_area", None):
-        print(f"erreur : --to-project ou --to-area requis, {action_suffix}",
-              file=sys.stderr)
-        return 1
-    if getattr(a, "to_project", None) and getattr(a, "to_area", None):
-        print(f"erreur : --to-project et --to-area sont exclusifs, "
+    to_inbox = bool(getattr(a, "to_inbox", False))
+    targets_given = sum([
+        bool(getattr(a, "to_project", None)),
+        bool(getattr(a, "to_area", None)),
+        to_inbox,
+    ])
+    if targets_given == 0:
+        print(f"erreur : --to-project, --to-area ou --to-inbox requis, "
               f"{action_suffix}", file=sys.stderr)
+        return 1
+    if targets_given > 1:
+        print(f"erreur : --to-project, --to-area et --to-inbox sont "
+              f"exclusifs, {action_suffix}", file=sys.stderr)
         return 1
 
     rows = q("select title, trashed from TMTask where uuid=? and type=?",
@@ -3518,6 +3614,10 @@ def cmd_move_task(a) -> int:
                   f"({_rendered(task_id)}) → {target_label!r}")
             return 0
         script = None
+    elif to_inbox:
+        target_id = None
+        target_kind, target_label = "inbox", "Inbox"
+        script = _build_move_to_inbox_script(task_id)
     elif a.to_project:
         target_id, err = _resolve_project_by_title(a.to_project, action_suffix)
         if err:
@@ -3580,13 +3680,18 @@ def cmd_move_task(a) -> int:
             ok = obs_heading == target_id
         elif target_kind == "project":
             ok = obs_project == target_id and obs_area is None
+        elif target_kind == "inbox":
+            ok = (obs_project is None and obs_area is None
+                  and obs_heading is None)
         else:
             ok = obs_area == target_id and obs_project is None
         if not ok:
+            attendu = ("inbox (aucun projet, aucune area, aucun heading)"
+                       if target_kind == "inbox"
+                       else f"{target_kind}={target_id!r}")
             return (f"vers {target_kind} {target_label!r}, appartenance relue "
                     f"en base = (project={obs_project!r}, area={obs_area!r}, "
-                    f"heading={obs_heading!r}), attendu ({target_kind}="
-                    f"{target_id!r})")
+                    f"heading={obs_heading!r}), attendu ({attendu})")
         return None
 
     # La valeur qui compose le message est celle que la sonde a OBSERVÉE, pas
@@ -4212,16 +4317,25 @@ def main() -> int:
     s.add_argument("title")
     s.add_argument("--project", required=True, help="titre exact du projet")
     s = add("add-task", cmd_add_task,
-            description="Crée une tâche dans un projet ou une area, via le "
-                        "schéma d'URL JSON. Refuse une cible (--list, "
-                        "--heading) qui ne correspond à aucun projet/area "
-                        "existant, plutôt que de laisser Things la faire "
-                        "atterrir en Inbox sans le dire. Refuse toute "
-                        "résolution par titre ambiguë ou nulle. Ne sort en "
+            description="Crée une tâche dans un projet, une area ou "
+                        "l'Inbox, via le schéma d'URL JSON. Refuse une "
+                        "cible (--list, --heading) qui ne correspond à "
+                        "aucun projet/area existant, plutôt que de laisser "
+                        "Things la faire atterrir en Inbox sans le dire. "
+                        "Refuse toute résolution par titre ambiguë ou "
+                        "nulle. --inbox crée directement dans l'Inbox, "
+                        "exclusif de --list et de --heading (un en-tête vit "
+                        "DANS un projet, jamais dans l'Inbox). Ne sort en "
                         "succès que si le rattachement d'une tâche NOUVELLE à "
                         "la cible exacte est constaté en base après coup — "
                         "l'existence d'une tâche de ce titre ne prouve rien.")
-    s.add_argument("title"); s.add_argument("--list", required=True)
+    s.add_argument("title")
+    g = s.add_mutually_exclusive_group(required=True)
+    g.add_argument("--list", help="titre exact du projet ou de l'area cible")
+    g.add_argument("--inbox", action="store_true",
+                   help="crée directement dans l'Inbox (« À classer »), sans "
+                        "projet ni area ni en-tête — exclusif de --list et "
+                        "de --heading")
     s.add_argument("--heading"); s.add_argument("--notes")
     s.add_argument("--when", help="today|tomorrow|evening|anytime|someday|AAAA-MM-JJ, "
                                   "suffixable de @HH:MM pour une alerte")
@@ -4363,12 +4477,18 @@ def main() -> int:
                         "opération `update` — aucune surface AppleScript ne "
                         "le permet (mesuré, cf. docstring module). L'UUID et "
                         "la date de création de la tâche sont vérifiés "
-                        "inchangés après coup.")
+                        "inchangés après coup. --to-inbox détache la tâche "
+                        "de son projet/area/en-tête (AppleScript `move … to "
+                        "list <libellé Inbox>`), exclusif de --to-project "
+                        "et --to-area.")
     s.add_argument("--id", help="identifiant Things de la tâche (recommandé)")
     s.add_argument("--title", help="titre exact ; refuse si 0 ou 2+ correspondances")
     g = s.add_mutually_exclusive_group(required=True)
     g.add_argument("--to-project", help="titre exact du projet cible")
     g.add_argument("--to-area", help="titre exact de l'area cible")
+    g.add_argument("--to-inbox", action="store_true",
+                   help="détache la tâche : plus de projet, d'area ni "
+                        "d'en-tête — exclusif de --to-project et --to-area")
     s.add_argument("--to-heading",
                    help="titre exact d'un en-tête DANS --to-project ; refuse "
                         "si 0 ou 2+ correspondances dans ce projet")

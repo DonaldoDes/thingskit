@@ -80,9 +80,10 @@ def _make_db(tmp_path, task_rows=(), area_rows=()):
 
 
 def _ns(title="Nouvelle tâche", list=None, heading=None, notes=None,
-        when=None, deadline=None):
+        when=None, deadline=None, inbox=False):
     return argparse.Namespace(title=title, list=list, heading=heading,
-                              notes=notes, when=when, deadline=deadline)
+                              notes=notes, when=when, deadline=deadline,
+                              inbox=inbox)
 
 
 @pytest.fixture
@@ -803,3 +804,101 @@ def test_the_observed_placement_renders_all_four_values_the_same_way(
         "l'uuid observé est rendu brut alors que ses trois voisins de la "
         f"même expression sont convertis : {err!r}")
     assert f"project={PROJ2_ID!r}" in err, err
+
+
+# ---------------------------------------------------------------------------
+# TOOL-452 — `--inbox` : l'Inbox devient une cible d'écriture directe.
+#
+# `--inbox` est exclusif de `--list` (groupe argparse) et de `--heading`
+# (refus explicite dans `cmd_add_task` : un en-tête vit DANS un projet,
+# jamais dans l'Inbox — aucun sens à les combiner). Mesuré le 2026-09-14 sur
+# une tâche jetable réelle, schéma d'URL sans clé `list` du tout (pas une
+# valeur vide, l'ABSENCE de la clé) : la tâche atterrit en Inbox, avec
+# `project`/`area`/`heading` tous NULS en base — même constat que le `list`
+# qui ne nomme ni projet ni area (docstring module), mesuré séparément pour
+# ne rien déduire de l'un à l'autre.
+# ---------------------------------------------------------------------------
+
+def test_inbox_creates_a_new_task_with_no_project_area_or_heading(
+        thingskit, monkeypatch, rigged, capsys):
+    calls, set_rows = rigged
+    db_file = set_rows([PROJECT_ROW], [AREA_ROW])
+    _rig_landing(thingskit, monkeypatch, calls, uuid="INBOXINBOXINBOXINBOX1")
+
+    rc = thingskit.cmd_add_task(_ns(inbox=True))
+
+    assert rc == 0, capsys.readouterr().err
+    con = sqlite3.connect(db_file)
+    project, heading, area = con.execute(
+        "select project, heading, area from TMTask where uuid=?",
+        ("INBOXINBOXINBOXINBOX1",)).fetchone()
+    con.close()
+    assert project is None
+    assert heading is None
+    assert area is None
+
+
+def test_inbox_omits_the_list_key_entirely_rather_than_send_it_empty(
+        thingskit, rigged):
+    """L'absence de la clé `list`, pas une valeur vide — c'est la forme
+    mesurée sur pièce (cf. en-tête de section)."""
+    calls, set_rows = rigged
+    set_rows([PROJECT_ROW], [AREA_ROW])
+
+    thingskit.cmd_add_task(_ns(inbox=True))
+
+    assert len(calls["url"]) == 1
+    assert "list" not in calls["url"][0][0]["attributes"]
+
+
+def test_inbox_with_a_list_is_refused_at_the_cli_level(thingskit, run_cli):
+    code, _, err = run_cli(
+        ["add-task", "X", "--inbox", "--list", "Un projet"])
+    assert code != 0
+    assert "inbox" in err.lower()
+
+
+def test_inbox_with_a_heading_is_refused_without_any_write_call(
+        thingskit, rigged, capsys):
+    """`--list`/`--heading` résolvent tous les deux normalement (le projet
+    et le heading existent) : sans la garde d'exclusivité, l'ancienne
+    résolution réussirait et solliciterait l'application malgré `--inbox`.
+    """
+    calls, set_rows = rigged
+    set_rows([PROJECT_ROW, HEADING_ROW], [AREA_ROW])
+
+    rc = thingskit.cmd_add_task(
+        _ns(inbox=True, list="Projet cible", heading="Section"))
+
+    assert rc != 0
+    assert calls["url"] == [], "l'application a été sollicitée malgré le refus"
+    assert calls["running"] == 0
+    err = capsys.readouterr().err
+    assert "inbox" in err.lower() and "heading" in err.lower()
+
+
+def test_inbox_with_a_heading_is_refused_at_the_cli_level(thingskit, run_cli):
+    code, _, err = run_cli(
+        ["add-task", "X", "--inbox", "--heading", "Section"])
+    assert code != 0
+
+
+def test_a_task_that_lands_elsewhere_than_the_inbox_is_a_failure(
+        thingskit, monkeypatch, rigged, capsys):
+    """Preuve de refus : sans la garde `target_kind == "inbox"`, une tâche
+    atterrie sous un projet passerait la vérification."""
+    calls, set_rows = rigged
+    set_rows([PROJECT_ROW], [AREA_ROW])
+    _rig_landing(thingskit, monkeypatch, calls, uuid="ELSEWHEREELSEWHERE001",
+                 project=PROJ_ID)
+
+    rc = thingskit.cmd_add_task(_ns(inbox=True))
+
+    assert rc != 0
+    assert "attendu inbox" in capsys.readouterr().err.lower()
+
+
+def test_inbox_is_registered_in_cli_help(thingskit, run_cli):
+    code, out, _ = run_cli(["add-task", "--help"])
+    assert code == 0
+    assert "--inbox" in out

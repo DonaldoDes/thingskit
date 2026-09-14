@@ -108,9 +108,11 @@ def _make_db(tmp_path, task_rows, area_rows=(), token="jeton-de-test"):
     return db_file
 
 
-def _ns(id=None, title=None, to_project=None, to_area=None, to_heading=None):
+def _ns(id=None, title=None, to_project=None, to_area=None, to_heading=None,
+        to_inbox=False):
     return argparse.Namespace(id=id, title=title, to_project=to_project,
-                              to_area=to_area, to_heading=to_heading)
+                              to_area=to_area, to_heading=to_heading,
+                              to_inbox=to_inbox)
 
 
 @pytest.fixture
@@ -1031,3 +1033,92 @@ def test_a_task_vanishing_before_its_placement_is_read_is_a_clean_refusal(
                                        to_heading="Section")) == 1
     assert calls["osa"] == [] and calls["url"] == []
     assert "disparue" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# TOOL-452 — `--to-inbox` : détache une tâche de son projet/area/en-tête.
+#
+# Surface mesurée le 2026-09-14 sur une tâche jetable réelle (projet ouvert
+# « Cycle Fiscal Annuel ») : `move to do id "<uuid>" to list "À classer"`
+# efface `project`/`area`/`heading` — « À classer » est le libellé français
+# de l'Inbox (`name of lists`, mesuré le même jour), comme « Anytime » pour
+# `THINGS_LIST_LABELS` : localisé, donc une liste de candidats, jamais un
+# littéral.
+# ---------------------------------------------------------------------------
+
+def test_to_inbox_by_id(thingskit, monkeypatch, rigged):
+    calls, set_rows = rigged
+    set_rows([{"uuid": TARGET, "title": "Cible", "type": 0, "project": PROJECT}],
+             [], token=None)
+    _rig_effective_move(thingskit, monkeypatch, calls, project=None, area=None,
+                        heading=None)
+
+    rc = thingskit.cmd_move_task(_ns(id=TARGET, to_inbox=True))
+    assert rc == 0
+    assert len(calls["osa"]) == 1
+    assert TARGET in calls["osa"][0]
+
+    con = sqlite3.connect(calls["db"])
+    project, area, heading = con.execute(
+        "select project, area, heading from TMTask where uuid=?",
+        (TARGET,)).fetchone()
+    con.close()
+    assert project is None
+    assert area is None
+    assert heading is None
+
+
+def test_failure_when_the_task_is_not_actually_detached(thingskit, rigged):
+    """`osa` « réussit » (rc=0, mock inerte) sans rien changer en base —
+    preuve que la vérification post-action porte bien sur `--to-inbox`."""
+    calls, set_rows = rigged
+    set_rows([{"uuid": TARGET, "title": "Cible", "type": 0, "project": PROJECT}],
+             [], token=None)
+
+    rc = thingskit.cmd_move_task(_ns(id=TARGET, to_inbox=True))
+
+    assert rc != 0
+    assert len(calls["osa"]) == 1, (
+        "la commande n'a jamais sollicité l'application — sans la nouvelle "
+        "branche --to-inbox, elle refuse en amont faute de cible connue")
+
+
+def test_to_inbox_and_to_area_are_exclusive(thingskit, rigged, capsys):
+    calls, set_rows = rigged
+    set_rows([{"uuid": TARGET, "title": "Cible", "type": 0, "project": PROJECT}],
+             [(AREA, "Une area")])
+
+    rc = thingskit.cmd_move_task(_ns(id=TARGET, to_inbox=True, to_area="Une area"))
+
+    assert rc != 0
+    assert calls["osa"] == []
+    assert "exclusif" in capsys.readouterr().err.lower()
+
+
+def test_to_inbox_and_to_project_are_exclusive_at_the_cli_level(thingskit, run_cli):
+    code, _, err = run_cli(
+        ["move-task", "--id", TARGET, "--to-inbox", "--to-project", "P"])
+    assert code != 0
+
+
+def test_the_inbox_route_is_registered_in_cli_help(thingskit, run_cli):
+    code, out, _ = run_cli(["move-task", "--help"])
+    assert code == 0
+    assert "--to-inbox" in out
+
+
+def test_uuid_unchanged_after_a_move_to_inbox(thingskit, monkeypatch, rigged):
+    calls, set_rows = rigged
+    set_rows([{"uuid": TARGET, "title": "Cible", "type": 0, "project": PROJECT}],
+             [], token=None)
+    _rig_effective_move(thingskit, monkeypatch, calls, project=None, area=None,
+                        heading=None)
+
+    rc = thingskit.cmd_move_task(_ns(id=TARGET, to_inbox=True))
+    assert rc == 0
+
+    con = sqlite3.connect(calls["db"])
+    row = con.execute("select uuid from TMTask where uuid=?", (TARGET,)).fetchone()
+    con.close()
+    assert row is not None
+    assert row[0] == TARGET
