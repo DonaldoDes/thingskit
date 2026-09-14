@@ -228,6 +228,21 @@ Supprimer un PROJET — constaté le 2026-09-14 sur deux projets jetables réels
                                     `to dos of p whose status is open` isole
                                     les tâches ouvertes
 
+    project terminé/annulé au Logbook — `delete p` rend -1728 tel quel ;
+                                    rouvert dans le MÊME acte (`set status of
+                                    p to open`), il se supprime (TOOL-457,
+                                    2026-09-15). Le projet part à la
+                                    Corbeille OUVERT (`status=0, trashed=1`).
+                                    Sur échec du `delete`, le script restaure
+                                    le statut d'origine avant de rendre
+                                    l'erreur.
+    set status of project … to completed
+                                    TERMINE aussi ses tâches ouvertes, et
+                                    rouvrir l'une d'elles rouvre le projet :
+                                    « projet terminé portant une tâche
+                                    ouverte » n'est pas productible par
+                                    AppleScript (mesuré le 2026-09-15).
+
     Les tâches d'un projet supprimé ne sont PAS marquées `trashed` en base
     (mesuré : `trashed=0` après coup) et deviennent pourtant INATTEIGNABLES
     par AppleScript (`delete to do id "<uuid>"` -> -1728). Elles disparaissent
@@ -4046,6 +4061,69 @@ def cmd_move_project(a) -> int:
 # dans l'acte). Le même aller-retour compte les tâches ouvertes et supprime,
 # et il refuse de lui-même : entre un constat séparé et le geste, une tâche
 # peut naître, et le geste s'appuierait sur un état qui n'est plus.
+#
+# PROJET TERMINÉ OU ANNULÉ (TOOL-457) — mesuré le 2026-09-15, d'abord par
+# l'utilisateur sur « Projet de test » (LbGyL7Gop2uBtVDvSXjqVD, terminé le
+# 2026-08-10, rangé au Logbook), puis sur trois sondes jetables
+# `ZZ-probe-tool457-{a,b,c}` créées pour l'occasion :
+#
+#   - Au Logbook, `set p to project id …` et le comptage passent, mais
+#     `delete p` rend -1728 « impossible d'obtenir project id » (offset
+#     289:297 du script, qui est `delete p`). `move p to list "Trash"` n'est
+#     pas une issue : `list "Trash"` n'existe pas (-1728). `set status of p
+#     to open` puis `delete p` dans le MÊME acte → `deleted`, rc=0.
+#     Rejeu :  thingskit delete-project --project-id LbGyL7Gop2uBtVDvSXjqVD
+#   - Un projet FRAÎCHEMENT terminé (pas encore au Logbook) se supprimait
+#     déjà sans réouverture (`ZZ-probe-delete-termine`, 2026-09-15). Les
+#     sondes ci-dessous établissent donc la non-régression du chemin
+#     nominal ; la correction du cas Logbook, c'est la mesure de l'utilisateur.
+#   - Sonde a, `status=3` : `delete-project` → `status=0, trashed=1`. La
+#     réouverture reste visible en base APRÈS la mise à la Corbeille — un
+#     « Put Back » rendrait donc un projet OUVERT, pas terminé. Sonde c,
+#     passée `canceled` (`status=2`) : même résultat, `status=0, trashed=1`.
+#   - Branche de restauration : le script de la sonde c rejoué avec
+#     `delete p` remplacé par `error "…"` → rc=1, message « suppression
+#     échouée, statut d'origine restauré — … », et `status=3, trashed=0`
+#     relu en base. Le `on error` re-résout par `project id "<uuid>"` plutôt
+#     que par `p`, comme la mesure de l'utilisateur.
+#   - `st` n'est PAS un nom de variable AppleScript valide : c'est un
+#     suffixe ordinal (« 1st »), et le script mourait en -2741 « expression
+#     prévu mais st trouvé ». D'où `origStatus`.
+#   - `set status of project id … to completed` TERMINE AUSSI ses tâches
+#     ouvertes (sonde b : la tâche passe `status=3` en cascade), et rouvrir
+#     l'une d'elles ROUVRE le projet (`status=0`). L'état « projet terminé
+#     portant une tâche ouverte » n'est donc pas productible par la surface
+#     AppleScript : la garde « aucune tâche ouverte » a été éprouvée sur la
+#     sonde b OUVERTE (REFUS, rc=1, statut et `trashed` inchangés), et son
+#     antériorité sur la réouverture est gardée par test, pas par sonde.
+#     Rejeu :  osascript -e 'tell application "Things3" to set status of
+#              project id "<uuid>" to completed' puis
+#              sqlite3 "file:<base>?mode=ro" "select status from TMTask
+#              where project='<uuid>'"
+#   - `stopDate` NE SURVIT PAS à l'aller-retour completed -> open ->
+#     completed : mesuré le 2026-09-15 sur `ZZ-probe-tool457-rework-a`,
+#     `stopDate=1789425152.42` une fois terminé, NULL une fois rouvert,
+#     `1789425156.82` (nouvelle valeur, l'instant de la re-terminaison) une
+#     fois terminé de nouveau. Un projet dont le `delete` a échoué et que le
+#     script a restauré revient donc au Logbook daté du jour de la
+#     restauration, pas de sa fin réelle. Non fermé, déclaré. Rejeu :
+#              osascript -e 'tell application "Things3" to set status of
+#              project id "<uuid>" to completed' / `… to open` / `… to
+#              completed`, et entre chaque : sqlite3 "file:<base>?mode=ro"
+#              "select status, stopDate from TMTask where uuid='<uuid>'"
+#   - Échec de la RESTAURATION (rework TOOL-457) : script de la sonde
+#     `ZZ-probe-tool457-rework-c` (annulée) rejoué avec `delete p` remplacé
+#     par `error "…"` ET l'uuid de la restauration remplacé par un uuid
+#     inexistant -> rc=1, « suppression échouée ET restauration échouée —
+#     projet LAISSÉ OUVERT (statut d'origine : canceled) ; suppression : … ;
+#     restauration : Erreur dans Things3 : Il est impossible de régler
+#     project id "…" à canceled. THINGSKIT_PROJECT_LEFT_OPEN », et
+#     `status=0, trashed=0` relu en base — le projet est bien resté ouvert,
+#     et c'est la seule ligne qui le dit. Le `error` levé DANS le `on error`
+#     imbriqué sort du `try` extérieur sans être repris (mesuré : c'est le
+#     message imbriqué que rend osascript, pas celui du chemin « restauré »).
+#     Même script avec la restauration intacte (sonde b, terminée) -> rc=1,
+#     « statut d'origine restauré », `status=3, trashed=0`.
 # ---------------------------------------------------------------------------
 
 _DELETE_NOT_TRIED = "La suppression n'est jamais tentée sur une cible non résolue."
@@ -4060,6 +4138,15 @@ _DP_OPEN, _DP_CHANGED, _DP_DELETED, _DP_ERROR = "ouvertes", "change", "supprimé
 _DP_OPEN_TAG = "OPEN:"
 _DP_CHANGED_TAG = "CHANGED:"
 _DP_DELETED_TAG = "DELETED:"
+# Marqueur que le script AJOUTE à son erreur quand la restauration du statut
+# d'origine a échoué APRÈS un `delete` échoué : le projet est alors laissé
+# OUVERT, et c'est la seule ligne qui le dit. Même motif que
+# `_CLIPBOARD_NOT_RESTORED_MARKER` : le script l'écrit, Python le traduit.
+_PROJECT_LEFT_OPEN_MARKER = "THINGSKIT_PROJECT_LEFT_OPEN"
+_PROJECT_LEFT_OPEN_NOTE = (
+    "la suppression a échoué ET la restauration du statut d'origine a échoué "
+    "à son tour : le projet est LAISSÉ OUVERT (sorti du Logbook). Le remettre "
+    "à la main dans Things, au statut d'origine nommé dans le détail")
 
 
 
@@ -4094,7 +4181,44 @@ def _build_delete_project_script(project_id: str,
             f'"{_DP_CHANGED_TAG}" & joined',
             'end repeat',
         ]
-    lines += ['delete p', f'return "{_DP_DELETED_TAG}" & joined', 'end tell']
+    # TOOL-457 — un projet TERMINÉ ou ANNULÉ rangé au Logbook ne se laisse
+    # pas supprimer tel quel (`delete p` → -1728, mesuré le 2026-09-15) ;
+    # rouvert dans le MÊME acte, il se supprime. La réouverture vient APRÈS
+    # les gardes ci-dessus — un projet non vide n'est jamais rouvert — et si
+    # le `delete` échoue ensuite, le statut d'origine est restauré dans le
+    # même script, qui rend alors l'erreur au lieu de l'avaler.
+    #
+    # Si la restauration échoue À SON TOUR, le projet reste ouvert : le `on
+    # error` imbriqué lève alors une erreur qui porte LES DEUX messages, le
+    # statut d'origine nommé et `_PROJECT_LEFT_OPEN_MARKER` — sans quoi
+    # l'erreur de restauration remplacerait celle du `delete` et rien ne
+    # dirait que le projet est laissé ouvert. Le nom du statut est fixé ICI,
+    # par comparaison aux constantes de l'énumération : `origStatus as text`
+    # n'est pas une coercition sûre d'un énumérateur, et une erreur de
+    # coercition DANS le gestionnaire remplacerait tout le message.
+    lines += [
+        'set origStatus to status of p',
+        'set origName to "open"',
+        'if origStatus is completed then set origName to "completed"',
+        'if origStatus is canceled then set origName to "canceled"',
+        'if origStatus is not open then set status of p to open',
+        'try',
+        'delete p',
+        'on error m',
+        'if origStatus is not open then',
+        'try',
+        f'set status of (project id "{_esc(project_id)}") to origStatus',
+        'on error m2',
+        'error "suppression échouée ET restauration échouée — projet LAISSÉ '
+        'OUVERT (statut d\'origine : " & origName & ") ; suppression : " & m '
+        f'& " ; restauration : " & m2 & " {_esc(_PROJECT_LEFT_OPEN_MARKER)}"',
+        'end try',
+        'end if',
+        'error "suppression échouée, statut d\'origine restauré — " & m',
+        'end try',
+        f'return "{_DP_DELETED_TAG}" & joined',
+        'end tell',
+    ]
     return "\n".join(lines)
 
 
@@ -4169,9 +4293,14 @@ def cmd_delete_project(a) -> int:
     verdict, ids = _interpret_delete_project_outcome(rc, out)
 
     if verdict == _DP_ERROR:
+        # Le marqueur est la seule trace de ce chemin : la sortie d'`osascript`
+        # est une valeur non contrôlée, donc la note est un texte FIXE et le
+        # détail est cité (`!r`, borné), jamais rejoué tel quel.
+        detail = (_PROJECT_LEFT_OPEN_NOTE if _PROJECT_LEFT_OPEN_MARKER in out
+                  else "l'acte n'a rendu aucun verdict exploitable")
         print(f"ÉCHEC suppression projet {title!r} ({_rendered(project_id)}) : "
-              f"l'acte n'a rendu aucun verdict exploitable — code retour = "
-              f"échec, pas 'commande envoyée'. {out!r}", file=sys.stderr)
+              f"{detail} — code retour = échec, pas 'commande envoyée'. "
+              f"{out!r}", file=sys.stderr)
         return 1
 
     if verdict == _DP_OPEN:

@@ -133,6 +133,12 @@ round-trip counts the open tasks and deletes, so a task created between a
 check and the deletion cannot be swept away unnoticed. `--delete-open-tasks`
 does not disarm the guard: it first prints what will disappear, then
 requires that exact set to still be there at the moment of deletion.
+A completed or canceled project (in the Logbook) cannot be deleted as is —
+Things answers -1728 — so the same script reopens it right before the
+`delete`, after the guards above. If the `delete` then fails, the script
+restores the original status in the same act; if that restoration fails
+too, the error names both failures and says the project was **left open**,
+with its original status, so it can be put back by hand.
 
 Every subcommand documents its exact behavior (and the observed Things
 behavior it was measured against) in the docstring at the top of
