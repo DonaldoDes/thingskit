@@ -59,6 +59,11 @@ CREATE TABLE TMTask (
 """
 
 TARGET = "AAAAAAAAAAAAAAAAAAAAAA"
+# Cible de `delete-project`, qui ne vise QUE des projets (`type=1`) : la
+# doublure d'`osa` rend le verdict de suppression du script, sans quoi la
+# commande s'arrêterait avant la boucle d'attente — et l'épreuve porterait
+# sur autre chose que ce qu'elle annonce.
+PROJECT_TARGET = "BBBBBBBBBBBBBBBBBBBBBB"
 
 
 
@@ -387,7 +392,10 @@ def _rig(thingskit, monkeypatch, tmp_path, rows):
     db_file = _make_db(tmp_path, rows)
     monkeypatch.setattr(thingskit, "db_path", lambda: db_file)
     monkeypatch.setattr(thingskit, "ensure_running", lambda: None)
-    monkeypatch.setattr(thingskit, "osa", lambda script: (0, ""))
+    # « DELETED: » est le verdict que `delete-project` attend de son script ;
+    # les autres commandes ne lisent `out` que pour composer un message
+    # d'échec, cette valeur leur est indifférente.
+    monkeypatch.setattr(thingskit, "osa", lambda script: (0, "DELETED:"))
     monkeypatch.setattr(thingskit, "time", Clock())
     return db_file
 
@@ -398,6 +406,9 @@ WRITE_CASES = {
     "rename-task": lambda t: t.cmd_rename_task(
         argparse.Namespace(id=TARGET, title=None, new_title="Nouveau")),
     "delete-task": lambda t: t.cmd_delete_task(argparse.Namespace(id=TARGET, title=None)),
+    "delete-project": lambda t: t.cmd_delete_project(
+        argparse.Namespace(project=None, project_id=PROJECT_TARGET,
+                           delete_open_tasks=False)),
     "set-notes": lambda t: t.cmd_set_notes(
         argparse.Namespace(project=None, project_id=None, task=None,
                            task_id=TARGET, notes="du texte")),
@@ -408,7 +419,8 @@ WRITE_CASES = {
 def test_every_write_command_still_fails_when_its_effect_is_never_observed(
         name, thingskit, monkeypatch, tmp_path, capsys):
     _rig(thingskit, monkeypatch, tmp_path,
-         [{"uuid": TARGET, "title": "Cible", "type": 0}])
+         [{"uuid": TARGET, "title": "Cible", "type": 0},
+          {"uuid": PROJECT_TARGET, "title": "Projet cible", "type": 1}])
 
     rc = WRITE_CASES[name](thingskit)
 
@@ -920,9 +932,11 @@ _APP_CONSTANTS = frozenset({"OPEN", "OSASCRIPT"})
 #      elle, la résolution naïve ne produit STRICTEMENT AUCUN symptôme,
 #      dans aucune des deux résolutions du parametrize.
 #
-# Planchers réels mesurés par la commande ci-dessus : 15 (`_MIN_REACHING`)
-# et 16 (`_MIN_FAILURE_BRANCHES`, mesurée par `_rereads_in_failure_branch()[1]`).
-_MIN_REACHING = 15
+# Planchers réels mesurés par la commande ci-dessus : 16 (`_MIN_REACHING`)
+# et 17 (`_MIN_FAILURE_BRANCHES`, mesurée par `_rereads_in_failure_branch()[1]`).
+# Relevés de 15/16 à 16/17 le 2026-09-14, `cmd_delete_project` ajoutant une
+# seizième fonction qui sollicite l'application (delete-project).
+_MIN_REACHING = 16
 
 
 def _module_functions(tree):
@@ -1080,7 +1094,7 @@ def _source_without(function_name, source=None):
 
 @pytest.mark.parametrize("disappeared",
                          ["cmd_move_task", "cmd_create_heading", "cmd_move_project",
-                          "cmd_reopen_task"])
+                          "cmd_reopen_task", "cmd_delete_project"])
 def test_the_derivation_floor_notices_a_command_that_disappeared(disappeared):
     """Le plancher n'a de valeur que s'il est SERRÉ : à une marge près, la
     disparition d'une commande d'écriture passait sous le seuil sans rien
@@ -1271,8 +1285,8 @@ def _rereads_in_failure_branch(source=None):
 #      chance : un cas paramétré sur quatre continue de crier, quelle que
 #      soit la résolution du parametrize (cf. point 1 du bloc ci-dessus).
 #
-# Planchers réels : 15 (`_MIN_REACHING`) et 16 (`_MIN_FAILURE_BRANCHES`).
-_MIN_FAILURE_BRANCHES = 16
+# Planchers réels : 16 (`_MIN_REACHING`) et 17 (`_MIN_FAILURE_BRANCHES`).
+_MIN_FAILURE_BRANCHES = 17
 
 
 def test_no_failure_branch_asks_the_database_again_what_the_probe_observed():

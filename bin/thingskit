@@ -179,6 +179,31 @@ de l'application au premier plan.
 Le schéma d'URL ne sait pas SUPPRIMER sans jeton d'authentification (réglages
 Things). Les suppressions passent donc par AppleScript, qui n'en demande pas.
 
+Supprimer un PROJET — constaté le 2026-09-14 sur deux projets jetables réels
+(`ZZ-probe-delete-project`, `ZZ-probe-guard`), pas déduit de la documentation :
+
+    delete project id "<uuid>"      pose `trashed=1` sur la ligne du projet
+                                    (`TMTask`, `type=1`), qui SUBSISTE — c'est
+                                    la Corbeille, récupérable par « Put Back »
+    project id "<uuid absent>"      erreur AppleScript -1728
+    project id "<uuid d'une tâche>" erreur AppleScript -1728 — l'acte refuse
+                                    donc de lui-même une cible qui n'est pas
+                                    un projet, ou qui a disparu entre la
+                                    résolution en base et le geste
+    to dos of p                     compte AUSSI les tâches terminées (2 sur
+                                    le projet de sonde) ; seule la forme
+                                    `to dos of p whose status is open` isole
+                                    les tâches ouvertes
+
+    Les tâches d'un projet supprimé ne sont PAS marquées `trashed` en base
+    (mesuré : `trashed=0` après coup) et deviennent pourtant INATTEIGNABLES
+    par AppleScript (`delete to do id "<uuid>"` -> -1728). Elles disparaissent
+    de l'application tout en restant visibles de `thingskit tasks`, qui lit la
+    base. Supprimer un projet portant des tâches ouvertes les échoue donc en
+    silence, sans plus aucun recours par le CLI : c'est ce constat, et lui
+    seul, qui justifie le refus de `delete-project` et le fait qu'il soit
+    porté par le script — pas par un contrôle qui le précéderait.
+
 Délai d'enregistrement d'une écriture — MESURÉ le 2026-08-25 (Mac Studio,
 Things 3.23), par sondage de `main.sqlite` toutes les 25 ms jusqu'à constat,
 plafond 10 s, sur 10 tâches jetables :
@@ -240,6 +265,8 @@ Usage
     thingskit move-task [--id UUID] [--title TITRE]
                         --to-project TITRE [--to-heading H] | --to-area NOM
     thingskit move-project --project TITRE|--project-id UUID --area NOM
+    thingskit delete-project --project TITRE|--project-id UUID
+                             [--delete-open-tasks]
     thingskit deeplink --type project|area|task --title TITRE
 
 Toutes les sous-commandes de lecture acceptent `--json`. Les sous-commandes
@@ -3598,61 +3625,87 @@ def cmd_move_task(a) -> int:
 # structure les projets qu'à l'intérieur d'une area.
 # ---------------------------------------------------------------------------
 
-def _resolve_project_target(a, action_suffix: str) -> tuple[str | None, str | None, str | None]:
-    """Résout le projet à déplacer, par `--project-id` (voie sûre) ou
-    `--project` (titre exact, refuse sur 0 ou 2+ correspondances). Retourne
-    (uuid, title, err). Refuse explicitement une cible qui n'est pas un
-    projet (tâche, heading) plutôt que de laisser `to do id` résoudre un
-    autre type d'objet en silence."""
+# Formulations par défaut du résolveur ci-dessous — celles de `move-project`,
+# qui fut son unique appelant. Elles sont PARAMÈTRES et non littéraux depuis
+# l'ajout de `delete-project` : deux copies du résolveur auraient divergé, et
+# un message qui parle de déplacement au milieu d'un refus de suppression
+# décrit un geste qui n'a pas eu lieu.
+_MOVE_NOT_TRIED = "Le déplacement n'est jamais tenté sur une cible non résolue."
+_MOVE_ONLY_PROJECTS = "move-project ne déplace que des projets."
+_MOVE_RESTORE_FIRST = "le restaurer ('Put Back') avant de le déplacer"
+
+
+def _resolve_project_target(a, action_suffix: str, *,
+                            not_tried: str = _MOVE_NOT_TRIED,
+                            only_projects: str = _MOVE_ONLY_PROJECTS,
+                            restore_first: str = _MOVE_RESTORE_FIRST,
+                            allow_trashed: bool = False,
+                            ) -> tuple[str | None, str | None, int | None, str | None]:
+    """Résout le projet visé, par `--project-id` (voie sûre) ou `--project`
+    (titre exact, refuse sur 0 ou 2+ correspondances). Retourne
+    (uuid, title, trashed, err). Refuse explicitement une cible qui n'est pas
+    un projet (tâche, heading) plutôt que de laisser `to do id` résoudre un
+    autre type d'objet en silence.
+
+    `allow_trashed` rend la Corbeille à l'appelant au lieu de la refuser :
+    un projet déjà jeté n'a pas de sens à déplacer, mais il en a un à
+    supprimer — c'est alors une IDEMPOTENCE (le but est déjà atteint), pas
+    une erreur, même partage que `delete-task`.
+    """
     project_id = getattr(a, "project_id", None)
     title_arg = getattr(a, "project", None)
 
     if not project_id and not title_arg:
-        return None, None, (f"erreur : --project ou --project-id requis, "
-                            f"{action_suffix}")
+        return None, None, None, (f"erreur : --project ou --project-id requis, "
+                                  f"{action_suffix}")
     if project_id and title_arg:
-        return None, None, (f"erreur : --project et --project-id sont "
-                            f"exclusifs, {action_suffix}")
+        return None, None, None, (f"erreur : --project et --project-id sont "
+                                  f"exclusifs, {action_suffix}")
 
     if project_id:
         if not _TASK_ID_RE.match(project_id):
-            return None, None, f"uuid malformé : {project_id!r}, {action_suffix}"
+            return None, None, None, (f"uuid malformé : {project_id!r}, "
+                                      f"{action_suffix}")
         rows = q("select title, type, trashed from TMTask where uuid=?",
                  (project_id,))
         if not rows:
-            return None, None, (f"introuvable : projet uuid={project_id!r} — "
-                                f"{action_suffix}. Le déplacement n'est jamais "
-                                f"tenté sur une cible non résolue.")
+            return None, None, None, (f"introuvable : projet uuid={project_id!r} — "
+                                      f"{action_suffix}. {not_tried}")
         title, kind, trashed = rows[0]
         if kind != TYPE_PROJECT:
             kind_label = _rendered(
                 {TYPE_TASK: "une tâche", TYPE_HEADING: "un heading"}.get(
                     kind, f"type={_rendered(kind)}"))
-            return None, None, (f"n'est pas un projet : {title!r} "
-                                f"({_rendered(project_id)}) est {kind_label} — "
-                                f"move-project ne déplace que des projets. "
-                                f"{action_suffix}")
+            return None, None, None, (f"n'est pas un projet : {title!r} "
+                                      f"({_rendered(project_id)}) est {kind_label} — "
+                                      f"{only_projects} {action_suffix}")
     else:
         rows = q("select uuid from TMTask where title=? and type=? and trashed=0",
                  (title_arg, TYPE_PROJECT))
         if not rows:
-            return None, None, (f"projet introuvable : {title_arg!r} — "
-                                f"{action_suffix}. Le déplacement n'est jamais "
-                                f"tenté sur une cible non résolue.")
+            return None, None, None, (f"projet introuvable : {title_arg!r} — "
+                                      f"{action_suffix}. {not_tried}")
         if len(rows) > 1:
-            return None, None, (f"AMBIGU : {len(rows)} projets nommés "
-                                f"{title_arg!r} — {action_suffix}")
+            # Le compte seul laissait l'utilisateur sans issue : il apprenait
+            # qu'il y avait ambiguïté sans obtenir de quoi la lever. Les
+            # identifiants sont la SEULE désignation non ambiguë — c'est par
+            # eux qu'il relance, via `--project-id`.
+            candidats = "".join(f"\n  - {_rendered(r[0])}" for r in rows)
+            return None, None, None, (f"AMBIGU : {len(rows)} projets nommés "
+                                      f"{title_arg!r} — {action_suffix}. "
+                                      f"Relancer avec --project-id, parmi :"
+                                      f"{candidats}")
         project_id = rows[0][0]
         title2 = q("select title, trashed from TMTask where uuid=?", (project_id,))
         title, trashed = title2[0]
 
-    if trashed:
-        return None, None, (f"à la Corbeille Things : {title!r} ({_rendered(project_id)}) — "
-                            f"le restaurer ('Put Back') avant de le déplacer : "
-                            f"un objet jeté n'apparaît dans aucune liste et "
-                            f"disparaît au vidage. {action_suffix}")
+    if trashed and not allow_trashed:
+        return None, None, None, (f"à la Corbeille Things : {title!r} "
+                                  f"({_rendered(project_id)}) — {restore_first} : "
+                                  f"un objet jeté n'apparaît dans aucune liste et "
+                                  f"disparaît au vidage. {action_suffix}")
 
-    return project_id, title, None
+    return project_id, title, trashed, None
 
 
 def cmd_move_project(a) -> int:
@@ -3667,7 +3720,7 @@ def cmd_move_project(a) -> int:
     """
     action_suffix = "aucun déplacement effectué"
 
-    project_id, title, err = _resolve_project_target(a, action_suffix)
+    project_id, title, _trashed, err = _resolve_project_target(a, action_suffix)
     if err:
         print(err, file=sys.stderr)
         return 1
@@ -3750,6 +3803,229 @@ def cmd_move_project(a) -> int:
     print(f"projet déplacé : {title!r} ({_rendered(project_id)}) → area {area_title!r}")
     return 0
 
+
+
+# ---------------------------------------------------------------------------
+# delete-project — suppression d'un projet, et REFUS rendu par l'acte.
+#
+# Surface mesurée le 2026-09-14 sur deux projets jetables réels
+# (`ZZ-probe-delete-project`, `ZZ-probe-guard`), jamais déduite de la
+# documentation :
+#
+#   - `delete project id "<uuid>"` pose `trashed=1` sur la ligne du projet
+#     (`TMTask`, `type=1`), qui SUBSISTE : c'est la Corbeille Things,
+#     récupérable par « Put Back » — même nature que `delete-task`.
+#   - `project id "<uuid>"` rend l'erreur -1728 quand l'uuid n'existe pas OU
+#     ne désigne pas un projet (mesuré sur l'uuid d'une tâche). L'acte refuse
+#     donc de lui-même une cible disparue entre la résolution et le geste :
+#     c'est ce qui permet de ne PAS s'appuyer sur un contrôle préalable.
+#   - `to dos of p` compte AUSSI les tâches terminées ; seule
+#     `to dos of p whose status is open` porte la condition de refus.
+#
+# POURQUOI un refus, et pas un simple avertissement — c'est le constat qui
+# gouverne toute la conception de cette commande : les tâches d'un projet
+# supprimé ne sont PAS marquées `trashed` en base (mesuré : `trashed=0`
+# après coup), et deviennent pourtant inatteignables par AppleScript
+# (`delete to do id "<uuid>"` → -1728). Elles disparaissent de
+# l'application tout en restant visibles de `thingskit tasks`, qui lit la
+# base. Supprimer un projet portant des tâches ouvertes les échoue donc en
+# silence, sans plus aucun recours par le CLI. Mesuré sur deux tâches de
+# sonde, qui sont restées dans cet état.
+#
+# La condition est portée PAR LE SCRIPT, pas par un contrôle Python qui le
+# précéderait (règle 14 : la condition d'un acte irréversible se réévalue
+# dans l'acte). Le même aller-retour compte les tâches ouvertes et supprime,
+# et il refuse de lui-même : entre un constat séparé et le geste, une tâche
+# peut naître, et le geste s'appuierait sur un état qui n'est plus.
+# ---------------------------------------------------------------------------
+
+_DELETE_NOT_TRIED = "La suppression n'est jamais tentée sur une cible non résolue."
+_DELETE_ONLY_PROJECTS = "delete-project ne supprime que des projets."
+
+# Verdicts que l'acte peut rendre. Ils viennent du SCRIPT, jamais d'une
+# lecture de la base : c'est ce qui fait d'eux une réévaluation.
+_DP_OPEN, _DP_CHANGED, _DP_DELETED, _DP_ERROR = "ouvertes", "change", "supprimé", "erreur"
+# Étiquettes de la réponse du script. Elles vivent en constantes parce que le
+# script les ÉCRIT et que l'interprétation les LIT : deux littéraux non liés
+# divergeraient au premier renommage, et le verdict deviendrait muet.
+_DP_OPEN_TAG = "OPEN:"
+_DP_CHANGED_TAG = "CHANGED:"
+_DP_DELETED_TAG = "DELETED:"
+
+
+
+def _build_delete_project_script(project_id: str,
+                                 expected: list[str] | None) -> str:
+    """Le script qui compte ET supprime, dans le même acte.
+
+    `expected is None` — la garde ordinaire : il refuse dès qu'une tâche
+    ouverte subsiste, et ne supprime pas.
+
+    `expected` non nul — le passage outre, qui n'est PAS un désarmement : le
+    script exige de retrouver EXACTEMENT le jeu de tâches ouvertes qui a été
+    annoncé à l'utilisateur, et refuse sinon. Une tâche ouverte apparue entre
+    l'annonce et le geste n'a été consentie par personne.
+    """
+    lines = ['tell application "Things3"',
+             f'set p to project id "{_esc(project_id)}"',
+             'set ids to id of (to dos of p whose status is open)',
+             'set AppleScript\'s text item delimiters to ","',
+             'set joined to ids as text',
+             'set AppleScript\'s text item delimiters to ""']
+    if expected is None:
+        lines.append(f'if (count ids) > 0 then return "{_DP_OPEN_TAG}" & joined')
+    else:
+        literal = ", ".join(f'"{_esc(x)}"' for x in expected)
+        lines += [
+            f'set attendu to {{{literal}}}',
+            f'if (count ids) is not (count attendu) then return '
+            f'"{_DP_CHANGED_TAG}" & joined',
+            'repeat with e in attendu',
+            f'if ids does not contain (e as text) then return '
+            f'"{_DP_CHANGED_TAG}" & joined',
+            'end repeat',
+        ]
+    lines += ['delete p', f'return "{_DP_DELETED_TAG}" & joined', 'end tell']
+    return "\n".join(lines)
+
+
+def _interpret_delete_project_outcome(rc: int, out: str) -> tuple[str, list[str]]:
+    """(verdict, identifiants des tâches ouvertes vues PAR L'ACTE).
+
+    Tout ce qui n'est pas une des trois réponses attendues est une erreur —
+    jamais un succès par défaut. Les identifiants sont opposés à la même
+    forme que partout ailleurs : une charge utile venue d'`osascript` est une
+    valeur non contrôlée, et la structure se vérifie avant de s'en servir.
+    """
+    if rc != 0:
+        return _DP_ERROR, []
+    for tag, verdict in ((_DP_OPEN_TAG, _DP_OPEN),
+                         (_DP_CHANGED_TAG, _DP_CHANGED),
+                         (_DP_DELETED_TAG, _DP_DELETED)):
+        if out.startswith(tag):
+            ids = [x for x in out[len(tag):].strip().split(",") if x]
+            if any(not _TASK_ID_RE.match(x) for x in ids):
+                return _DP_ERROR, []
+            return verdict, ids
+    return _DP_ERROR, []
+
+
+def _open_task_labels(ids: list[str]) -> list[tuple[str, str]]:
+    """Les titres des tâches que l'ACTE a nommées, pour le seul affichage.
+
+    L'autorité reste au script : la base ne fournit ici qu'un libellé, et
+    quand elle n'en a pas, la ligne le dit au lieu de taire l'identifiant.
+    """
+    labels = []
+    for tid in ids:
+        rows = q("select title from TMTask where uuid=?", (tid,))
+        title = rows[0][0] if rows and rows[0][0] is not None else None
+        labels.append((tid, title if title is not None else "(titre inconnu en base)"))
+    return labels
+
+
+def _print_open_tasks(ids: list[str], stream) -> None:
+    for tid, label in _open_task_labels(ids):
+        print(f"  - {_rendered(label)} ({_rendered(tid)})", file=stream)
+
+
+def cmd_delete_project(a) -> int:
+    """Supprime un projet — déplacement vers la Corbeille Things, récupérable
+    par « Put Back », pas une destruction définitive (mesuré, cf. le bloc
+    ci-dessus).
+
+    Refuse tant que le projet porte des tâches OUVERTES, et ce refus est
+    rendu par l'acte lui-même. `--delete-open-tasks` ne saute pas la
+    condition : il annonce d'abord ce qui disparaîtra, puis exige de le
+    retrouver à l'identique au moment du geste.
+    """
+    action_suffix = "aucune suppression effectuée"
+
+    project_id, title, trashed, err = _resolve_project_target(
+        a, action_suffix, not_tried=_DELETE_NOT_TRIED,
+        only_projects=_DELETE_ONLY_PROJECTS, allow_trashed=True)
+    if err:
+        print(err, file=sys.stderr)
+        return 1
+
+    # Idempotence par vérification PRÉALABLE (constitution § Conventions) :
+    # le but est DÉJÀ atteint, l'application n'est pas sollicitée. Même
+    # contrat que `delete-task` sur une tâche déjà jetée.
+    if trashed:
+        print(f"déjà à la Corbeille Things : {title!r} ({_rendered(project_id)})")
+        return 0
+
+    ensure_running()
+    rc, out = osa(_build_delete_project_script(project_id, None))
+    verdict, ids = _interpret_delete_project_outcome(rc, out)
+
+    if verdict == _DP_ERROR:
+        print(f"ÉCHEC suppression projet {title!r} ({_rendered(project_id)}) : "
+              f"l'acte n'a rendu aucun verdict exploitable — code retour = "
+              f"échec, pas 'commande envoyée'. {out!r}", file=sys.stderr)
+        return 1
+
+    if verdict == _DP_OPEN:
+        if not getattr(a, "delete_open_tasks", False):
+            print(f"REFUS : {title!r} ({_rendered(project_id)}) porte encore "
+                  f"{len(ids)} tâche(s) ouverte(s) — {action_suffix}.",
+                  file=sys.stderr)
+            _print_open_tasks(ids, sys.stderr)
+            print("Supprimer le projet les EMPORTE : mesuré le 2026-09-14, "
+                  "elles deviennent inatteignables par le CLI comme par "
+                  "l'application, sans plus aucun recours. Les traiter "
+                  "d'abord, ou relancer avec --delete-open-tasks pour les "
+                  "emporter délibérément.", file=sys.stderr)
+            return 1
+
+        # Le passage outre annonce AVANT d'agir, et ce qu'il annonce est ce
+        # que l'acte vient d'observer — pas ce que la base en disait.
+        print(f"va disparaître avec {title!r} ({_rendered(project_id)}) : "
+              f"{len(ids)} tâche(s) ouverte(s)")
+        _print_open_tasks(ids, sys.stdout)
+        rc, out = osa(_build_delete_project_script(project_id, ids))
+        verdict, ids = _interpret_delete_project_outcome(rc, out)
+
+    if verdict != _DP_DELETED:
+        detail = ("le jeu de tâches ouvertes a changé entre l'annonce et le "
+                  "geste — rien n'a été supprimé"
+                  if verdict == _DP_CHANGED
+                  else "l'acte n'a rendu aucun verdict exploitable")
+        print(f"ÉCHEC suppression projet {title!r} ({_rendered(project_id)}) : "
+              f"{detail} — code retour = échec, pas 'commande envoyée'. "
+              f"{out!r}", file=sys.stderr)
+        return 1
+
+    # La sonde capture par fermeture ce qu'elle observe : la branche d'échec
+    # cite cette observation, elle ne redemande rien à la base (même motif
+    # que `cmd_move_project`).
+    seen: dict[str, str | None] = {"problem": None}
+
+    def _problem() -> str | None:
+        rows = q("select trashed from TMTask where uuid=? and type=?",
+                 (project_id, TYPE_PROJECT))
+        if not rows:
+            return "ligne du projet introuvable après l'opération"
+        if rows[0][0] != 1:
+            return "toujours hors Corbeille en base (trashed=0)"
+        return None
+
+    def _in_trash() -> bool:
+        seen["problem"] = _problem()
+        return seen["problem"] is None
+
+    if not wait_for_effect(_in_trash):
+        observed = seen["problem"] or _NO_OBSERVATION
+        print(f"ÉCHEC suppression projet {title!r} ({_rendered(project_id)}) : "
+              f"{observed} — code retour = échec, pas 'commande envoyée'. "
+              f"{out!r}", file=sys.stderr)
+        return 1
+
+    emportees = (f", {len(ids)} tâche(s) ouverte(s) emportée(s)" if ids else "")
+    print(f"projet déplacé vers la Corbeille Things (récupérable, pas de "
+          f"destruction définitive) : {title!r} ({_rendered(project_id)})"
+          f"{emportees}")
+    return 0
 
 def cmd_delete_task(a) -> int:
     """Supprime une tâche — constaté par test le 2026-08-12 : `delete to do id`
@@ -4088,6 +4364,36 @@ def main() -> int:
     g.add_argument("--project-id", help="identifiant Things du projet "
                                         "(voie sûre, sans ambiguïté possible)")
     s.add_argument("--area", required=True, help="titre exact de l'area cible")
+
+    s = add("delete-project", cmd_delete_project,
+            description="Supprime un projet (déplacement vers la Corbeille "
+                        "Things, récupérable par 'Put Back' — pas une "
+                        "destruction définitive). REFUSE tant que le projet "
+                        "porte des tâches OUVERTES, et ce refus est rendu "
+                        "par l'acte lui-même : le même aller-retour compte "
+                        "les tâches ouvertes et supprime, si bien qu'aucune "
+                        "tâche née entre le constat et le geste ne peut "
+                        "être emportée à l'insu de l'utilisateur. Motif du "
+                        "refus, mesuré le 2026-09-14 : les tâches d'un "
+                        "projet supprimé deviennent inatteignables par le "
+                        "CLI comme par l'application, sans aucun recours. "
+                        "Refuse toute résolution par titre ambiguë ou nulle "
+                        "(et liste alors les candidats), et une cible qui "
+                        "n'est pas un projet. Idempotent : un projet déjà à "
+                        "la Corbeille sort en succès sans solliciter "
+                        "l'application. Ne sort en succès que si la mise à "
+                        "la Corbeille est constatée en base après coup.")
+    g = s.add_mutually_exclusive_group(required=True)
+    g.add_argument("--project", help="titre exact du projet ; refuse si 0 "
+                                     "ou 2+ correspondances")
+    g.add_argument("--project-id", help="identifiant Things du projet "
+                                        "(voie sûre, sans ambiguïté possible)")
+    s.add_argument("--delete-open-tasks", action="store_true",
+                   help="emporte DÉLIBÉRÉMENT les tâches ouvertes du projet. "
+                        "Rien ne l'active par défaut. N'annule pas la "
+                        "réévaluation : la commande annonce d'abord ce qui "
+                        "va disparaître, puis exige de retrouver exactement "
+                        "ce jeu au moment de supprimer — sinon elle refuse.")
 
     def add_notes_target(parser):
         """`--project` / `--task` / `--task-id` : exclusifs, et l'un des trois
