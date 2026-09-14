@@ -59,7 +59,7 @@ redevient obligatoire.
 - **Écriture = la surface la moins invasive qui fonctionne**, par ordre de
   préférence : schéma d'URL JSON (`create-project`, `add-task`) >
   AppleScript ciblé (`create-area`, `set-notes`, `append-notes`, `delete-task`,
-  `complete-task`, `reschedule-task`) > automatisation d'interface (`create-heading`, en dernier
+  `delete-project`, `complete-task`, `reschedule-task`) > automatisation d'interface (`create-heading`, en dernier
   recours, quand aucune des deux premières ne couvre le besoin). Le choix se
   fait sur ce que la surface expose réellement, constaté sur pièce :
   `complete-task` reste en AppleScript ciblé parce que `sdef
@@ -100,9 +100,9 @@ redevient obligatoire.
   gère ses propres erreurs et imprime sur `stderr`.
 - **Écriture = vérification obligatoire après action, jamais avant.** Toute
   sous-commande d'écriture (`create-area`, `create-project`, `add-task`,
-  `set-notes`, `append-notes`, `delete-task`, `create-heading`,
-  `complete-task`, `cancel-task`, `reopen-task`, `rename-task`,
-  `reschedule-task`, `move-task`, `move-project`) relit la
+  `set-notes`, `append-notes`, `delete-task`, `delete-project`,
+  `create-heading`, `complete-task`, `cancel-task`, `reopen-task`,
+  `rename-task`, `reschedule-task`, `move-task`, `move-project`) relit la
   base après avoir
   déclenché l'action, et ne retourne `0` que si l'effet est **constaté**.
   Cette énumération se tenait à la main et avait dérivé : quatre commandes
@@ -218,7 +218,11 @@ redevient obligatoire.
   changements d'état : `complete-task` sur une tâche déjà terminée, comme
   `delete-task` sur une tâche déjà à la Corbeille, sort en `0` en le
   signalant, **sans solliciter l'application** — l'absence d'appel est
-  testée, pas seulement le code retour.
+  testée, pas seulement le code retour. `delete-project` suit le même
+  partage sur un projet déjà jeté, et c'est la seule raison pour laquelle
+  son résolveur accepte la Corbeille là où `move-project` la refuse : un
+  objet jeté n'a pas de sens à déplacer, il en a un à supprimer — le but
+  est déjà atteint.
 
   **Sur `move-project`, cette règle n'est pas un confort : c'est le seul
   endroit d'où le défaut est arrêtable.** Un projet DÉJÀ dans l'area visée
@@ -1179,6 +1183,35 @@ redevient obligatoire.
   non-régression lancée avec `python3` se préfixe donc de `PYTHON_COLORS=0`,
   ou elle attribue au lot un échec qui est celui de l'environnement.
 
+  Baseline relevée à **1261** le 2026-09-11 avant `delete-project`, **1291**
+  après. L'écart de 30 se décompose, et chaque terme est mesuré : 27 dans le
+  nouveau `tests/test_delete_project.py` ; +2 dans `tests/test_write_wait.py`
+  (59 -> 61), un par contrôle paramétré que l'ajout d'une commande d'écriture
+  oblige à étendre — `WRITE_CASES` et
+  `test_the_derivation_floor_notices_a_command_that_disappeared` ; +1 dans
+  `tests/test_annotations_resolve.py` (37 -> 38), qui balaie les fichiers de
+  test. Les deux planchers de dérivation ont été **remesurés**, jamais
+  additionnés : `_MIN_REACHING` 15 -> 16 et `_MIN_FAILURE_BRANCHES` 16 -> 17,
+  par la commande inscrite au-dessus de chacun. Les commandes :
+
+      .venv/bin/python -m pytest --collect-only -q -p no:cacheprovider | tail -1 -> 1291 tests collected in 0.12s
+      .venv/bin/python -m pytest tests/test_delete_project.py --collect-only -q -p no:cacheprovider | tail -1 -> 27 tests collected
+      .venv/bin/python -m pytest tests/test_write_wait.py --collect-only -q -p no:cacheprovider | tail -1 -> 61 tests collected
+      .venv/bin/python -m pytest -q -p no:cacheprovider -> 1290 passed, 1 skipped in 60.85s (0:01:00)
+
+  **Ce que la doublure d'`osa` doit faire, et que la première version ne
+  faisait pas.** `tests/test_delete_project.py` rejoue l'APPLICATION : c'est
+  elle, et non la base jetable, qui détient les tâches ouvertes au moment de
+  l'acte — sans quoi rien n'établirait que la condition est réévaluée dans le
+  geste plutôt que lue en base avant lui. Sa première version appliquait le
+  contrat qu'elle connaissait d'avance (« s'il y a des tâches ouvertes, je
+  réponds OPEN ») : **mesuré, la garde retirée du script AppleScript, 26 des
+  27 tests restaient verts** — seule l'épreuve textuelle la voyait. Elle LIT
+  désormais les gardes du script et s'y plie ligne à ligne jusqu'au
+  `delete p` ; la même mutation fait tomber 5 tests, dont les trois
+  comportementaux. Une doublure qui vouche pour un contrat que le code
+  n'implémente pas ne teste rien.
+
 ## Zones sensibles
 
 ### 1. Écriture dans la base d'un gestionnaire de tâches personnel
@@ -1195,9 +1228,45 @@ d'URL, AppleScript, automatisation d'interface), jamais par une requête SQL
 `_resolve_project_for_notes`, `cmd_delete_task`, `cmd_create_heading`,
 `cmd_complete_task`, `cmd_cancel_task`, `cmd_reopen_task`,
 `cmd_reschedule_task`, `cmd_rename_task`, `cmd_move_task`,
-`cmd_move_project`. Même dérive que
+`cmd_move_project`, `cmd_delete_project`. Même dérive que
 l'énumération du § Conventions, et même remède : la liste se relit du
 balayage d'AST, elle ne se complète pas de mémoire.
+
+**Cas particulier de `delete-project` — la condition vit DANS l'acte.** Un
+projet supprimé emporte ses tâches, et le constat du 2026-09-14 est plus dur
+que « c'est récupérable » : les lignes des tâches gardent `trashed=0` en base
+et deviennent pourtant inatteignables par AppleScript
+(`delete to do id "<uuid>"` -> -1728). Elles disparaissent de l'application
+tout en restant visibles de `thingskit tasks`. Il n'y a donc **aucun recours
+par le CLI** une fois le geste fait.
+
+La commande refuse en conséquence tant que le projet porte des tâches
+**ouvertes** — et ce refus n'est pas un contrôle Python qui précéderait
+l'appel. C'est le script AppleScript lui-même qui compte les tâches ouvertes
+et qui supprime, dans le MÊME aller-retour : entre un constat séparé et le
+geste, une tâche peut naître, et le geste s'appuierait sur un état qui n'est
+plus (règle 14 du harnais : la condition d'un acte irréversible se réévalue
+dans l'acte, et l'acte doit pouvoir refuser). `project id "<uuid>"` rendant
+-1728 sur une cible absente ou d'un autre type, l'acte refuse de lui-même
+jusqu'à la nature de sa cible.
+
+`--delete-open-tasks` **ne désarme pas** cette garde, et c'est la propriété
+à ne pas perdre au premier refactoring : la commande annonce d'abord le jeu
+exact de tâches ouvertes que l'acte vient d'observer, puis relance un acte
+qui EXIGE de retrouver ce jeu à l'identique et refuse sinon. Une tâche
+ouverte apparue entre l'annonce et le geste n'a été consentie par personne.
+
+**Invariants** :
+- Aucun chemin de `cmd_delete_project` ne supprime sans que le script qu'il
+  envoie porte lui-même la condition. Gardé par `test_delete_project.py` —
+  la doublure d'`osa` LIT les gardes du script au lieu de les présumer, et
+  la mutation qui retire la garde fait tomber 5 tests.
+- Le passage outre n'est jamais déclenché par défaut : sans le drapeau, le
+  script ne porte aucun jeu attendu (`test_the_override_is_never_triggered_
+  by_default`).
+- Un titre ambigu refuse ET liste les identifiants candidats — le compte
+  seul laissait l'utilisateur sans moyen de lever l'ambiguïté. Porté par le
+  résolveur partagé avec `move-project`, qui en bénéficie du même coup.
 
 **Risque** : la base Things est un fichier SQLite non documenté, sans schéma
 officiel publié. Une écriture directe pourrait corrompre l'intégrité
