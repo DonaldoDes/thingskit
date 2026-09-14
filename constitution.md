@@ -1258,6 +1258,41 @@ redevient obligatoire.
       .venv/bin/python -m pytest tests/test_move_task.py --collect-only -q -p no:cacheprovider | tail -1 -> 60 tests collected
       .venv/bin/python -m pytest -q -p no:cacheprovider -> 1311 passed, 1 skipped
 
+  Écart non consigné à sa date, relevé le 2026-09-15 : **1312 -> 1326** entre
+  `ea9783f` et `5ebf064`, par le second lot TOOL-452 (`e70dc5f`, la sonde
+  Inbox lit `start`/`startDate`) — +5 dans `tests/test_add_task.py` (68 -> 73),
+  +9 dans `tests/test_move_task.py` (60 -> 69). Mesuré sur `master` à
+  `5ebf064` :
+
+      .venv/bin/python -m pytest --collect-only -q -p no:cacheprovider | tail -1 -> 1326 tests collected
+      .venv/bin/python -m pytest tests/test_add_task.py --collect-only -q -p no:cacheprovider | tail -1 -> 73 tests collected
+      .venv/bin/python -m pytest tests/test_move_task.py --collect-only -q -p no:cacheprovider | tail -1 -> 69 tests collected
+
+  Baseline relevée à **1326** le 2026-09-15 avant TOOL-457 (`delete-project`
+  rouvre un projet du Logbook dans l'acte), **1334** après le premier lot,
+  **1340** après le rework demandé par les reviews (l'échec de la
+  restauration du statut est nommé). Tout est dans
+  `tests/test_delete_project.py` (27 -> 35 -> 41) : +8 pour la réouverture
+  conditionnelle et sa restauration, +6 pour la restauration qui échoue à son
+  tour (2 paramétrés terminé/annulé, 1 projet déjà ouvert sans fausse
+  alerte, 1 épreuve textuelle du `try` imbriqué, 1 rendu borné d'une sortie
+  hostile, 1 « jamais un verdict de succès »). Les commandes, depuis le
+  worktree avec le `.venv` de l'arbre principal :
+
+      ~/Developer/thingskit/.venv/bin/python -m pytest --collect-only -q -p no:cacheprovider | tail -1 -> 1340 tests collected
+      ~/Developer/thingskit/.venv/bin/python -m pytest tests/test_delete_project.py --collect-only -q -p no:cacheprovider | tail -1 -> 41 tests collected
+      ~/Developer/thingskit/.venv/bin/python -m pytest -q -p no:cacheprovider -> 1339 passed, 1 skipped in 63.02s (0:01:03)
+
+  **Ce que la doublure ne prouve pas, et qui a coûté un tour.** Elle
+  reconnaît les lignes du script par leur forme, elle n'en vérifie pas la
+  syntaxe AppleScript : `st` comme nom de variable a traversé un lot vert
+  avant que la sonde `osascript` ne le rejette (-2741, suffixe ordinal de
+  « 1st »). Toute modification du script généré se prouve par une sonde
+  réelle sur un projet `ZZ-probe-…`, créé et jeté dans le même lot — les
+  trois chemins (nominal, restauration réussie, restauration échouée) l'ont
+  été le 2026-09-15 sur `ZZ-probe-tool457-rework-{a,b,c}`, sortie et
+  requêtes dans le bloc de constats de `cmd_delete_project`.
+
   **Ce que la doublure d'`osa` doit faire, et que la première version ne
   faisait pas.** `tests/test_delete_project.py` rejoue l'APPLICATION : c'est
   elle, et non la base jetable, qui détient les tâches ouvertes au moment de
