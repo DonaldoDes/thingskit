@@ -1013,6 +1013,100 @@ def test_the_bound_leaves_the_parser_own_help_untouched(
     assert "\\x" not in out and "\\n" not in out, out
 
 
+# Deuxième forme du même défaut, constatée le 2026-09-11 (TOOL-444) : à partir
+# de Python 3.14, `argparse` COLORISE son aide et ses erreurs d'usage dès que
+# l'environnement le lui permet (`FORCE_COLOR`, ou un tty). Ce n'est plus une
+# valeur d'argv qui porte l'ESC : c'est le texte du programme lui-même. Pour
+# la zone sensible n° 1 la distinction n'existe pas — la sortie est lue par
+# des agents, et une séquence ESC dedans est un rendu non fiable, d'où qu'elle
+# vienne. Le remède porte sur la SORTIE, pas sur l'assertion ni sur
+# l'environnement : le parseur refuse la couleur à sa construction, et les
+# sous-parseurs, construits par la même classe, la refusent avec lui.
+#
+# Sous 3.12, `argparse` ne colorise jamais : le test y reste vrai, il n'est
+# pas sauté. Sous 3.14 il rougit dès que la classe cesse de refuser.
+# ---------------------------------------------------------------------------
+# Les deux façons dont l'environnement DEMANDE la couleur à `_colorize`
+# (3.14) : `FORCE_COLOR` (n'importe quelle valeur) et `PYTHON_COLORS=1`.
+# `NO_COLOR` est retiré dans les deux cas — c'est lui qui masquait le défaut.
+_COULEUR_DEMANDEE = [
+    pytest.param({"FORCE_COLOR": "3"}, id="FORCE_COLOR"),
+    pytest.param({"PYTHON_COLORS": "1"}, id="PYTHON_COLORS"),
+]
+
+
+def _environnement_qui_demande_la_couleur(monkeypatch, env):
+    for variable in ("FORCE_COLOR", "NO_COLOR", "PYTHON_COLORS"):
+        monkeypatch.delenv(variable, raising=False)
+    for variable, valeur in env.items():
+        monkeypatch.setenv(variable, valeur)
+
+
+@pytest.mark.parametrize("env", _COULEUR_DEMANDEE)
+@pytest.mark.parametrize("argv, flux", [
+    (["thingskit", "--help"], "out"),
+    (["thingskit", "add-task", "--help"], "out"),
+    (["thingskit", "--bidon"], "err"),
+], ids=["aide-racine", "aide-sous-parseur", "erreur-usage"])
+def test_the_parser_never_colours_its_output_whatever_the_environment_asks(
+        thingskit, monkeypatch, capsys, argv, flux, env):
+    _environnement_qui_demande_la_couleur(monkeypatch, env)
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with pytest.raises(SystemExit):
+        thingskit.main()
+
+    sortie = getattr(capsys.readouterr(), flux)
+    assert sortie, "le parseur n'a rien émis sur le flux attendu"
+    assert "\x1b" not in sortie, repr(sortie)
+
+
+# Adversité 1 — le test ci-dessus est une liste d'inclusion (trois argv) : un
+# sous-parseur qu'il ne nomme pas n'est pas vu. Cette garde est calculée sur
+# la forme : elle intercepte TOUTE construction d'`ArgumentParser` pendant
+# `main()` — racine et chaque `add_parser` — et exige que chacune passe par
+# `_BoundedParser` et refuse la couleur. Un sous-parseur ajouté demain est
+# couvert sans qu'on pense à l'inscrire ici.
+def test_every_parser_main_builds_refuses_colour_by_construction(
+        thingskit, monkeypatch, capsys):
+    _environnement_qui_demande_la_couleur(monkeypatch, {"FORCE_COLOR": "3"})
+    constructions = []
+    init_reel = argparse.ArgumentParser.__init__
+
+    def init_espion(self, *args, **kwargs):
+        constructions.append((type(self), kwargs.get("color", "absent")))
+        return init_reel(self, *args, **kwargs)
+
+    monkeypatch.setattr(argparse.ArgumentParser, "__init__", init_espion)
+    monkeypatch.setattr(sys, "argv", ["thingskit", "--help"])
+    with pytest.raises(SystemExit):
+        thingskit.main()
+    capsys.readouterr()
+
+    assert len(constructions) >= 2, constructions  # racine + sous-parseurs
+    attendu = (False if thingskit._BoundedParser._COLOR_KWARG else "absent")
+    fautifs = [(cls.__name__, couleur) for cls, couleur in constructions
+               if cls is not thingskit._BoundedParser or couleur != attendu]
+    assert not fautifs, fautifs
+
+
+# Adversité 2 — un appelant qui DEMANDE la couleur explicitement
+# (`add_parser(name, color=True)`, forme qu'un futur ajout de sous-commande
+# pourrait écrire) n'obtient pas plus que l'environnement : la classe refuse,
+# et refuse de la même façon sous 3.12, où le kwarg n'existe pas — elle
+# l'avale au lieu de laisser argparse lever `TypeError`.
+def test_an_explicit_request_for_colour_is_refused_on_every_interpreter(
+        thingskit, monkeypatch):
+    _environnement_qui_demande_la_couleur(monkeypatch, {"FORCE_COLOR": "3"})
+
+    p = thingskit._BoundedParser(prog="x", color=True)
+    sous = p.add_subparsers(dest="cmd").add_parser("y", color=True)
+
+    assert "\x1b" not in p.format_help(), repr(p.format_help())
+    assert "\x1b" not in sous.format_help(), repr(sous.format_help())
+    assert "\x1b" not in p.format_usage(), repr(p.format_usage())
+
+
 def test_the_bound_escapes_in_place_instead_of_quoting_the_whole_message(
         thingskit):
     """`_bounded` n'est pas `repr` : il échappe caractère par caractère et

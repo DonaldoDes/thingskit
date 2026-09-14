@@ -1174,14 +1174,47 @@ redevient obligatoire.
   intact — `test_an_unrecognised_argument_never_reaches_stderr_raw` et
   `test_the_bound_leaves_the_parser_own_help_untouched`
   (`tests/test_untrusted_rendering.py`) : ils lisent `\x1b[1;34musage:` là
-  où ils attendent `usage:`. Ce n'est pas un défaut du code : c'est
-  `argparse` qui émet ESC, hors du module, et `PYTHON_COLORS=0` le lui
-  interdit. Rejeu : `python3 -m pytest -q -p no:cacheprovider
-  tests/test_untrusted_rendering.py` -> `2 failed, 95 passed` ; la même
-  commande préfixée de `PYTHON_COLORS=0` -> `97 passed` ; et
-  `.venv/bin/python` rend `97 passed` dans les deux cas. Toute mesure de
-  non-régression lancée avec `python3` se préfixe donc de `PYTHON_COLORS=0`,
-  ou elle attribue au lot un échec qui est celui de l'environnement.
+  où ils attendent `usage:`. Rejeu sur `master` `4e7393a` :
+  `env -u NO_COLOR python3 -m pytest -q -p no:cacheprovider
+  tests/test_untrusted_rendering.py` -> `2 failed, 95 passed` ;
+  `.venv/bin/python` -> `97 passed`.
+
+  Ce paragraphe a d'abord conclu « ce n'est pas un défaut du code » et
+  prescrit de préfixer toute mesure de `PYTHON_COLORS=0`. C'était une
+  normalisation de l'écart, et la même erreur que celle que BUG-017 avait
+  déjà nommée plus haut : le remède porte sur la SORTIE, pas sur l'assertion
+  — ni sur l'environnement de celui qui mesure. Un agent qui lit l'aide ou
+  une erreur d'usage du CLI ne pose pas `PYTHON_COLORS=0` ; s'il reçoit un
+  ESC, la sortie est un rendu non fiable au sens de la zone sensible 1, et
+  peu importe que l'ESC soit le texte du programme et non une valeur d'argv.
+  **Corrigé par TOOL-444 (2026-09-14)** : `_BoundedParser.__init__` force
+  `color=False` là où `argparse` connaît le kwarg (3.14+) et l'avale là où il
+  ne le connaît pas (3.12, qui ne colorise pas) — un `color=True` explicite
+  d'un appelant est écrasé de la même façon. La racine et chaque
+  sous-parseur passent par cette classe, donc refusent ensemble. Aucune
+  variable d'environnement n'est posée par le programme, ni par la suite de
+  tests, ni par la mesure. Les deux tests ci-dessus sont restés inchangés :
+  ils étaient justes. Les commandes, sans aucun préfixe de couleur — au
+  contraire, avec la couleur DEMANDÉE :
+
+      env -u NO_COLOR -u PYTHON_COLORS FORCE_COLOR=3 python3 -m pytest -q -p no:cacheprovider tests/test_untrusted_rendering.py -> 105 passed
+      env -u NO_COLOR -u PYTHON_COLORS FORCE_COLOR=3 .venv/bin/python -m pytest -q -p no:cacheprovider tests/test_untrusted_rendering.py -> 105 passed
+      env -u NO_COLOR -u PYTHON_COLORS FORCE_COLOR=3 python3 -m pytest -q -p no:cacheprovider -> 1298 passed, 1 skipped in 63.11s
+      env -u NO_COLOR -u PYTHON_COLORS FORCE_COLOR=3 .venv/bin/python -m pytest -q -p no:cacheprovider -> 1298 passed, 1 skipped in 64.66s
+
+  La preuve de capacité d'échec a été jouée sur le nominal (`color=True`
+  réintroduit dans `__init__` : `3 failed` sous 3.14.7, `3 passed` après
+  restauration) et sur la garde par construction (sous-parseurs construits
+  par `argparse.ArgumentParser` nu via `parser_class=` : `1 failed, 7
+  passed` — les sept sondes de sortie restent vertes parce qu'argparse
+  propage `color=False`, seule la garde structurelle voit que la borne sur
+  `error` a disparu). `python3 bin/thingskit --help` hors bundle ne mesure
+  PAS ce correctif : la garde d'identité de code (ADR-001) refuse avant
+  `main()`. La mesure exacte charge la source par `SourceFileLoader` et
+  appelle `main()` dans un sous-processus, stdout/stderr réels ; sous les
+  deux interpréteurs, `--help`, `add-task --help` et `projects --bidon`
+  rendent 0 ESC (`grep -c $'\x1b'`), là où `argparse.ArgumentParser(prog="x")`
+  nu, même sous-processus, 3.14.7, en rend 1.
 
   Baseline relevée à **1261** le 2026-09-11 avant `delete-project`, **1291**
   après. L'écart de 30 se décompose, et chaque terme est mesuré : 27 dans le
@@ -1198,6 +1231,21 @@ redevient obligatoire.
       .venv/bin/python -m pytest tests/test_delete_project.py --collect-only -q -p no:cacheprovider | tail -1 -> 27 tests collected
       .venv/bin/python -m pytest tests/test_write_wait.py --collect-only -q -p no:cacheprovider | tail -1 -> 61 tests collected
       .venv/bin/python -m pytest -q -p no:cacheprovider -> 1290 passed, 1 skipped in 60.85s (0:01:00)
+
+  Baseline **1291** -> **1299** le 2026-09-14 (TOOL-444, § ci-dessus) :
+  `+8`, tous dans `tests/test_untrusted_rendering.py` (97 -> 105) — 6 pour la
+  fonction
+  paramétrée (3 sondes x 2 façons dont l'environnement demande la couleur,
+  `FORCE_COLOR` et `PYTHON_COLORS=1`), 1 pour la garde qui intercepte toute
+  construction d'`ArgumentParser` pendant `main()`, 1 pour le `color=True`
+  explicite. L'import `inspect` (pour `inspect.signature`) a été relu et
+  inscrit dans les deux listes de dispense qui refusent tout import inconnu
+  (`_REVIEWED_IMPORTS`, `_STDLIB_ALLOWLIST`) : `grep -c sleep inspect.py`
+  -> 0, `grep -ci osascript inspect.py` -> 0, sur 3.12.9 et 3.14.7. Les
+  commandes :
+
+      .venv/bin/python -m pytest --collect-only -q -p no:cacheprovider | tail -1 -> 1299 tests collected in 0.16s
+      .venv/bin/python -m pytest tests/test_untrusted_rendering.py --collect-only -q -p no:cacheprovider | tail -1 -> 105 tests collected in 0.07s
 
   **Ce que la doublure d'`osa` doit faire, et que la première version ne
   faisait pas.** `tests/test_delete_project.py` rejoue l'APPLICATION : c'est
@@ -1417,6 +1465,27 @@ irréversible pour un gestionnaire de tâches personnel utilisé au quotidien.
   sept gabarits vaut pour 3.12.9 et pourrait changer de version en version ;
   la borne n'en dépend pas — elle s'applique au message quel qu'il soit, et
   c'est le motif de la poser au passage plutôt que sur un gabarit nommé.
+
+  **Seconde forme, à partir de Python 3.14 : l'ESC est le texte du programme
+  lui-même** (TOOL-444, 2026-09-14). `argparse` y colorise l'aide et les
+  erreurs d'usage dès que l'environnement le demande — `FORCE_COLOR`,
+  `PYTHON_COLORS=1`, ou un tty. Plus aucune valeur d'argv n'est en cause, et
+  la distinction n'a pas d'importance ici : la sortie est lue par des agents,
+  et un ESC dedans est un rendu non fiable d'où qu'il vienne. Le refus est
+  posé à la CONSTRUCTION, dans `_BoundedParser.__init__` (`color=False` là où
+  le kwarg existe, avalé là où il n'existe pas, `color=True` de l'appelant
+  écrasé), jamais dans l'environnement : un `PYTHON_COLORS=0` posé au
+  lancement ou dans la suite de tests aurait masqué le défaut au lieu de le
+  fermer. Gardé par
+  `test_the_parser_never_colours_its_output_whatever_the_environment_asks`
+  (trois sondes — aide racine, aide d'un sous-parseur, erreur d'usage — sous
+  chacune des deux demandes de couleur), par
+  `test_every_parser_main_builds_refuses_colour_by_construction`, qui
+  intercepte TOUTE construction d'`ArgumentParser` pendant `main()` et exige
+  qu'elle passe par `_BoundedParser` sans couleur — une liste d'argv est une
+  liste d'inclusion, elle ne voit pas le sous-parseur qu'elle ne nomme pas —,
+  et par `test_an_explicit_request_for_colour_is_refused_on_every_interpreter`.
+  Sous 3.12 ces tests restent vrais sans être sautés.
 
   **Ce qui a permis de fermer la classe n'est pas un comptage, c'est un
   prédicat.** Cinq mesures l'avaient précédée et avaient rendu cinq résultats

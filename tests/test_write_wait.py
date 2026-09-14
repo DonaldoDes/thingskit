@@ -721,11 +721,13 @@ def test_the_project_title_is_escaped_in_the_view_comparison(thingskit):
 
 # Imports de `bin/thingskit` relus le 2026-08-25, puis le 2026-09-11
 # (ajout de `os` par TOOL-433, `os.environ.get` pour `THINGSKIT_TODAY` —
-# aucune primitive d'attente dans ce module) : aucun ne porte de primitive
-# d'attente autre que `time.sleep`.
+# aucune primitive d'attente dans ce module), puis le 2026-09-14 (ajout
+# d'`inspect` par TOOL-444, `inspect.signature` pour savoir si `argparse`
+# connaît `color` — `grep -c sleep inspect.py` -> 0 sur 3.12.9 et 3.14.7) :
+# aucun ne porte de primitive d'attente autre que `time.sleep`.
 _REVIEWED_IMPORTS = frozenset({
-    "__future__", "argparse", "datetime", "json", "os", "re", "sqlite3",
-    "subprocess", "sys", "time", "unicodedata", "urllib", "pathlib",
+    "__future__", "argparse", "datetime", "inspect", "json", "os", "re",
+    "sqlite3", "subprocess", "sys", "time", "unicodedata", "urllib", "pathlib",
 })
 
 

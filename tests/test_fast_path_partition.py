@@ -47,10 +47,11 @@ _BUILTINS = frozenset(dir(builtins))
 
 # Un module tiers pourrait solliciter `osascript` sans que rien ne le dise ici.
 # Le balayage refuse donc ce qu'il ne connaît pas, plutôt que de le supposer
-# inoffensif.
+# inoffensif. `inspect` relu le 2026-09-14 (TOOL-444) : ni `subprocess` ni
+# `osascript` dans le module, sur 3.12.9 comme sur 3.14.7.
 _STDLIB_ALLOWLIST = frozenset({
-    "__future__", "argparse", "json", "os", "plistlib", "re", "shutil",
-    "sqlite3", "subprocess", "sys", "time", "unicodedata", "urllib",
+    "__future__", "argparse", "inspect", "json", "os", "plistlib", "re",
+    "shutil", "sqlite3", "subprocess", "sys", "time", "unicodedata", "urllib",
     "datetime", "pathlib", "textwrap", "typing", "collections", "itertools",
     "functools", "sysconfig", "tempfile", "contextlib", "hashlib",
 })

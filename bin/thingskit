@@ -278,6 +278,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import inspect
 import json
 import os
 import re
@@ -4111,7 +4112,34 @@ class _BoundedParser(argparse.ArgumentParser):
     gabarit aujourd'hui converti. La borne, elle, n'en dépend pas : elle
     s'applique au message quel qu'il soit, c'est le point de la poser au
     passage plutôt que sur un gabarit nommé.
+
+    Seconde forme du même défaut, à partir de Python 3.14 (TOOL-444) :
+    `argparse` colorise son aide et ses erreurs d'usage dès que l'environnement
+    le permet (`FORCE_COLOR`, ou un tty). Ce n'est plus une valeur d'argv qui
+    porte l'ESC, c'est le texte du programme — et pour la zone sensible n° 1
+    la distinction n'existe pas : la sortie est lue par des agents, un ESC
+    dedans est un rendu non fiable, d'où qu'il vienne. Le refus est posé ICI,
+    à la construction, et non dans l'environnement : `color=False` rend une
+    sortie sans ESC même sous `FORCE_COLOR=3` (vérifié le 2026-09-14 sur
+    3.14.7), et les sous-parseurs, construits par `add_parser` avec cette
+    même classe, refusent avec lui — sans dépendre de l'héritage du réglage
+    que `add_subparsers` fait ou ne fait pas. Un `color=True` explicite de
+    l'appelant est écrasé. Le kwarg n'existe pas avant 3.14 : il y est
+    avalé (un `color=True` n'y lève pas `TypeError`), et argparse n'y
+    colorise pas.
     """
+
+    _COLOR_KWARG = "color" in inspect.signature(
+        argparse.ArgumentParser.__init__).parameters
+
+    def __init__(self, *args, **kwargs):
+        # Quoi que l'appelant demande (`color=True` compris), et quel que soit
+        # l'interpréteur : le kwarg est forcé là où il existe, avalé là où il
+        # n'existe pas — jamais transmis tel quel.
+        kwargs.pop("color", None)
+        if self._COLOR_KWARG:
+            kwargs["color"] = False
+        super().__init__(*args, **kwargs)
 
     @staticmethod
     def _bounded_message(message):
