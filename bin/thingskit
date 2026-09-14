@@ -178,15 +178,29 @@ Constaté par test le 2026-08-11, pas déduit de la documentation :
                                     `heading` reviennent tous NULS en base —
                                     constat séparé de celui du `list` qui ne
                                     nomme rien (ci-dessus), pour ne rien
-                                    déduire de l'un à l'autre (TOOL-452)
+                                    déduire de l'un à l'autre (TOOL-452).
+                                    Mais « aucun conteneur » n'est PAS
+                                    l'Inbox — c'est `start=0 ET startDate
+                                    NUL` (table ci-dessous). Re-mesuré le
+                                    2026-09-14 : `--inbox --deadline` laisse
+                                    la tâche en Inbox (start=0) ; `--inbox
+                                    --when today` la range dans Aujourd'hui
+                                    (start=1, startDate posé) sans conteneur.
+                                    `--when` est donc refusé avec `--inbox`,
+                                    et la sonde relit `start`/`startDate`
                   détacher       -> AppleScript `move to do id … to list
                                     "<libellé Inbox>"` : `move-task
                                     --to-inbox`. Mesuré le 2026-09-14 sur une
                                     tâche jetable réelle sortie d'un projet
                                     ouvert (« Cycle Fiscal Annuel ») :
                                     `project`/`area`/`heading` reviennent
-                                    tous NULS après coup. Libellé LOCALISÉ,
-                                    comme les listes intégrées de
+                                    tous NULS après coup. Re-mesuré le même
+                                    jour sur deux tâches PLANIFIÉES (area +
+                                    `--when today`, start=1 ; projet +
+                                    `--when 2026-10-01`, start=2) : Things
+                                    DÉPLANIFIE en détachant — start=0,
+                                    startDate NUL après coup. Libellé
+                                    LOCALISÉ, comme les listes intégrées de
                                     `reschedule-task` : « À classer » sur ce
                                     poste, « Inbox » à l'anglaise —
                                     `THINGS_INBOX_LABELS` (TOOL-452)
@@ -1627,26 +1641,51 @@ def cmd_create_project(a) -> int:
 
 
 def _tasks_titled(title: str) -> list[tuple]:
-    """Tâches non jetées portant ce titre EXACT, avec leur rattachement —
-    `(uuid, project, area, heading)`. Lecture pure, égalité paramétrée : un
+    """Tâches non jetées portant ce titre EXACT, avec leur rattachement ET
+    leur planification — `(uuid, project, area, heading, start, startDate)`.
+    Les six colonnes viennent de la MÊME requête : deux lectures pourraient
+    observer deux états, et la sonde Inbox juge le couple (start, startDate)
+    en même temps que le conteneur. Lecture pure, égalité paramétrée : un
     `%` dans le titre est un caractère, jamais un joker.
     """
-    return q("select uuid, project, area, heading from TMTask where title=? "
-             "and type=? and trashed=0", (title, TYPE_TASK))
+    return q("select uuid, project, area, heading, start, startDate from "
+             "TMTask where title=? and type=? and trashed=0",
+             (title, TYPE_TASK))
 
 
 def cmd_add_task(a) -> int:
     """Crée une tâche par le schéma d'URL, dans une cible RÉSOLUE avant d'écrire.
 
     TOOL-452 — `--inbox` crée directement dans l'Inbox, sans passer par
-    `--list`. Exclusif de `--list` (groupe argparse) et de `--heading` (refus
+    `--list`. Exclusif de `--list` (groupe argparse), de `--heading` (refus
     explicite ici : un en-tête vit DANS un projet, jamais dans l'Inbox — la
-    combinaison n'a pas de sens). Mesuré le 2026-09-14 sur une tâche jetable
+    combinaison n'a pas de sens) et de `--when` (refus explicite ici aussi,
+    voir la table). Mesuré le 2026-09-14 sur une tâche jetable
     réelle : un payload SANS la clé `list` du tout (pas une valeur vide,
     l'ABSENCE de la clé) atterrit en Inbox, `project`/`area`/`heading` tous
     NULS en base — mesure séparée du constat déjà établi pour un `list` qui
     ne nomme ni projet ni area (docstring module), pour ne rien déduire de
     l'un à l'autre.
+
+    Rework après review sécurité (FAIL P1, 2026-09-14) : « aucun conteneur »
+    n'est PAS l'Inbox. Le module la définit lui-même comme `start ==
+    START_INBOX (0) et startDate NULL` (`scheduling_list`) ; une tâche sans
+    projet/area/heading mais `start=1` est dans « À tout moment » ou
+    « Aujourd'hui ». La sonde exige donc les cinq colonnes, relues dans la
+    même requête (`_tasks_titled`). Ce que Things fait avec les dates sur
+    une création sans `list`, mesuré le 2026-09-14 sur tâches jetables
+    réelles `ZZ-inbox-probe-*` (supprimées après coup), relu en base :
+
+        --inbox --deadline 2026-12-31 -> start=0, startDate NULL,
+                                         deadline posé : EN INBOX (autorisé)
+        --inbox --when today          -> start=1, startDate=132814592 :
+                                         dans AUJOURD'HUI, pas en Inbox — et
+                                         l'ancienne sonde rendait 0 (refusé
+                                         AVANT tout appel d'écriture)
+
+    `--deadline` reste donc accepté : une échéance ne planifie pas. `--when`
+    est refusé : il n'y a aucune valeur de `when` qui laisse une tâche en
+    Inbox (« anytime » et « someday » posent start=1/2 par définition).
 
     BUG-005 — `--list` était recopié tel quel dans le payload. Une valeur qui
     ne nomme aucun projet ni aucune area fait atterrir la tâche en **Inbox**,
@@ -1675,6 +1714,12 @@ def cmd_add_task(a) -> int:
     if a.inbox and a.heading:
         print(f"erreur : --inbox et --heading sont exclusifs (un en-tête vit "
               f"DANS un projet, jamais dans l'Inbox), {action_suffix}",
+              file=sys.stderr)
+        return 1
+    if a.inbox and a.when:
+        print(f"erreur : --inbox et --when sont exclusifs (une tâche "
+              f"planifiée n'est pas dans l'Inbox : mesuré, `--when today` "
+              f"pose start=1 et la range dans Aujourd'hui), {action_suffix}",
               file=sys.stderr)
         return 1
 
@@ -1747,7 +1792,8 @@ def cmd_add_task(a) -> int:
         fresh = [r for r in _tasks_titled(a.title) if r[0] not in known]
         if not fresh:
             return f"aucune tâche {a.title!r} n'est apparue en base"
-        for obs_uuid, obs_project, obs_area, obs_heading in fresh:
+        for (obs_uuid, obs_project, obs_area, obs_heading, obs_start,
+             obs_start_date) in fresh:
             if target_kind == "heading":
                 # Constat du docstring module : une tâche sous heading a sa
                 # colonne `project` VIDE. Exiger le projet ici rendrait un
@@ -1757,22 +1803,30 @@ def cmd_add_task(a) -> int:
             elif target_kind == "project":
                 ok = obs_project == target_id and obs_area is None
             elif target_kind == "inbox":
+                # L'Inbox est un ÉTAT DE PLANIFICATION, pas seulement une
+                # absence de conteneur (`scheduling_list`) : sans `start`,
+                # une tâche rangée dans Aujourd'hui passait pour en Inbox.
                 ok = (obs_project is None and obs_area is None
-                      and obs_heading is None)
+                      and obs_heading is None
+                      and obs_start == START_INBOX
+                      and obs_start_date is None)
             else:
                 ok = obs_area == target_id and obs_project is None
             if ok:
                 return None
-        # Les QUATRE valeurs de cette expression sont converties, pas trois
-        # sur quatre : l'uuid partait brut au milieu de ses voisins. Son
+        # Les SIX valeurs de cette expression sont converties, pas cinq
+        # sur six : l'uuid partait brut au milieu de ses voisins. Son
         # atteignabilité n'est pas établie — ces uuid viennent de Things —
         # mais un écart connu au milieu de la garde qu'on ajoute reste un
         # écart, et l'uniformité se vérifie par EXPRESSION, pas par ligne.
         observed = " ; ".join(
-            f"{u!r} (project={p!r}, area={ar!r}, heading={h!r})"
-            for u, p, ar, h in fresh)
-        attendu = "inbox (aucun projet, aucune area, aucun heading)" if (
-            target_kind == "inbox") else f"{target_kind}={target_id!r}"
+            f"{u!r} (project={p!r}, area={ar!r}, heading={h!r}, "
+            f"start={st!r}, startDate={sd!r})"
+            for u, p, ar, h, st, sd in fresh)
+        attendu = ("inbox (aucun projet, aucune area, aucun heading, "
+                   f"start={START_INBOX}, startDate=None)"
+                   if target_kind == "inbox"
+                   else f"{target_kind}={target_id!r}")
         return f"créée mais rattachée ailleurs : {observed}, attendu {attendu}"
 
     # La valeur qui compose le message est celle que la sonde a OBSERVÉE : une
@@ -3499,6 +3553,28 @@ def cmd_move_task(a) -> int:
     2026-09-14 sur une tâche jetable réelle — `project`/`area`/`heading`
     reviennent tous les trois à NUL après coup, même famille de garde que
     `THINGS_LIST_LABELS` (libellé localisé, jamais un littéral).
+
+    Rework après review sécurité (FAIL P1, 2026-09-14) : la sonde
+    `--to-inbox` ne lisait que le conteneur, alors que l'Inbox est
+    `start == START_INBOX (0) et startDate NULL` (`scheduling_list`). Elle
+    exige désormais les cinq colonnes, relues dans la même requête. Ce que
+    Things permet, mesuré de bout en bout le 2026-09-14 sur tâches jetables
+    réelles `ZZ-inbox-probe-move*` (supprimées après coup), état relu en
+    base avant puis après `move … to list "À classer"` :
+
+        tâche d'area, --when today       (start=1, startDate=132814592)
+            -> start=0, startDate NULL, project/area/heading NULL : EN INBOX
+        tâche de projet, --when 2026-10-01 (start=2, startDate=132817024)
+            -> start=0, startDate NULL, project/area/heading NULL : EN INBOX
+
+    Things DÉPLANIFIE en détachant — une tâche planifiée peut donc viser
+    l'Inbox, et la sonde rend le vrai constat dans les deux sens : `0` si
+    les cinq colonnes sont à l'état Inbox, échec sinon.
+
+    Une tâche DÉJÀ en Inbox (cinq colonnes à l'état Inbox) court-circuite
+    AVANT l'AppleScript, comme la voie `to_heading` : sinon la relecture
+    serait verte avant même l'ordre, et un script qui échoue passerait pour
+    un déplacement fait.
     """
     action_suffix = "aucun déplacement effectué"
 
@@ -3617,6 +3693,21 @@ def cmd_move_task(a) -> int:
     elif to_inbox:
         target_id = None
         target_kind, target_label = "inbox", "Inbox"
+        # Déjà en Inbox : la relecture post-action serait verte AVANT l'ordre
+        # et masquerait un script en échec. Message DISTINCT, aucune
+        # sollicitation de l'application — même remède que `to_heading`.
+        # Les cinq colonnes, pas seulement le conteneur : sans conteneur
+        # mais planifiée, la tâche n'est PAS en Inbox et l'ordre part.
+        obs = q("select project, area, heading, start, startDate from TMTask "
+                "where uuid=? and type=?", (task_id, TYPE_TASK))
+        if not obs:
+            print(f"tâche disparue entre sa vérification et la lecture de son "
+                  f"rattachement ({_rendered(task_id)}) — {action_suffix}",
+                  file=sys.stderr)
+            return 1
+        if obs[0] == (None, None, None, START_INBOX, None):
+            print(f"tâche déjà en Inbox : {title!r} ({_rendered(task_id)})")
+            return 0
         script = _build_move_to_inbox_script(task_id)
     elif a.to_project:
         target_id, err = _resolve_project_by_title(a.to_project, action_suffix)
@@ -3660,11 +3751,13 @@ def cmd_move_task(a) -> int:
     # cesserait de décrire celle qui juge. La cascade distingue toujours ses
     # trois causes, qui ne se diagnostiquent pas de la même façon.
     def _move_problem() -> str | None:
-        rows = q("select uuid, project, area, heading, creationDate from "
-                 "TMTask where uuid=? and type=?", (task_id, TYPE_TASK))
+        rows = q("select uuid, project, area, heading, creationDate, start, "
+                 "startDate from TMTask where uuid=? and type=?",
+                 (task_id, TYPE_TASK))
         if not rows:
             return "tâche introuvable après l'opération"
-        obs_uuid, obs_project, obs_area, obs_heading, obs_created = rows[0]
+        (obs_uuid, obs_project, obs_area, obs_heading, obs_created, obs_start,
+         obs_start_date) = rows[0]
         if obs_uuid != task_id:
             return (f"l'UUID relu ({obs_uuid!r}) diffère de celui déplacé — "
                     "invariant violé")
@@ -3681,17 +3774,27 @@ def cmd_move_task(a) -> int:
         elif target_kind == "project":
             ok = obs_project == target_id and obs_area is None
         elif target_kind == "inbox":
+            # L'Inbox est un ÉTAT DE PLANIFICATION, pas seulement une absence
+            # de conteneur (`scheduling_list`) : mesuré, Things déplanifie en
+            # détachant, et c'est CE constat qui vaut succès.
             ok = (obs_project is None and obs_area is None
-                  and obs_heading is None)
+                  and obs_heading is None
+                  and obs_start == START_INBOX and obs_start_date is None)
         else:
             ok = obs_area == target_id and obs_project is None
         if not ok:
-            attendu = ("inbox (aucun projet, aucune area, aucun heading)"
-                       if target_kind == "inbox"
-                       else f"{target_kind}={target_id!r}")
+            if target_kind == "inbox":
+                attendu = ("inbox (aucun projet, aucune area, aucun heading, "
+                           f"start={START_INBOX}, startDate=None)")
+                relu = (f"(project={obs_project!r}, area={obs_area!r}, "
+                        f"heading={obs_heading!r}, start={obs_start!r}, "
+                        f"startDate={obs_start_date!r})")
+            else:
+                attendu = f"{target_kind}={target_id!r}"
+                relu = (f"(project={obs_project!r}, area={obs_area!r}, "
+                        f"heading={obs_heading!r})")
             return (f"vers {target_kind} {target_label!r}, appartenance relue "
-                    f"en base = (project={obs_project!r}, area={obs_area!r}, "
-                    f"heading={obs_heading!r}), attendu ({attendu})")
+                    f"en base = {relu}, attendu ({attendu})")
         return None
 
     # La valeur qui compose le message est celle que la sonde a OBSERVÉE, pas
@@ -4334,8 +4437,9 @@ def main() -> int:
     g.add_argument("--list", help="titre exact du projet ou de l'area cible")
     g.add_argument("--inbox", action="store_true",
                    help="crée directement dans l'Inbox (« À classer »), sans "
-                        "projet ni area ni en-tête — exclusif de --list et "
-                        "de --heading")
+                        "projet ni area ni en-tête — exclusif de --list, "
+                        "de --heading et de --when (une tâche planifiée "
+                        "n'est pas dans l'Inbox) ; --deadline reste permis")
     s.add_argument("--heading"); s.add_argument("--notes")
     s.add_argument("--when", help="today|tomorrow|evening|anytime|someday|AAAA-MM-JJ, "
                                   "suffixable de @HH:MM pour une alerte")

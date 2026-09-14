@@ -119,7 +119,7 @@ def _ns(id=None, title=None, to_project=None, to_area=None, to_heading=None,
 @pytest.fixture
 def rigged(thingskit, monkeypatch, tmp_path):
     """`osa` inerte qui enregistre ses appels — aucun effet en base."""
-    calls = {"osa": [], "url": [], "db": None}
+    calls = {"osa": [], "url": [], "running": 0, "db": None}
 
     def _set_rows(task_rows, area_rows=(), token="jeton-de-test"):
         db_file = _make_db(tmp_path, task_rows, area_rows, token=token)
@@ -127,7 +127,8 @@ def rigged(thingskit, monkeypatch, tmp_path):
         calls["db"] = db_file
         return db_file
 
-    monkeypatch.setattr(thingskit, "ensure_running", lambda: None)
+    monkeypatch.setattr(thingskit, "ensure_running",
+                        lambda: calls.__setitem__("running", calls["running"] + 1))
     monkeypatch.setattr(thingskit, "osa",
                         lambda script: (calls["osa"].append(script), (0, ""))[1])
     monkeypatch.setattr(
