@@ -181,8 +181,8 @@ def _write_status(state, uuid, value):
     con.close()
 
 
-_REOPEN_LINE = "if st is not open then set status of p to open"
-_RESTORE_PREFIX = "if st is not open then set status of "
+_REOPEN_LINE = "if origStatus is not open then set status of p to open"
+_RESTORE_PREFIX = "if origStatus is not open then set status of "
 
 
 def _as_the_application_would(script: str, ids: list[str], state,
@@ -195,7 +195,7 @@ def _as_the_application_would(script: str, ids: list[str], state,
     garde : mesuré le 2026-09-14, la garde retirée du script, 26 des 27
     tests restaient verts.
 
-    TOOL-457 : elle rejoue aussi le STATUT du projet. `set st to status of
+    TOOL-457 : elle rejoue aussi le STATUT du projet. `set origStatus to status of
     p` capture le statut en base ; la réouverture conditionnelle l'écrit ;
     un `delete p` qui échoue (Logbook sans réouverture, ou échec forcé)
     déroule le bloc `on error` du script — et c'est ce bloc, lu dans le
@@ -206,7 +206,7 @@ def _as_the_application_would(script: str, ids: list[str], state,
     lines = [raw.strip() for raw in script.splitlines()]
     st = None
     for i, line in enumerate(lines):
-        if line == "set st to status of p":
+        if line == "set origStatus to status of p":
             st = _status_in_db(state, project_id)
         elif line == _REOPEN_LINE:
             if st != STATUS_OPEN:
@@ -233,7 +233,7 @@ def _as_the_application_would(script: str, ids: list[str], state,
             for h in handler:
                 if h == "end try":
                     break
-                if h.startswith(_RESTORE_PREFIX) and h.endswith(" to st"):
+                if h.startswith(_RESTORE_PREFIX) and h.endswith(" to origStatus"):
                     if st != STATUS_OPEN:
                         state["restored"].append(st)
                         _write_status(state, project_id, st)
@@ -777,10 +777,10 @@ def test_the_restore_lives_in_an_on_error_block_around_the_delete(
     i_err, i_end = lines.index("on error m"), lines.index("end try")
     assert i_try < i_del < i_err < i_end
     handler = lines[i_err + 1:i_end]
-    assert any(h.startswith(_RESTORE_PREFIX) and h.endswith(" to st")
+    assert any(h.startswith(_RESTORE_PREFIX) and h.endswith(" to origStatus")
                for h in handler)
     assert any(h.startswith("error ") for h in handler)
-    assert lines.index("set st to status of p") < lines.index(_REOPEN_LINE)
+    assert lines.index("set origStatus to status of p") < lines.index(_REOPEN_LINE)
 
 
 def test_the_override_reopens_after_the_set_check_and_before_the_delete(

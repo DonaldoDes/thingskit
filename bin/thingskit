@@ -228,6 +228,21 @@ Supprimer un PROJET — constaté le 2026-09-14 sur deux projets jetables réels
                                     `to dos of p whose status is open` isole
                                     les tâches ouvertes
 
+    project terminé/annulé au Logbook — `delete p` rend -1728 tel quel ;
+                                    rouvert dans le MÊME acte (`set status of
+                                    p to open`), il se supprime (TOOL-457,
+                                    2026-09-15). Le projet part à la
+                                    Corbeille OUVERT (`status=0, trashed=1`).
+                                    Sur échec du `delete`, le script restaure
+                                    le statut d'origine avant de rendre
+                                    l'erreur.
+    set status of project … to completed
+                                    TERMINE aussi ses tâches ouvertes, et
+                                    rouvrir l'une d'elles rouvre le projet :
+                                    « projet terminé portant une tâche
+                                    ouverte » n'est pas productible par
+                                    AppleScript (mesuré le 2026-09-15).
+
     Les tâches d'un projet supprimé ne sont PAS marquées `trashed` en base
     (mesuré : `trashed=0` après coup) et deviennent pourtant INATTEIGNABLES
     par AppleScript (`delete to do id "<uuid>"` -> -1728). Elles disparaissent
@@ -4046,6 +4061,45 @@ def cmd_move_project(a) -> int:
 # dans l'acte). Le même aller-retour compte les tâches ouvertes et supprime,
 # et il refuse de lui-même : entre un constat séparé et le geste, une tâche
 # peut naître, et le geste s'appuierait sur un état qui n'est plus.
+#
+# PROJET TERMINÉ OU ANNULÉ (TOOL-457) — mesuré le 2026-09-15, d'abord par
+# l'utilisateur sur « Projet de test » (LbGyL7Gop2uBtVDvSXjqVD, terminé le
+# 2026-08-10, rangé au Logbook), puis sur trois sondes jetables
+# `ZZ-probe-tool457-{a,b,c}` créées pour l'occasion :
+#
+#   - Au Logbook, `set p to project id …` et le comptage passent, mais
+#     `delete p` rend -1728 « impossible d'obtenir project id » (offset
+#     289:297 du script, qui est `delete p`). `move p to list "Trash"` n'est
+#     pas une issue : `list "Trash"` n'existe pas (-1728). `set status of p
+#     to open` puis `delete p` dans le MÊME acte → `deleted`, rc=0.
+#     Rejeu :  thingskit delete-project --project-id LbGyL7Gop2uBtVDvSXjqVD
+#   - Un projet FRAÎCHEMENT terminé (pas encore au Logbook) se supprimait
+#     déjà sans réouverture (`ZZ-probe-delete-termine`, 2026-09-15). Les
+#     sondes ci-dessous établissent donc la non-régression du chemin
+#     nominal ; la correction du cas Logbook, c'est la mesure de l'utilisateur.
+#   - Sonde a, `status=3` : `delete-project` → `status=0, trashed=1`. La
+#     réouverture reste visible en base APRÈS la mise à la Corbeille — un
+#     « Put Back » rendrait donc un projet OUVERT, pas terminé. Sonde c,
+#     passée `canceled` (`status=2`) : même résultat, `status=0, trashed=1`.
+#   - Branche de restauration : le script de la sonde c rejoué avec
+#     `delete p` remplacé par `error "…"` → rc=1, message « suppression
+#     échouée, statut d'origine restauré — … », et `status=3, trashed=0`
+#     relu en base. Le `on error` re-résout par `project id "<uuid>"` plutôt
+#     que par `p`, comme la mesure de l'utilisateur.
+#   - `st` n'est PAS un nom de variable AppleScript valide : c'est un
+#     suffixe ordinal (« 1st »), et le script mourait en -2741 « expression
+#     prévu mais st trouvé ». D'où `origStatus`.
+#   - `set status of project id … to completed` TERMINE AUSSI ses tâches
+#     ouvertes (sonde b : la tâche passe `status=3` en cascade), et rouvrir
+#     l'une d'elles ROUVRE le projet (`status=0`). L'état « projet terminé
+#     portant une tâche ouverte » n'est donc pas productible par la surface
+#     AppleScript : la garde « aucune tâche ouverte » a été éprouvée sur la
+#     sonde b OUVERTE (REFUS, rc=1, statut et `trashed` inchangés), et son
+#     antériorité sur la réouverture est gardée par test, pas par sonde.
+#     Rejeu :  osascript -e 'tell application "Things3" to set status of
+#              project id "<uuid>" to completed' puis
+#              sqlite3 "file:<base>?mode=ro" "select status from TMTask
+#              where project='<uuid>'"
 # ---------------------------------------------------------------------------
 
 _DELETE_NOT_TRIED = "La suppression n'est jamais tentée sur une cible non résolue."
@@ -4094,7 +4148,25 @@ def _build_delete_project_script(project_id: str,
             f'"{_DP_CHANGED_TAG}" & joined',
             'end repeat',
         ]
-    lines += ['delete p', f'return "{_DP_DELETED_TAG}" & joined', 'end tell']
+    # TOOL-457 — un projet TERMINÉ ou ANNULÉ rangé au Logbook ne se laisse
+    # pas supprimer tel quel (`delete p` → -1728, mesuré le 2026-09-15) ;
+    # rouvert dans le MÊME acte, il se supprime. La réouverture vient APRÈS
+    # les gardes ci-dessus — un projet non vide n'est jamais rouvert — et si
+    # le `delete` échoue ensuite, le statut d'origine est restauré dans le
+    # même script, qui rend alors l'erreur au lieu de l'avaler.
+    lines += [
+        'set origStatus to status of p',
+        'if origStatus is not open then set status of p to open',
+        'try',
+        'delete p',
+        'on error m',
+        f'if origStatus is not open then set status of (project id '
+        f'"{_esc(project_id)}") to origStatus',
+        'error "suppression échouée, statut d\'origine restauré — " & m',
+        'end try',
+        f'return "{_DP_DELETED_TAG}" & joined',
+        'end tell',
+    ]
     return "\n".join(lines)
 
 
