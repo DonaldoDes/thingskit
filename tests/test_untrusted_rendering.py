@@ -1013,6 +1013,39 @@ def test_the_bound_leaves_the_parser_own_help_untouched(
     assert "\\x" not in out and "\\n" not in out, out
 
 
+# Deuxième forme du même défaut, constatée le 2026-09-11 (TOOL-444) : à partir
+# de Python 3.14, `argparse` COLORISE son aide et ses erreurs d'usage dès que
+# l'environnement le lui permet (`FORCE_COLOR`, ou un tty). Ce n'est plus une
+# valeur d'argv qui porte l'ESC : c'est le texte du programme lui-même. Pour
+# la zone sensible n° 1 la distinction n'existe pas — la sortie est lue par
+# des agents, et une séquence ESC dedans est un rendu non fiable, d'où qu'elle
+# vienne. Le remède porte sur la SORTIE, pas sur l'assertion ni sur
+# l'environnement : le parseur refuse la couleur à sa construction, et les
+# sous-parseurs, construits par la même classe, la refusent avec lui.
+#
+# Sous 3.12, `argparse` ne colorise jamais : le test y reste vrai, il n'est
+# pas sauté. Sous 3.14 il rougit dès que la classe cesse de refuser.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("argv, flux", [
+    (["thingskit", "--help"], "out"),
+    (["thingskit", "add-task", "--help"], "out"),
+    (["thingskit", "--bidon"], "err"),
+], ids=["aide-racine", "aide-sous-parseur", "erreur-usage"])
+def test_the_parser_never_colours_its_output_whatever_the_environment_asks(
+        thingskit, monkeypatch, capsys, argv, flux):
+    monkeypatch.setenv("FORCE_COLOR", "3")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("PYTHON_COLORS", raising=False)
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with pytest.raises(SystemExit):
+        thingskit.main()
+
+    sortie = getattr(capsys.readouterr(), flux)
+    assert sortie, "le parseur n'a rien émis sur le flux attendu"
+    assert "\x1b" not in sortie, repr(sortie)
+
+
 def test_the_bound_escapes_in_place_instead_of_quoting_the_whole_message(
         thingskit):
     """`_bounded` n'est pas `repr` : il échappe caractère par caractère et
