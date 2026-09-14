@@ -1247,6 +1247,17 @@ redevient obligatoire.
       .venv/bin/python -m pytest --collect-only -q -p no:cacheprovider | tail -1 -> 1299 tests collected in 0.16s
       .venv/bin/python -m pytest tests/test_untrusted_rendering.py --collect-only -q -p no:cacheprovider | tail -1 -> 105 tests collected in 0.07s
 
+  Baseline relevée à **1299** le 2026-09-14 avant `--inbox`/`--to-inbox`
+  (TOOL-452), **1312** après. L'écart de 13 se décompose, et chaque terme est
+  mesuré : +7 dans `tests/test_add_task.py` (61 -> 68) ; +6 dans
+  `tests/test_move_task.py` (54 -> 60). Aucun contrôle paramétré ne bouge :
+  les deux fichiers existaient déjà. Les commandes :
+
+      .venv/bin/python -m pytest --collect-only -q -p no:cacheprovider | tail -1 -> 1312 tests collected
+      .venv/bin/python -m pytest tests/test_add_task.py --collect-only -q -p no:cacheprovider | tail -1 -> 68 tests collected
+      .venv/bin/python -m pytest tests/test_move_task.py --collect-only -q -p no:cacheprovider | tail -1 -> 60 tests collected
+      .venv/bin/python -m pytest -q -p no:cacheprovider -> 1311 passed, 1 skipped
+
   **Ce que la doublure d'`osa` doit faire, et que la première version ne
   faisait pas.** `tests/test_delete_project.py` rejoue l'APPLICATION : c'est
   elle, et non la base jetable, qui détient les tâches ouvertes au moment de

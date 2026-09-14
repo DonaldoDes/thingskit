@@ -63,6 +63,7 @@ CREATE TABLE TMTask (
     project TEXT,
     heading TEXT,
     area TEXT,
+    start INTEGER,
     startDate INTEGER,
     startBucket INTEGER,
     deadline INTEGER,
@@ -84,18 +85,18 @@ def _make_db(tmp_path, task_rows, area_rows=(), token="jeton-de-test"):
     con.executescript(SCHEMA)
     defaults = dict(
         uuid=None, title=None, type=0, trashed=0, project=None, heading=None,
-        area=None, startDate=None, startBucket=None, deadline=None,
+        area=None, start=1, startDate=None, startBucket=None, deadline=None,
         reminderTime=None, status=0, notes=None, creationDate=None,
     )
     for r in task_rows:
         row = {**defaults, **r}
         con.execute(
             "insert into TMTask (uuid,title,type,trashed,project,heading,area,"
-            "startDate,startBucket,deadline,reminderTime,status,notes,"
+            "start,startDate,startBucket,deadline,reminderTime,status,notes,"
             "creationDate) values "
             "(:uuid,:title,:type,:trashed,:project,:heading,:area,"
-            ":startDate,:startBucket,:deadline,:reminderTime,:status,:notes,"
-            ":creationDate)",
+            ":start,:startDate,:startBucket,:deadline,:reminderTime,:status,"
+            ":notes,:creationDate)",
             row,
         )
     for uuid, title in area_rows:
@@ -108,15 +109,17 @@ def _make_db(tmp_path, task_rows, area_rows=(), token="jeton-de-test"):
     return db_file
 
 
-def _ns(id=None, title=None, to_project=None, to_area=None, to_heading=None):
+def _ns(id=None, title=None, to_project=None, to_area=None, to_heading=None,
+        to_inbox=False):
     return argparse.Namespace(id=id, title=title, to_project=to_project,
-                              to_area=to_area, to_heading=to_heading)
+                              to_area=to_area, to_heading=to_heading,
+                              to_inbox=to_inbox)
 
 
 @pytest.fixture
 def rigged(thingskit, monkeypatch, tmp_path):
     """`osa` inerte qui enregistre ses appels — aucun effet en base."""
-    calls = {"osa": [], "url": [], "db": None}
+    calls = {"osa": [], "url": [], "running": 0, "db": None}
 
     def _set_rows(task_rows, area_rows=(), token="jeton-de-test"):
         db_file = _make_db(tmp_path, task_rows, area_rows, token=token)
@@ -124,7 +127,8 @@ def rigged(thingskit, monkeypatch, tmp_path):
         calls["db"] = db_file
         return db_file
 
-    monkeypatch.setattr(thingskit, "ensure_running", lambda: None)
+    monkeypatch.setattr(thingskit, "ensure_running",
+                        lambda: calls.__setitem__("running", calls["running"] + 1))
     monkeypatch.setattr(thingskit, "osa",
                         lambda script: (calls["osa"].append(script), (0, ""))[1])
     monkeypatch.setattr(
@@ -138,9 +142,12 @@ def rigged(thingskit, monkeypatch, tmp_path):
 
 
 def _rig_effective_move(thingskit, monkeypatch, calls, project=..., area=...,
-                        heading=...):
+                        heading=..., start=..., start_date=...):
     """`osa` qui simule l'effet réel constaté : poser `project` efface `area`
-    (et réciproquement), comme mesuré sur la vraie application."""
+    (et réciproquement), comme mesuré sur la vraie application. `start` et
+    `start_date` ne bougent que si le test le dit — c'est ce qui permet de
+    simuler un `move … to list "À classer"` qui détacherait SANS
+    déplanifier, le cas que la sonde `--to-inbox` doit refuser."""
     db_file = calls["db"]
 
     def _fake(script):
@@ -153,6 +160,10 @@ def _rig_effective_move(thingskit, monkeypatch, calls, project=..., area=...,
             cols["area"] = area
         if heading is not ...:
             cols["heading"] = heading
+        if start is not ...:
+            cols["start"] = start
+        if start_date is not ...:
+            cols["startDate"] = start_date
         for col, val in cols.items():
             con.execute(f"update TMTask set {col}=? where uuid=?", (val, TARGET))
         con.commit()
@@ -1031,3 +1042,227 @@ def test_a_task_vanishing_before_its_placement_is_read_is_a_clean_refusal(
                                        to_heading="Section")) == 1
     assert calls["osa"] == [] and calls["url"] == []
     assert "disparue" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# TOOL-452 — `--to-inbox` : détache une tâche de son projet/area/en-tête.
+#
+# Surface mesurée le 2026-09-14 sur une tâche jetable réelle (projet ouvert
+# « Cycle Fiscal Annuel ») : `move to do id "<uuid>" to list "À classer"`
+# efface `project`/`area`/`heading` — « À classer » est le libellé français
+# de l'Inbox (`name of lists`, mesuré le même jour), comme « Anytime » pour
+# `THINGS_LIST_LABELS` : localisé, donc une liste de candidats, jamais un
+# littéral.
+# ---------------------------------------------------------------------------
+
+def test_to_inbox_by_id(thingskit, monkeypatch, rigged):
+    calls, set_rows = rigged
+    set_rows([{"uuid": TARGET, "title": "Cible", "type": 0, "project": PROJECT}],
+             [], token=None)
+    _rig_effective_move(thingskit, monkeypatch, calls, project=None, area=None,
+                        heading=None, start=thingskit.START_INBOX,
+                        start_date=None)
+
+    rc = thingskit.cmd_move_task(_ns(id=TARGET, to_inbox=True))
+    assert rc == 0
+    assert len(calls["osa"]) == 1
+    assert TARGET in calls["osa"][0]
+
+    con = sqlite3.connect(calls["db"])
+    project, area, heading = con.execute(
+        "select project, area, heading from TMTask where uuid=?",
+        (TARGET,)).fetchone()
+    con.close()
+    assert project is None
+    assert area is None
+    assert heading is None
+
+
+def test_failure_when_the_task_is_not_actually_detached(thingskit, rigged):
+    """`osa` « réussit » (rc=0, mock inerte) sans rien changer en base —
+    preuve que la vérification post-action porte bien sur `--to-inbox`."""
+    calls, set_rows = rigged
+    set_rows([{"uuid": TARGET, "title": "Cible", "type": 0, "project": PROJECT}],
+             [], token=None)
+
+    rc = thingskit.cmd_move_task(_ns(id=TARGET, to_inbox=True))
+
+    assert rc != 0
+    assert len(calls["osa"]) == 1, (
+        "la commande n'a jamais sollicité l'application — sans la nouvelle "
+        "branche --to-inbox, elle refuse en amont faute de cible connue")
+
+
+def test_to_inbox_and_to_area_are_exclusive(thingskit, rigged, capsys):
+    calls, set_rows = rigged
+    set_rows([{"uuid": TARGET, "title": "Cible", "type": 0, "project": PROJECT}],
+             [(AREA, "Une area")])
+
+    rc = thingskit.cmd_move_task(_ns(id=TARGET, to_inbox=True, to_area="Une area"))
+
+    assert rc != 0
+    assert calls["osa"] == []
+    assert "exclusif" in capsys.readouterr().err.lower()
+
+
+def test_to_inbox_and_to_project_are_exclusive_at_the_cli_level(
+        thingskit, rigged, run_cli):
+    """Le refus vient du groupe argparse, et le message le dit : `not allowed
+    with argument`. Sans `--to-inbox` (master), argparse refuserait aussi,
+    mais avec « unrecognized arguments » — ce test le distingue.
+
+    `rigged` est posé sur TOUT test CLI d'une commande d'écriture : si la
+    garde testée disparaît, le chemin atteint l'écriture réelle."""
+    calls, set_rows = rigged
+    set_rows([{"uuid": TARGET, "title": "Cible", "type": 0, "project": PROJECT}],
+             [], token=None)
+    code, _, err = run_cli(
+        ["move-task", "--id", TARGET, "--to-inbox", "--to-project", "P"])
+    assert code != 0
+    assert calls["osa"] == [] and calls["url"] == []
+    assert "not allowed with argument" in err
+    assert "--to-inbox" in err and "--to-project" in err
+
+
+# --- rework TOOL-452 (review sécurité, P1) : l'Inbox se lit sur `start` -----
+#
+# « Aucun conteneur » n'est PAS l'Inbox : `scheduling_list` la définit comme
+# `start == START_INBOX (0) et startDate NULL`. Une tâche détachée mais
+# planifiée (`start=1` + date) est dans Aujourd'hui ; la sonde qui ne lisait
+# que project/area/heading disait « Inbox » avec un code retour 0.
+#
+# Mesuré le 2026-09-14 sur tâches jetables réelles (`ZZ-inbox-probe-move*`,
+# supprimées après coup) : `move to do id … to list "À classer"` sur une
+# tâche d'area planifiée aujourd'hui (start=1, startDate posé) ET sur une
+# tâche de projet planifiée au 2026-10-01 (start=2, startDate posé) rend les
+# deux fois `start=0, startDate NULL, project/area/heading NULL` — Things
+# déplanifie en détachant. La sonde exige donc les cinq colonnes, relues
+# dans la même requête.
+
+def test_to_inbox_fails_when_detached_but_still_scheduled(
+        thingskit, monkeypatch, rigged, capsys):
+    """Le script « réussit » et efface le conteneur, mais laisse
+    `start=1, startDate posé` : la tâche est dans Aujourd'hui, pas en Inbox."""
+    calls, set_rows = rigged
+    set_rows([{"uuid": TARGET, "title": "Cible", "type": 0, "project": PROJECT,
+               "start": thingskit.START_ANYTIME, "startDate": 132814592}],
+             [], token=None)
+    _rig_effective_move(thingskit, monkeypatch, calls, project=None, area=None,
+                        heading=None)
+
+    rc = thingskit.cmd_move_task(_ns(id=TARGET, to_inbox=True))
+
+    assert rc != 0
+    err = capsys.readouterr().err.lower()
+    assert "attendu" in err
+    assert "start=1" in err and "startdate=132814592" in err
+
+
+def test_to_inbox_fails_when_detached_but_start_anytime_without_date(
+        thingskit, monkeypatch, rigged, capsys):
+    """`start=1` sans date = « À tout moment » : refusé sur `start` seul."""
+    calls, set_rows = rigged
+    set_rows([{"uuid": TARGET, "title": "Cible", "type": 0, "area": AREA,
+               "start": thingskit.START_ANYTIME}],
+             [(AREA, "Une area")], token=None)
+    _rig_effective_move(thingskit, monkeypatch, calls, project=None, area=None,
+                        heading=None)
+
+    rc = thingskit.cmd_move_task(_ns(id=TARGET, to_inbox=True))
+
+    assert rc != 0
+    assert "attendu" in capsys.readouterr().err.lower()
+
+
+def test_to_inbox_on_a_scheduled_task_succeeds_when_things_unschedules_it(
+        thingskit, monkeypatch, rigged, capsys):
+    """L'effet mesuré : Things met `start=0, startDate NULL` en détachant.
+    La sonde le constate et rend 0."""
+    calls, set_rows = rigged
+    set_rows([{"uuid": TARGET, "title": "Cible", "type": 0, "project": PROJECT,
+               "start": thingskit.START_SOMEDAY, "startDate": 132817024}],
+             [], token=None)
+    _rig_effective_move(thingskit, monkeypatch, calls, project=None, area=None,
+                        heading=None, start=thingskit.START_INBOX,
+                        start_date=None)
+
+    rc = thingskit.cmd_move_task(_ns(id=TARGET, to_inbox=True))
+
+    assert rc == 0, capsys.readouterr().err
+    assert len(calls["osa"]) == 1
+
+
+def test_to_inbox_on_a_task_already_in_the_inbox_short_circuits(
+        thingskit, rigged, capsys):
+    """Déjà en Inbox (aucun conteneur, `start=0`, sans date) : message
+    DISTINCT, code 0, et AUCUN AppleScript — sinon un script qui échoue
+    serait masqué par une relecture verte avant même l'ordre (même remède
+    que le chemin `to_heading`)."""
+    calls, set_rows = rigged
+    set_rows([{"uuid": TARGET, "title": "Cible", "type": 0,
+               "start": thingskit.START_INBOX, "startDate": None}],
+             [], token=None)
+
+    rc = thingskit.cmd_move_task(_ns(id=TARGET, to_inbox=True))
+
+    assert rc == 0
+    assert calls["osa"] == []
+    assert calls["running"] == 0
+    out = capsys.readouterr().out
+    assert "déjà" in out and "Inbox" in out
+
+
+def test_to_inbox_on_a_detached_but_scheduled_task_is_not_already_in_the_inbox(
+        thingskit, monkeypatch, rigged):
+    """Le court-circuit lit `start` aussi : sans conteneur mais planifiée, la
+    tâche n'est PAS déjà en Inbox — l'ordre est envoyé."""
+    calls, set_rows = rigged
+    set_rows([{"uuid": TARGET, "title": "Cible", "type": 0,
+               "start": thingskit.START_ANYTIME, "startDate": 132814592}],
+             [], token=None)
+    _rig_effective_move(thingskit, monkeypatch, calls, start=thingskit.START_INBOX,
+                        start_date=None)
+
+    rc = thingskit.cmd_move_task(_ns(id=TARGET, to_inbox=True))
+
+    assert rc == 0
+    assert len(calls["osa"]) == 1
+
+
+@pytest.mark.parametrize("hostile", ['a"b', "a\\b", "a\nb", 'a"b\\c\nd'])
+def test_build_move_to_inbox_script_escapes_a_hostile_task_id(thingskit, hostile):
+    """`_build_move_to_inbox_script` est pure et n'est pas la garde d'entrée
+    (`_TASK_ID_RE` l'est, en amont) — mais un identifiant hostile qui
+    l'atteindrait ne doit ni fermer la chaîne ni couper la ligne."""
+    script = thingskit._build_move_to_inbox_script(hostile)
+    line = next(l for l in script.splitlines() if l.startswith("move to do id"))
+    assert line == f'move to do id "{thingskit._esc(hostile)}" to list targetList'
+    # aucune ligne n'est coupée : le saut de ligne hostile est encodé `\\n`
+    assert len(script.splitlines()) == len(
+        thingskit._build_move_to_inbox_script("X").splitlines())
+    # la valeur brute n'apparaît nulle part telle quelle
+    assert f'"{hostile}"' not in script
+
+
+def test_the_inbox_route_is_registered_in_cli_help(thingskit, run_cli):
+    code, out, _ = run_cli(["move-task", "--help"])
+    assert code == 0
+    assert "--to-inbox" in out
+
+
+def test_uuid_unchanged_after_a_move_to_inbox(thingskit, monkeypatch, rigged):
+    calls, set_rows = rigged
+    set_rows([{"uuid": TARGET, "title": "Cible", "type": 0, "project": PROJECT}],
+             [], token=None)
+    _rig_effective_move(thingskit, monkeypatch, calls, project=None, area=None,
+                        heading=None, start=thingskit.START_INBOX,
+                        start_date=None)
+
+    rc = thingskit.cmd_move_task(_ns(id=TARGET, to_inbox=True))
+    assert rc == 0
+
+    con = sqlite3.connect(calls["db"])
+    row = con.execute("select uuid from TMTask where uuid=?", (TARGET,)).fetchone()
+    con.close()
+    assert row is not None
+    assert row[0] == TARGET
