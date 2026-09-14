@@ -119,9 +119,20 @@ Write commands (URL scheme, targeted AppleScript, or UI automation as a
 last resort):
 
 - `create-area`, `create-project`, `create-heading`, `add-task`,
-  `delete-task`, `complete-task`, `cancel-task`, `reopen-task`,
-  `rename-task`, `reschedule-task`, `move-task`, `move-project`,
-  `set-notes`, `append-notes`.
+  `delete-task`, `delete-project`, `complete-task`, `cancel-task`,
+  `reopen-task`, `rename-task`, `reschedule-task`, `move-task`,
+  `move-project`, `set-notes`, `append-notes`.
+
+`delete-project` is the one command whose refusal matters more than its
+effect. Deleting a project carries its tasks away: measured on disposable
+projects, the child rows keep `trashed=0` in the database yet become
+unreachable through AppleScript, so the CLI can no longer touch them. The
+command therefore refuses as long as the project still holds **open** tasks
+— and that refusal is produced by the act itself: a single AppleScript
+round-trip counts the open tasks and deletes, so a task created between a
+check and the deletion cannot be swept away unnoticed. `--delete-open-tasks`
+does not disarm the guard: it first prints what will disappear, then
+requires that exact set to still be there at the moment of deletion.
 
 Every subcommand documents its exact behavior (and the observed Things
 behavior it was measured against) in the docstring at the top of
