@@ -121,7 +121,8 @@ def rigged(thingskit, monkeypatch, tmp_path):
              # `delete p` quel que soit le statut, pour éprouver la
              # restauration. `reopened`/`restored` journalisent les
              # changements de statut que le script a fait exécuter.
-             "logbook": False, "delete_fails": False,
+             "logbook": False, "delete_fails": False, "restore_fails": False,
+             "restore_attempts": [],
              "reopened": [], "restored": []}
 
     def _set_rows(task_rows, area_rows=()):
@@ -182,7 +183,32 @@ def _write_status(state, uuid, value):
 
 
 _REOPEN_LINE = "if origStatus is not open then set status of p to open"
-_RESTORE_PREFIX = "if origStatus is not open then set status of "
+_RESTORE_PREFIX = 'set status of (project id "'
+_RESTORE_GUARD = "if origStatus is not open then"
+_ENUM_OF_NAME = {"open": STATUS_OPEN, "completed": STATUS_COMPLETED,
+                 "canceled": STATUS_CANCELED}
+# Ce que l'application dit quand un geste sur le projet échoue — le libellé
+# réel de -1728, mesuré le 2026-09-15.
+_DELETE_ERROR = ('execution error: Erreur dans Things3 : Il est '
+                 'impossible d’obtenir project id "…". (-1728)')
+_RESTORE_ERROR = ('Erreur dans Things3 : Il est impossible de définir '
+                  'status of project id "…". (-10006)')
+
+
+def _eval_concat(expr: str, env: dict[str, str]) -> str:
+    """Évalue une concaténation AppleScript `"lit" & var & "lit"` : les
+    littéraux entre guillemets sont pris tels quels, les identifiants sont
+    lus dans `env`. Un identifiant inconnu est une erreur du script, et la
+    doublure la rend comme telle au lieu de l'inventer."""
+    out = []
+    for part in re.findall(r'"(?:[^"\\]|\\.)*"|[A-Za-z_][A-Za-z0-9_]*', expr):
+        if part.startswith('"'):
+            out.append(part[1:-1].replace('\\"', '"').replace("\\\\", "\\"))
+        elif part in env:
+            out.append(env[part])
+        else:
+            raise AssertionError(f"identifiant AppleScript non défini : {part!r}")
+    return "".join(out)
 
 
 def _as_the_application_would(script: str, ids: list[str], state,
@@ -199,15 +225,78 @@ def _as_the_application_would(script: str, ids: list[str], state,
     p` capture le statut en base ; la réouverture conditionnelle l'écrit ;
     un `delete p` qui échoue (Logbook sans réouverture, ou échec forcé)
     déroule le bloc `on error` du script — et c'est ce bloc, lu dans le
-    script, qui restaure ou non le statut d'origine.
+    script, qui restaure ou non le statut d'origine. `restore_fails=True`
+    fait échouer la restauration elle-même, et c'est alors le `on error`
+    IMBRIQUÉ du script, lu de la même façon, qui décide de ce qui est rendu.
+
+    Ce qu'elle PROUVE : que le script porte les gardes, dans cet ordre, et
+    que ses branches d'erreur rendent ce qu'elles rendent — parce qu'elle ne
+    fait rien que le script ne lui dise de faire.
+
+    Ce qu'elle NE PROUVE PAS : la validité syntaxique AppleScript réelle du
+    script, ni la sémantique de l'application. Elle reconnaît des lignes par
+    leur forme ; une ligne qu'elle ne reconnaît pas est ignorée, pas refusée.
+    `st` a été un nom de variable pendant tout un lot vert avant que la sonde
+    `osascript` ne le rejette (-2741 : « st » est le suffixe ordinal de
+    « 1st »). Cette preuve-là est celle de la sonde réelle sur un projet
+    `ZZ-probe-…`, et elle ne se remplace pas.
     """
     joined = ",".join(ids)
     expected = _expected_of(script)
     lines = [raw.strip() for raw in script.splitlines()]
     st = None
+    env: dict[str, str] = {}
+
+    def _run_handler(handler: list[str]) -> tuple[int, str]:
+        """Déroule un bloc `on error` ligne à ligne : blocs `if … end if`
+        sautés quand leur condition est fausse, `try` imbriqué exécuté, et
+        la première instruction `error` rencontrée rend le script."""
+        j = 0
+        while j < len(handler):
+            h = handler[j]
+            if h == _RESTORE_GUARD:
+                if st == STATUS_OPEN:
+                    j = handler.index("end if", j)
+                j += 1
+                continue
+            if h == "try":
+                k = handler.index("end try", j)
+                body = handler[j + 1:k]
+                if "on error m2" in body:
+                    e = body.index("on error m2")
+                    attempt, nested = body[:e], body[e + 1:]
+                else:
+                    attempt, nested = body, []
+                for a in attempt:
+                    if a.startswith(_RESTORE_PREFIX) and a.endswith(" to origStatus"):
+                        state["restore_attempts"].append(st)
+                        if state["restore_fails"]:
+                            env["m2"] = _RESTORE_ERROR
+                            return _run_handler(nested)
+                        state["restored"].append(st)
+                        _write_status(state, project_id, st)
+                j = k + 1
+                continue
+            if h.startswith(_RESTORE_PREFIX) and h.endswith(" to origStatus"):
+                state["restore_attempts"].append(st)
+                if not state["restore_fails"]:
+                    state["restored"].append(st)
+                    _write_status(state, project_id, st)
+            elif h.startswith("error "):
+                return 1, _eval_concat(h[len("error "):], env)
+            j += 1
+        return 1, env["m"]
+
     for i, line in enumerate(lines):
         if line == "set origStatus to status of p":
             st = _status_in_db(state, project_id)
+        elif re.fullmatch(r'set origName to "(\w+)"', line):
+            env["origName"] = re.fullmatch(r'set origName to "(\w+)"', line).group(1)
+        elif re.fullmatch(r'if origStatus is (\w+) then set origName to "(\w+)"', line):
+            enum, name = re.fullmatch(
+                r'if origStatus is (\w+) then set origName to "(\w+)"', line).groups()
+            if st == _ENUM_OF_NAME[enum]:
+                env["origName"] = name
         elif line == _REOPEN_LINE:
             if st != STATUS_OPEN:
                 state["reopened"].append(st)
@@ -224,22 +313,15 @@ def _as_the_application_would(script: str, ids: list[str], state,
                     con.commit()
                     con.close()
                 return 0, f"DELETED:{joined}"
-            message = ('execution error: Erreur dans Things3 : Il est '
-                       'impossible d\u2019obtenir project id "…". (-1728)')
+            env["m"] = _DELETE_ERROR
             rest = lines[i + 1:]
             if "on error m" not in rest:
-                return 1, message
+                return 1, _DELETE_ERROR
             handler = rest[rest.index("on error m") + 1:]
-            for h in handler:
-                if h == "end try":
-                    break
-                if h.startswith(_RESTORE_PREFIX) and h.endswith(" to origStatus"):
-                    if st != STATUS_OPEN:
-                        state["restored"].append(st)
-                        _write_status(state, project_id, st)
-                elif h.startswith("error "):
-                    return 1, f"{h[len('error '):]} {message}"
-            return 1, message
+            # Le `end try` du bloc EXTÉRIEUR est le dernier : les imbriqués
+            # le précèdent.
+            handler = handler[:len(handler) - handler[::-1].index("end try") - 1]
+            return _run_handler(handler)
         elif line.startswith('if (count ids) > 0 then return "OPEN:"'):
             if ids:
                 return 0, f"OPEN:{joined}"
@@ -805,3 +887,145 @@ def test_the_override_reopens_after_the_set_check_and_before_the_delete(
     assert (script.index('return "CHANGED:"') < script.index(_REOPEN_LINE)
             < script.index("delete p"))
     assert state["reopened"] == [STATUS_COMPLETED]
+
+
+# --- TOOL-457, rework : l'échec de la restauration est NOMMÉ -----------------
+#
+# Si `delete p` échoue APRÈS la réouverture ET que la restauration du statut
+# d'origine échoue à son tour, le projet reste OUVERT. Un `on error` dont la
+# restauration nue échouait remplaçait l'erreur du `delete` par celle de la
+# restauration, et aucune ligne ne disait que le projet était laissé ouvert.
+# Même motif que `_build_heading_script` / `_CLIPBOARD_NOT_RESTORED_MARKER`.
+
+@pytest.mark.parametrize("origin, name", [(STATUS_COMPLETED, "completed"),
+                                          (STATUS_CANCELED, "canceled")],
+                         ids=["terminé", "annulé"])
+def test_a_failed_restore_says_the_project_is_left_open_with_both_errors(
+        thingskit, rigged, capsys, origin, name):
+    """Le message porte LES DEUX erreurs, dit « laissé ouvert », et nomme le
+    statut d'origine — l'utilisateur sait quoi remettre à la main."""
+    state, set_rows = rigged
+    set_rows([{"uuid": PROJECT, "title": "Archivé", "type": TYPE_PROJECT,
+               "status": origin}])
+    state["delete_fails"] = True
+    state["restore_fails"] = True
+
+    rc = thingskit.cmd_delete_project(_ns(project_id=PROJECT))
+
+    err = capsys.readouterr().err
+    assert rc != 0
+    assert "ÉCHEC" in err
+    assert "laissé ouvert" in err.lower(), err
+    assert name in err, err
+    assert "-1728" in err and "-10006" in err, err      # les deux erreurs
+    assert _status_row(state) == (STATUS_OPEN, 0)       # laissé ouvert, en base
+    assert state["reopened"] == [origin]
+    assert state["restore_attempts"] == [origin]
+    assert state["restored"] == []
+    assert len(state["osa"]) == 1, "la restauration a coûté un second acte"
+
+
+def test_a_failed_restore_on_an_open_project_never_claims_left_open(
+        thingskit, rigged, capsys):
+    """Adversité : sur un projet qui ÉTAIT ouvert, rien n'a été rouvert et
+    rien n'est à restaurer — l'échec du `delete` ne prétend pas que le
+    projet est « laissé ouvert » par la commande."""
+    state, set_rows = rigged
+    set_rows([{"uuid": PROJECT, "title": "Ouvert", "type": TYPE_PROJECT,
+               "status": STATUS_OPEN}])
+    state["delete_fails"] = True
+    state["restore_fails"] = True
+
+    rc = thingskit.cmd_delete_project(_ns(project_id=PROJECT))
+
+    err = capsys.readouterr().err
+    assert rc != 0
+    assert "laissé ouvert" not in err.lower(), err
+    assert thingskit._PROJECT_LEFT_OPEN_MARKER not in err
+    assert state["restore_attempts"] == []
+    assert _status_row(state) == (STATUS_OPEN, 0)
+
+
+def test_the_restore_lives_in_its_own_try_whose_handler_raises_the_marker(
+        thingskit, rigged):
+    """Épreuve textuelle : la restauration est dans un `try` IMBRIQUÉ dans
+    le `on error m` ; son `on error m2` lève une erreur qui cite `m`, `m2`,
+    le statut d'origine nommé et le marqueur. Le chemin « restauration
+    réussie » lève toujours l'erreur d'origine (jamais avalée)."""
+    state, set_rows = rigged
+    set_rows([{"uuid": PROJECT, "title": "Archivé", "type": TYPE_PROJECT,
+               "status": STATUS_COMPLETED}])
+
+    thingskit.cmd_delete_project(_ns(project_id=PROJECT))
+
+    lines = [l.strip() for l in state["osa"][-1].splitlines()]
+    i_err = lines.index("on error m")
+    i_end_outer = len(lines) - 1 - lines[::-1].index("end try")
+    handler = lines[i_err + 1:i_end_outer]
+    i_try = handler.index("try")
+    i_m2 = handler.index("on error m2")
+    i_end_inner = handler.index("end try")
+    assert i_try < i_m2 < i_end_inner
+    restore = handler[i_try + 1:i_m2]
+    assert len(restore) == 1 and restore[0].startswith(_RESTORE_PREFIX) \
+        and restore[0].endswith(" to origStatus"), restore
+    nested_error = [h for h in handler[i_m2 + 1:i_end_inner] if h.startswith("error ")]
+    assert len(nested_error) == 1, handler
+    expr = nested_error[0]
+    assert re.search(r"\bm\b", expr) and re.search(r"\bm2\b", expr), expr
+    assert "origName" in expr and thingskit._PROJECT_LEFT_OPEN_MARKER in expr
+    assert "LAISSÉ OUVERT" in expr, expr
+    # L'ensemble est gardé par « statut d'origine non ouvert », et l'erreur
+    # du chemin « restauré » suit le `end if`.
+    assert handler.index(_RESTORE_GUARD) < i_try
+    i_end_if = handler.index("end if")
+    assert i_end_inner < i_end_if
+    tail = [h for h in handler[i_end_if + 1:] if h.startswith("error ")]
+    assert len(tail) == 1 and "restauré" in tail[0], tail
+    # Le nom du statut est FIXÉ par le script, pas lu ailleurs : les trois
+    # valeurs de l'énumération y sont écrites en clair.
+    assert 'set origName to "open"' in lines
+    assert 'if origStatus is completed then set origName to "completed"' in lines
+    assert 'if origStatus is canceled then set origName to "canceled"' in lines
+
+
+def test_a_marker_in_a_hostile_error_output_is_rendered_bounded(
+        thingskit, rigged, capsys):
+    """Adversité : la sortie d'`osascript` est une valeur non contrôlée. Un
+    marqueur accompagné de séquences de contrôle est traduit (sur-alerte,
+    le sens sûr), et le message rendu ne porte aucun octet de contrôle."""
+    state, set_rows = rigged
+    set_rows([{"uuid": PROJECT, "title": "Archivé", "type": TYPE_PROJECT,
+               "status": STATUS_COMPLETED}])
+    state["rc"] = 1
+    state["out"] = ("\x1b[31mfaux\x1b[0m \r\n" + thingskit._PROJECT_LEFT_OPEN_MARKER
+                    + " ‮")
+
+    rc = thingskit.cmd_delete_project(_ns(project_id=PROJECT))
+
+    err = capsys.readouterr().err
+    assert rc != 0
+    assert "laissé ouvert" in err.lower()
+    assert "\x1b" not in err and "\r" not in err and "‮" not in err, repr(err)
+
+
+def test_a_restore_failure_is_an_error_never_a_success_verdict(
+        thingskit, rigged):
+    """Le message composé commence par « suppression échouée » : aucune
+    étiquette de verdict (`DELETED:` …) ne peut y apparaître en tête, donc
+    aucune lecture ne peut le prendre pour un succès."""
+    state, set_rows = rigged
+    set_rows([{"uuid": PROJECT, "title": "Archivé", "type": TYPE_PROJECT,
+               "status": STATUS_COMPLETED}])
+    state["delete_fails"] = True
+    state["restore_fails"] = True
+
+    rc = thingskit.cmd_delete_project(_ns(project_id=PROJECT))
+
+    assert rc == 1
+    assert _project_row(state) == (0,)
+    _, out = _as_the_application_would(state["osa"][-1], [], state, PROJECT)
+    for tag in (thingskit._DP_DELETED_TAG, thingskit._DP_OPEN_TAG,
+                thingskit._DP_CHANGED_TAG):
+        assert not out.startswith(tag)
+    assert thingskit._interpret_delete_project_outcome(1, out) == (thingskit._DP_ERROR, [])
