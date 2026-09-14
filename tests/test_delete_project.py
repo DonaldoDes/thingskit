@@ -61,7 +61,7 @@ CREATE TABLE TMTask (
 """
 
 TYPE_TASK, TYPE_PROJECT, TYPE_HEADING = 0, 1, 2
-STATUS_OPEN, STATUS_COMPLETED = 0, 3
+STATUS_OPEN, STATUS_CANCELED, STATUS_COMPLETED = 0, 2, 3
 
 PROJECT = "PPPPPPPPPPPPPPPPPPPPPP"
 PROJECT2 = "QQQQQQQQQQQQQQQQQQQQQQ"
@@ -113,7 +113,16 @@ def rigged(thingskit, monkeypatch, tmp_path):
     moyen d'éprouver que la condition n'est pas lue en base avant l'acte.
     """
     state = {"osa": [], "db": None, "app_open": None, "effective": True,
-             "rc": 0, "out": ""}
+             "rc": 0, "out": "",
+             # TOOL-457 — ce que l'application fait d'un projet TERMINÉ.
+             # `logbook=True` rejoue le défaut mesuré le 2026-09-15 :
+             # `delete p` rend -1728 sur un projet dont le statut n'est pas
+             # `open` (rangé au Logbook). `delete_fails=True` fait échouer
+             # `delete p` quel que soit le statut, pour éprouver la
+             # restauration. `reopened`/`restored` journalisent les
+             # changements de statut que le script a fait exécuter.
+             "logbook": False, "delete_fails": False,
+             "reopened": [], "restored": []}
 
     def _set_rows(task_rows, area_rows=()):
         db_file = _make_db(tmp_path, task_rows, area_rows)
@@ -135,8 +144,7 @@ def rigged(thingskit, monkeypatch, tmp_path):
         state["osa"].append(script)
         if state["rc"] != 0:
             return state["rc"], state["out"]
-        return 0, _as_the_application_would(script, _open_ids(),
-                                            state, PROJECT)
+        return _as_the_application_would(script, _open_ids(), state, PROJECT)
 
     monkeypatch.setattr(thingskit, "ensure_running", lambda: None)
     monkeypatch.setattr(thingskit, "osa", _fake_osa)
@@ -157,39 +165,93 @@ def _expected_of(script: str):
     return [x.strip().strip('"') for x in body.split(",") if x.strip()]
 
 
-def _as_the_application_would(script: str, ids: list[str], state, project_id):
-    """Exécute le script comme l'application l'exécuterait.
+def _status_in_db(state, uuid):
+    con = sqlite3.connect(state["db"])
+    row = con.execute("select status from TMTask where uuid=?", (uuid,)).fetchone()
+    con.close()
+    return row[0] if row else None
 
-    C'est le point sur lequel cette doublure ne transige pas : elle n'applique
-    aucun contrat qu'elle connaîtrait d'avance — elle LIT les gardes du script
-    et s'y plie, ligne à ligne, jusqu'au `delete p`. Une doublure qui refusait
-    « parce que c'est le contrat » aurait validé un script SANS garde : mesuré
-    le 2026-09-14, la garde retirée du script, 26 des 27 tests restaient verts.
+
+def _write_status(state, uuid, value):
+    if not state["effective"]:
+        return
+    con = sqlite3.connect(state["db"])
+    con.execute("update TMTask set status=? where uuid=?", (value, uuid))
+    con.commit()
+    con.close()
+
+
+_REOPEN_LINE = "if st is not open then set status of p to open"
+_RESTORE_PREFIX = "if st is not open then set status of "
+
+
+def _as_the_application_would(script: str, ids: list[str], state,
+                              project_id) -> tuple[int, str]:
+    """Ce que l'application répond au script — (rc, sortie).
+
+    La doublure ne connaît pas le contrat d'avance : elle LIT les gardes du
+    script et s'y plie, ligne à ligne, jusqu'au `delete p`. Une doublure qui
+    refusait « parce que c'est le contrat » aurait validé un script SANS
+    garde : mesuré le 2026-09-14, la garde retirée du script, 26 des 27
+    tests restaient verts.
+
+    TOOL-457 : elle rejoue aussi le STATUT du projet. `set st to status of
+    p` capture le statut en base ; la réouverture conditionnelle l'écrit ;
+    un `delete p` qui échoue (Logbook sans réouverture, ou échec forcé)
+    déroule le bloc `on error` du script — et c'est ce bloc, lu dans le
+    script, qui restaure ou non le statut d'origine.
     """
     joined = ",".join(ids)
     expected = _expected_of(script)
-    for raw in script.splitlines():
-        line = raw.strip()
-        if line == "delete p":
-            if state["effective"]:
-                con = sqlite3.connect(state["db"])
-                con.execute("update TMTask set trashed=1 where uuid=?",
-                            (project_id,))
-                con.commit()
-                con.close()
-            return f"DELETED:{joined}"
-        if line.startswith('if (count ids) > 0 then return "OPEN:"'):
+    lines = [raw.strip() for raw in script.splitlines()]
+    st = None
+    for i, line in enumerate(lines):
+        if line == "set st to status of p":
+            st = _status_in_db(state, project_id)
+        elif line == _REOPEN_LINE:
+            if st != STATUS_OPEN:
+                state["reopened"].append(st)
+                _write_status(state, project_id, STATUS_OPEN)
+        elif line == "delete p":
+            fails = state["delete_fails"] or (
+                state["logbook"]
+                and _status_in_db(state, project_id) != STATUS_OPEN)
+            if not fails:
+                if state["effective"]:
+                    con = sqlite3.connect(state["db"])
+                    con.execute("update TMTask set trashed=1 where uuid=?",
+                                (project_id,))
+                    con.commit()
+                    con.close()
+                return 0, f"DELETED:{joined}"
+            message = ('execution error: Erreur dans Things3 : Il est '
+                       'impossible d\u2019obtenir project id "…". (-1728)')
+            rest = lines[i + 1:]
+            if "on error m" not in rest:
+                return 1, message
+            handler = rest[rest.index("on error m") + 1:]
+            for h in handler:
+                if h == "end try":
+                    break
+                if h.startswith(_RESTORE_PREFIX) and h.endswith(" to st"):
+                    if st != STATUS_OPEN:
+                        state["restored"].append(st)
+                        _write_status(state, project_id, st)
+                elif h.startswith("error "):
+                    return 1, f"{h[len('error '):]} {message}"
+            return 1, message
+        elif line.startswith('if (count ids) > 0 then return "OPEN:"'):
             if ids:
-                return f"OPEN:{joined}"
+                return 0, f"OPEN:{joined}"
         elif line.startswith('if (count ids) is not (count attendu) then '
                              'return "CHANGED:"'):
             if expected is None or len(expected) != len(ids):
-                return f"CHANGED:{joined}"
+                return 0, f"CHANGED:{joined}"
         elif line.startswith('if ids does not contain (e as text) then '
                              'return "CHANGED:"'):
             if expected is None or sorted(expected) != sorted(ids):
-                return f"CHANGED:{joined}"
-    return "-1728 : le script n'a jamais supprimé"
+                return 0, f"CHANGED:{joined}"
+    return 0, "-1728 : le script n'a jamais supprimé"
 
 
 def _project_row(state, uuid=PROJECT):
@@ -582,3 +644,164 @@ def test_waiting_never_writes_a_single_byte_to_the_database(thingskit, rigged):
     thingskit.cmd_delete_project(_ns(project_id=PROJECT))
 
     assert db_file.read_bytes() == before
+
+
+# --- TOOL-457 : projet terminé ou annulé (Logbook) -------------------------
+#
+# Mesuré le 2026-09-15 sur « Projet de test » (LbGyL7Gop2uBtVDvSXjqVD,
+# terminé le 2026-08-10, rangé au Logbook) : `delete p` rend -1728 alors que
+# `set p to project id …` et le comptage des tâches ouvertes passent ; `set
+# status of p to open` puis `delete p` dans le MÊME acte rend `deleted`,
+# rc=0. La réouverture vit donc dans le script, après la garde et juste
+# avant le `delete`, et un `delete` qui échoue ensuite restaure le statut
+# d'origine dans le même acte.
+
+def _status_row(state, uuid=PROJECT):
+    con = sqlite3.connect(state["db"])
+    row = con.execute("select status, trashed from TMTask where uuid=?",
+                      (uuid,)).fetchone()
+    con.close()
+    return row
+
+
+def test_a_completed_project_is_reopened_in_the_same_act_before_the_delete(
+        thingskit, rigged):
+    """Le défaut mesuré : au Logbook, `delete p` échoue tant que le projet
+    n'est pas rouvert. La réouverture précède le `delete` dans le MÊME
+    script — un seul aller-retour, jamais un second `osascript`."""
+    state, set_rows = rigged
+    set_rows([{"uuid": PROJECT, "title": "Archivé", "type": TYPE_PROJECT,
+               "status": STATUS_COMPLETED}])
+    state["logbook"] = True
+
+    rc = thingskit.cmd_delete_project(_ns(project_id=PROJECT))
+
+    assert rc == 0
+    assert _project_row(state) == (1,)
+    assert len(state["osa"]) == 1, "la réouverture a coûté un second acte"
+    script = state["osa"][-1]
+    assert script.index(_REOPEN_LINE) < script.index("delete p")
+    assert state["reopened"] == [STATUS_COMPLETED]
+
+
+def test_the_reopening_is_conditional_an_open_project_is_never_touched(
+        thingskit, rigged):
+    """Un projet ouvert ne subit aucun changement de statut : la réouverture
+    est conditionnelle au statut lu PAR L'ACTE."""
+    state, set_rows = rigged
+    set_rows([{"uuid": PROJECT, "title": "Ouvert", "type": TYPE_PROJECT,
+               "status": STATUS_OPEN}])
+    state["logbook"] = True
+
+    assert thingskit.cmd_delete_project(_ns(project_id=PROJECT)) == 0
+    assert _project_row(state) == (1,)
+    assert state["reopened"] == []
+
+
+def test_a_completed_project_with_open_tasks_is_refused_and_never_reopened(
+        thingskit, rigged, capsys):
+    """La garde précède la réouverture : un projet non vide n'est JAMAIS
+    rouvert, et son statut ne bouge pas — le refus laisse le projet
+    exactement tel qu'il était."""
+    state, set_rows = rigged
+    set_rows([
+        {"uuid": PROJECT, "title": "Archivé", "type": TYPE_PROJECT,
+         "status": STATUS_COMPLETED},
+        {"uuid": TASK, "title": "Reste", "type": TYPE_TASK, "project": PROJECT,
+         "status": STATUS_OPEN},
+    ])
+    state["logbook"] = True
+
+    rc = thingskit.cmd_delete_project(_ns(project_id=PROJECT))
+
+    assert rc != 0
+    assert "REFUS" in capsys.readouterr().err
+    assert _status_row(state) == (STATUS_COMPLETED, 0)
+    assert state["reopened"] == [], "rouvert malgré le refus"
+    script = state["osa"][-1]
+    assert script.index("return \"OPEN:") < script.index(_REOPEN_LINE), (
+        "la réouverture précède la garde : un projet non vide serait rouvert")
+
+
+@pytest.mark.parametrize("origin", [STATUS_COMPLETED, STATUS_CANCELED],
+                         ids=["completed", "canceled"])
+def test_a_failed_delete_restores_the_original_status_in_the_same_act(
+        thingskit, rigged, capsys, origin):
+    """Jamais de projet laissé rouvert : si `delete p` échoue APRÈS la
+    réouverture, le même script restaure le statut d'origine — terminé
+    comme annulé — et rend une erreur."""
+    state, set_rows = rigged
+    set_rows([{"uuid": PROJECT, "title": "Archivé", "type": TYPE_PROJECT,
+               "status": origin}])
+    state["delete_fails"] = True
+
+    rc = thingskit.cmd_delete_project(_ns(project_id=PROJECT))
+
+    assert rc != 0
+    assert "ÉCHEC" in capsys.readouterr().err
+    assert _status_row(state) == (origin, 0)
+    assert state["reopened"] == [origin]
+    assert state["restored"] == [origin]
+    assert len(state["osa"]) == 1, "la restauration a coûté un second acte"
+
+
+def test_a_failed_delete_on_an_open_project_issues_no_restore(
+        thingskit, rigged):
+    """La restauration est conditionnelle comme la réouverture : sur un
+    projet qui était ouvert, l'échec du `delete` ne réécrit aucun statut."""
+    state, set_rows = rigged
+    set_rows([{"uuid": PROJECT, "title": "Ouvert", "type": TYPE_PROJECT,
+               "status": STATUS_OPEN}])
+    state["delete_fails"] = True
+
+    rc = thingskit.cmd_delete_project(_ns(project_id=PROJECT))
+
+    assert rc != 0
+    assert _status_row(state) == (STATUS_OPEN, 0)
+    assert state["reopened"] == [] and state["restored"] == []
+
+
+def test_the_restore_lives_in_an_on_error_block_around_the_delete(
+        thingskit, rigged):
+    """Épreuve textuelle : `delete p` est dans un `try`, la restauration
+    dans son `on error`, et l'erreur est RENDUE (pas avalée) — un `on error`
+    qui retournerait normalement ferait passer l'échec pour un succès."""
+    state, set_rows = rigged
+    set_rows([{"uuid": PROJECT, "title": "Archivé", "type": TYPE_PROJECT,
+               "status": STATUS_COMPLETED}])
+
+    thingskit.cmd_delete_project(_ns(project_id=PROJECT))
+
+    lines = [l.strip() for l in state["osa"][-1].splitlines()]
+    i_try, i_del = lines.index("try"), lines.index("delete p")
+    i_err, i_end = lines.index("on error m"), lines.index("end try")
+    assert i_try < i_del < i_err < i_end
+    handler = lines[i_err + 1:i_end]
+    assert any(h.startswith(_RESTORE_PREFIX) and h.endswith(" to st")
+               for h in handler)
+    assert any(h.startswith("error ") for h in handler)
+    assert lines.index("set st to status of p") < lines.index(_REOPEN_LINE)
+
+
+def test_the_override_reopens_after_the_set_check_and_before_the_delete(
+        thingskit, rigged):
+    """Le passage outre garde le même ordre : exiger le jeu annoncé, PUIS
+    rouvrir, PUIS supprimer. Un jeu qui a changé ne rouvre rien."""
+    state, set_rows = rigged
+    set_rows([
+        {"uuid": PROJECT, "title": "Archivé", "type": TYPE_PROJECT,
+         "status": STATUS_COMPLETED},
+        {"uuid": TASK, "title": "Reste", "type": TYPE_TASK, "project": PROJECT,
+         "status": STATUS_OPEN},
+    ])
+    state["logbook"] = True
+
+    rc = thingskit.cmd_delete_project(
+        _ns(project_id=PROJECT, delete_open_tasks=True))
+
+    assert rc == 0
+    assert _project_row(state) == (1,)
+    script = state["osa"][-1]
+    assert (script.index('return "CHANGED:"') < script.index(_REOPEN_LINE)
+            < script.index("delete p"))
+    assert state["reopened"] == [STATUS_COMPLETED]
