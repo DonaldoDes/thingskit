@@ -38,6 +38,7 @@ CREATE TABLE TMTask (
     project TEXT,
     heading TEXT,
     area TEXT,
+    start INTEGER,
     startDate INTEGER,
     startBucket INTEGER,
     deadline INTEGER,
@@ -61,15 +62,16 @@ def _make_db(tmp_path, task_rows=(), area_rows=()):
     con.executescript(SCHEMA)
     defaults = dict(
         uuid=None, title=None, type=0, trashed=0, project=None, heading=None,
-        area=None, startDate=None, startBucket=None, deadline=None,
+        area=None, start=1, startDate=None, startBucket=None, deadline=None,
         reminderTime=None, status=0, notes=None,
     )
     for r in task_rows:
         con.execute(
             "insert into TMTask (uuid,title,type,trashed,project,heading,area,"
-            "startDate,startBucket,deadline,reminderTime,status,notes) values "
-            "(:uuid,:title,:type,:trashed,:project,:heading,:area,"
-            ":startDate,:startBucket,:deadline,:reminderTime,:status,:notes)",
+            "start,startDate,startBucket,deadline,reminderTime,status,notes) "
+            "values (:uuid,:title,:type,:trashed,:project,:heading,:area,"
+            ":start,:startDate,:startBucket,:deadline,:reminderTime,:status,"
+            ":notes)",
             {**defaults, **r},
         )
     for uuid, title in area_rows:
@@ -109,10 +111,20 @@ def rigged(thingskit, monkeypatch, tmp_path):
 
 
 def _rig_landing(thingskit, monkeypatch, calls, uuid="NEWNEWNEWNEWNEWNEWNEW1",
-                 project=None, area=None, heading=None):
+                 project=None, area=None, heading=None, start=None,
+                 start_date=None):
     """`url_open` qui simule l'atterrissage RÉEL de la tâche, à l'endroit
-    demandé par le test — y compris « nulle part », c'est-à-dire l'Inbox."""
+    demandé par le test — y compris « nulle part », c'est-à-dire l'Inbox.
+
+    `start` suit ce que Things fait quand on ne le force pas (mesuré le
+    2026-09-14, cf. en-tête de section TOOL-452) : `0` (START_INBOX) pour
+    une tâche sans conteneur, `1` (À tout moment) sous un projet/area/en-tête.
+    Le forcer (`start=1` sans conteneur) reproduit une tâche planifiée que
+    l'Inbox ne contient PAS — le cas que la sonde doit refuser.
+    """
     db_file = calls["db"]
+    if start is None:
+        start = 0 if (project is None and area is None and heading is None) else 1
 
     def _fake(payload, **kw):
         calls["url"].append(payload)
@@ -120,8 +132,8 @@ def _rig_landing(thingskit, monkeypatch, calls, uuid="NEWNEWNEWNEWNEWNEWNEW1",
         con = sqlite3.connect(db_file)
         con.execute(
             "insert into TMTask (uuid,title,type,trashed,project,heading,area,"
-            "status) values (?,?,?,0,?,?,?,0)",
-            (uuid, title, TASK, project, heading, area))
+            "start,startDate,status) values (?,?,?,0,?,?,?,?,?,0)",
+            (uuid, title, TASK, project, heading, area, start, start_date))
         con.commit()
         con.close()
 
@@ -851,11 +863,21 @@ def test_inbox_omits_the_list_key_entirely_rather_than_send_it_empty(
     assert "list" not in calls["url"][0][0]["attributes"]
 
 
-def test_inbox_with_a_list_is_refused_at_the_cli_level(thingskit, run_cli):
+def test_inbox_with_a_list_is_refused_at_the_cli_level(thingskit, rigged, run_cli):
+    """Le refus vient du groupe argparse, et le message le dit : `not allowed
+    with argument`. Avant TOOL-452, `--inbox` n'existait pas et le refus
+    disait « unrecognized arguments » — ce test le distingue.
+
+    `rigged` est posé sur TOUT test CLI d'une commande d'écriture : si la
+    garde testée disparaît, le chemin atteint l'écriture réelle."""
+    calls, set_rows = rigged
+    set_rows([PROJECT_ROW], [AREA_ROW])
     code, _, err = run_cli(
         ["add-task", "X", "--inbox", "--list", "Un projet"])
     assert code != 0
-    assert "inbox" in err.lower()
+    assert calls["url"] == []
+    assert "not allowed with argument" in err
+    assert "--inbox" in err and "--list" in err
 
 
 def test_inbox_with_a_heading_is_refused_without_any_write_call(
@@ -877,10 +899,19 @@ def test_inbox_with_a_heading_is_refused_without_any_write_call(
     assert "inbox" in err.lower() and "heading" in err.lower()
 
 
-def test_inbox_with_a_heading_is_refused_at_the_cli_level(thingskit, run_cli):
+def test_inbox_with_a_heading_is_refused_at_the_cli_level(thingskit, rigged,
+                                                          run_cli):
+    """Le refus vient de `cmd_add_task` (pas d'argparse) : son message nomme
+    l'exclusivité. Sans `--inbox` (master), argparse refuserait aussi, mais
+    avec « unrecognized arguments » — ce test le distingue."""
+    calls, set_rows = rigged
+    set_rows([PROJECT_ROW, HEADING_ROW], [AREA_ROW])
     code, _, err = run_cli(
         ["add-task", "X", "--inbox", "--heading", "Section"])
     assert code != 0
+    assert calls["url"] == []
+    assert "exclusifs" in err
+    assert "--inbox" in err and "--heading" in err
 
 
 def test_a_task_that_lands_elsewhere_than_the_inbox_is_a_failure(
@@ -896,6 +927,88 @@ def test_a_task_that_lands_elsewhere_than_the_inbox_is_a_failure(
 
     assert rc != 0
     assert "attendu inbox" in capsys.readouterr().err.lower()
+
+
+def test_a_task_without_container_but_scheduled_is_not_in_the_inbox(
+        thingskit, monkeypatch, rigged, capsys):
+    """TOOL-452 rework (review sécurité, P1) : l'Inbox n'est PAS « aucun
+    conteneur », c'est `start == START_INBOX et startDate NULL`
+    (`scheduling_list`). Mesuré le 2026-09-14 sur tâche jetable réelle :
+    `add-task T --inbox --when today` crée une tâche sans projet/area/heading
+    mais `start=1, startDate posé` — elle est dans Aujourd'hui, et la sonde
+    disait « Inbox » avec un code retour 0."""
+    calls, set_rows = rigged
+    set_rows([PROJECT_ROW], [AREA_ROW])
+    _rig_landing(thingskit, monkeypatch, calls, uuid="SCHEDULEDNOCONTAINER1",
+                 start=thingskit.START_ANYTIME, start_date=132814592)
+
+    rc = thingskit.cmd_add_task(_ns(inbox=True))
+
+    assert rc != 0
+    err = capsys.readouterr().err.lower()
+    assert "attendu inbox" in err
+    assert "start=1" in err and "startdate=132814592" in err
+
+
+def test_a_task_without_container_and_start_anytime_without_date_is_refused(
+        thingskit, monkeypatch, rigged, capsys):
+    """`start=1` sans date = « À tout moment », pas l'Inbox — la sonde
+    refuse sur `start` seul, sans avoir besoin d'une date."""
+    calls, set_rows = rigged
+    set_rows([PROJECT_ROW], [AREA_ROW])
+    _rig_landing(thingskit, monkeypatch, calls, uuid="ANYTIMENOCONTAINER01",
+                 start=thingskit.START_ANYTIME)
+
+    rc = thingskit.cmd_add_task(_ns(inbox=True))
+
+    assert rc != 0
+    assert "attendu inbox" in capsys.readouterr().err.lower()
+
+
+def test_inbox_with_when_is_refused_without_any_write_call(
+        thingskit, rigged, capsys):
+    """`--when` planifie ; une tâche planifiée n'est pas dans l'Inbox (mesure
+    du 2026-09-14 : `start=1, startDate posé`). Le refus PRÉCÈDE toute
+    sollicitation de l'application, comme celui de `--heading`."""
+    calls, set_rows = rigged
+    set_rows([PROJECT_ROW], [AREA_ROW])
+
+    rc = thingskit.cmd_add_task(_ns(inbox=True, when="today"))
+
+    assert rc != 0
+    assert calls["url"] == [], "l'application a été sollicitée malgré le refus"
+    assert calls["running"] == 0
+    err = capsys.readouterr().err
+    assert "--inbox" in err and "--when" in err and "exclusifs" in err
+
+
+def test_inbox_with_when_is_refused_at_the_cli_level(thingskit, rigged, run_cli):
+    """`rigged` est posé AUSSI ici : tant que le refus n'existe pas, ce
+    chemin atteint l'écriture — sans le gréement, ce test en RED aurait créé
+    une tâche réelle (c'est arrivé, 2026-09-14, supprimée après coup)."""
+    calls, set_rows = rigged
+    set_rows([PROJECT_ROW], [AREA_ROW])
+    code, _, err = run_cli(["add-task", "X", "--inbox", "--when", "today"])
+    assert code != 0
+    assert calls["url"] == []
+    assert "exclusifs" in err
+    assert "--inbox" in err and "--when" in err
+
+
+def test_inbox_with_deadline_is_accepted_and_sent(
+        thingskit, monkeypatch, rigged, capsys):
+    """Mesuré le 2026-09-14 sur tâche jetable réelle : une échéance laisse la
+    tâche en Inbox (`start=0, startDate NULL, deadline posé`). Elle est donc
+    autorisée, et transmise."""
+    calls, set_rows = rigged
+    set_rows([PROJECT_ROW], [AREA_ROW])
+    _rig_landing(thingskit, monkeypatch, calls, uuid="INBOXDEADLINE0000001")
+
+    rc = thingskit.cmd_add_task(_ns(inbox=True, deadline="2026-12-31"))
+
+    assert rc == 0, capsys.readouterr().err
+    assert calls["url"][0][0]["attributes"]["deadline"] == "2026-12-31"
+    assert "when" not in calls["url"][0][0]["attributes"]
 
 
 def test_inbox_is_registered_in_cli_help(thingskit, run_cli):
